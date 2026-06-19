@@ -20,26 +20,40 @@ def test_train_v2_config_and_overrides(tmp_path) -> None:
     """Test loading configuration from YAML with CLI overrides."""
     # 1. Create a dummy YAML config file
     config_data = {
-        "seed": 123,
-        "train_dir": str(tmp_path / "train"),
-        "val_dir": str(tmp_path / "val"),
-        "out_dir": str(tmp_path / "out"),
-        "n_states": 20,
-        "quantizer_type": "vq",
-        "max_epochs": 10,
-        "batch_size": 256,
-        "lr": 0.005,
-        "kmeans_init": False,
-        "quantizer_warmup_epochs": 0,
-        "aux_ramp_epochs": 0,
-        "lambda_usage": 0.0,
-        "lambda_contrast": 0.0,
-        "lambda_self": 0.1,
-        "descriptor_jitter_std": 0.0,
-        "alignments_per_batch": 0,
-        "accumulate_grad_batches": 1,
-        "precision": "32-true",
-        "torch_compile": False,
+        "model": {
+            "input_dim": 10,
+            "hidden_dim": 64,
+            "z_dim": 4,
+            "n_states": 20,
+            "quantizer": "vq",
+            "kmeans_init": False,
+        },
+        "loss": {
+            "commitment_weight": 0.25,
+            "usage_weight": 0.0,
+            "contrastive_weight": 0.0,
+            "self_reconstruction_weight": 0.1,
+        },
+        "data": {
+            "train_dir": str(tmp_path / "train"),
+            "val_dir": str(tmp_path / "val"),
+            "descriptor_jitter_std": 0.0,
+            "alignments_per_batch": 0,
+        },
+        "optimizer": {
+            "lr": 0.005,
+        },
+        "training": {
+            "seed": 123,
+            "out_dir": str(tmp_path / "out"),
+            "max_epochs": 10,
+            "batch_size": 256,
+            "continuous_warmup_epochs": 0,
+            "aux_ramp_epochs": 0,
+            "accumulate_grad_batches": 1,
+            "precision": "32-true",
+            "torch_compile": False,
+        },
     }
 
     config_file = tmp_path / "train_config.yaml"
@@ -108,16 +122,24 @@ def test_train_v2_config_only(tmp_path) -> None:
     """Test loading configuration from YAML with no overrides."""
     # Create YAML config
     config_data = {
-        "seed": 42,
-        "train_dir": str(tmp_path / "train"),
-        "val_dir": str(tmp_path / "val"),
-        "out_dir": str(tmp_path / "out"),
-        "n_states": 20,
-        "quantizer_type": "vq",
-        "max_epochs": 100,
-        "batch_size": 512,
-        "lr": 0.001,
-        "kmeans_init": False,
+        "model": {
+            "n_states": 20,
+            "quantizer": "vq",
+            "kmeans_init": False,
+        },
+        "data": {
+            "train_dir": str(tmp_path / "train"),
+            "val_dir": str(tmp_path / "val"),
+        },
+        "optimizer": {
+            "lr": 0.001,
+        },
+        "training": {
+            "seed": 42,
+            "out_dir": str(tmp_path / "out"),
+            "max_epochs": 100,
+            "batch_size": 512,
+        },
     }
     config_file = tmp_path / "train_config.yaml"
     with open(config_file, "w") as f:
