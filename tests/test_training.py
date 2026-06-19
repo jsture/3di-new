@@ -64,6 +64,8 @@ def test_fuse_linear_bn() -> None:
     """Test conversion and fusing of Linear and BatchNorm layers."""
     linear = nn.Linear(5, 10)
     bn = nn.BatchNorm1d(10)
+    assert bn.running_mean is not None
+    assert bn.running_var is not None
     bn.running_mean.fill_(0.5)
     bn.running_var.fill_(1.2)
     bn.weight.data.fill_(0.8)
