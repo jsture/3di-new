@@ -13,8 +13,10 @@ from torch.utils.data import Dataset
 
 from . import features, util
 
-# Cache for computed features (vae_features, valid_mask, coords) to avoid expensive PDB re-parsing
-FEATURE_CACHE: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+# Cache for computed features (vae_features, valid_mask, coords) to avoid expensive PDB re-parsing.
+# Keyed on (abs path, virt_cb, feature-version, convention) so different virt_cb cannot collide.
+CacheKey = tuple[str, tuple[float, float, float], str, str]
+FEATURE_CACHE: dict[CacheKey, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
 
 def jitter_coords(
@@ -46,7 +48,7 @@ def jitter_coords(
 def extract_features(
     pdb_path: str,
     virt_cb: tuple[float, float, float],
-    jitter_std: float = 0.0,
+    coordinate_jitter_std: float = 0.0,
     rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Calculate 3D descriptors and coordinates for each residue of a PDB file.
@@ -54,15 +56,23 @@ def extract_features(
     Args:
         pdb_path: Path to the PDB file.
         virt_cb: Virtual center coordinate offset parameters (alpha, beta, d).
-        jitter_std: Standard deviation of coordinates jittering noise (0.0 to disable).
+        coordinate_jitter_std: Std of coordinate-level jittering noise (0.0 to disable).
         rng: Optional random generator for jittering.
 
     Returns:
-        A tuple of (vae_features, valid_mask, coords).
+        A tuple of (vae_features, valid_mask, coords). ``coords`` are the raw parsed
+        coordinates (pre CB-move), so callers never observe a mutated array.
     """
-    # Check cache if jittering is disabled
-    if jitter_std == 0.0:
-        cached = FEATURE_CACHE.get(pdb_path)
+    # Cache only when jittering is disabled; key includes virt_cb + version/convention tags
+    # so two runs with different virt_cb do not return stale features.
+    cache_key: CacheKey = (
+        os.path.abspath(pdb_path),
+        (float(virt_cb[0]), float(virt_cb[1]), float(virt_cb[2])),
+        "features_v2",  # feature-definition version tag
+        "seq_delta_j_minus_i",  # convention tag
+    )
+    if coordinate_jitter_std == 0.0:
+        cached = FEATURE_CACHE.get(cache_key)
         if cached is not None:
             return cached
 
@@ -70,10 +80,11 @@ def extract_features(
     coords, valid_mask = features.get_coords_from_pdb(pdb_path, full_backbone=True)
 
     # Apply coordinate-level training augmentation (jittering)
-    if jitter_std > 0.0 and rng is not None:
-        coords = jitter_coords(coords, valid_mask, jitter_std, rng)
+    if coordinate_jitter_std > 0.0 and rng is not None:
+        coords = jitter_coords(coords, valid_mask, coordinate_jitter_std, rng)
 
-    coords_moved = features.move_CB(coords, virt_cb=virt_cb)
+    # move_CB mutates its input, so move a copy and keep raw coords intact for caching.
+    coords_moved = features.move_CB(coords.copy(), virt_cb=virt_cb)
 
     # Convention: sequence delta is partner_index - source_index.
     # This is intentionally consistent with the existing implementation.
@@ -88,8 +99,9 @@ def extract_features(
     # Combine structural angles and log sequence distance
     vae_features = np.hstack([feat, seq_dist_log])
 
-    if jitter_std == 0.0:
-        FEATURE_CACHE[pdb_path] = vae_features, valid_mask2, coords
+    # Cache the raw parsed coords (CA columns 0:3 used downstream are unaffected by move_CB).
+    if coordinate_jitter_std == 0.0:
+        FEATURE_CACHE[cache_key] = vae_features, valid_mask2, coords
 
     return vae_features, valid_mask2, coords
 
@@ -97,7 +109,7 @@ def extract_features(
 def encoder_features(
     pdb_path: str,
     virt_cb: tuple[float, float, float],
-    jitter_std: float = 0.0,
+    coordinate_jitter_std: float = 0.0,
     rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Calculate 3D descriptors for each residue of a PDB file.
@@ -105,13 +117,13 @@ def encoder_features(
     Args:
         pdb_path: Path to the PDB file.
         virt_cb: Virtual center coordinate offset parameters (alpha, beta, d).
-        jitter_std: Standard deviation of coordinates jittering noise (0.0 to disable).
+        coordinate_jitter_std: Std of coordinate-level jittering noise (0.0 to disable).
         rng: Optional random generator for jittering.
 
     Returns:
         A tuple of (vae_features, valid_mask).
     """
-    feat, mask, _ = extract_features(pdb_path, virt_cb, jitter_std, rng)
+    feat, mask, _ = extract_features(pdb_path, virt_cb, coordinate_jitter_std, rng)
     return feat, mask
 
 
@@ -363,7 +375,7 @@ class PairDataset(Dataset):
         y: np.ndarray,
         mean: np.ndarray | None = None,
         std: np.ndarray | None = None,
-        jitter_std: float = 0.0,
+        descriptor_jitter_std: float = 0.0,
         seed: int = 42,
     ) -> None:
         """Initialize the PairDataset.
@@ -373,8 +385,9 @@ class PairDataset(Dataset):
             y: Aligned target descriptors of shape (N, 10).
             mean: Precomputed feature mean. If None, statistics are fit on x.
             std: Precomputed feature std. If None, statistics are fit on x.
-            jitter_std: Noise std applied to input descriptors.
-            seed: Random seed for coordinate jittering.
+            descriptor_jitter_std: Experimental noise std applied to scaled input descriptors.
+                Distinct from coordinate-level jitter (see ``extract_features``); default 0.0.
+            seed: Base seed for deterministic per-item jitter.
         """
         assert len(x) == len(y), "Features and targets must have matching length."
         self.raw_x = x.astype(np.float32)
@@ -389,8 +402,13 @@ class PairDataset(Dataset):
 
         self.x_scaled = transform(self.raw_x, self.mean, self.std)
         self.y_scaled = transform(self.raw_y, self.mean, self.std)
-        self.jitter_std = jitter_std
-        self.rng = np.random.default_rng(seed)
+        self.descriptor_jitter_std = descriptor_jitter_std
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch so per-item jitter differs across epochs but stays reproducible."""
+        self.epoch = epoch
 
     def __len__(self) -> int:
         return len(self.x_scaled)
@@ -399,9 +417,11 @@ class PairDataset(Dataset):
         x_val = self.x_scaled[idx].copy()
         y_val = self.y_scaled[idx]
 
-        # Add noise to input features in scaled descriptor space if training augmentation is on
-        if self.jitter_std > 0.0:
-            noise = self.rng.normal(0.0, self.jitter_std, size=x_val.shape).astype(np.float32)
+        # Deterministic per-item jitter: seed from (base_seed, idx, epoch) so noise is
+        # identical regardless of worker count (no shared stateful RNG to fork).
+        if self.descriptor_jitter_std > 0.0:
+            rng = np.random.default_rng([self.seed, idx, self.epoch])
+            noise = rng.normal(0.0, self.descriptor_jitter_std, size=x_val.shape).astype(np.float32)
             x_val += noise
 
         return torch.tensor(x_val), torch.tensor(y_val)

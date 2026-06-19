@@ -45,7 +45,11 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=512, help="Mini-batch size.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument(
-        "--jitter_std", type=float, default=0.0, help="Coordinate jittering noise std."
+        "--descriptor_jitter_std",
+        type=float,
+        default=0.0,
+        help="Experimental descriptor-space jitter std applied in PairDataset (default off). "
+        "Coordinate-level jitter belongs to the data-build step, not here.",
     )
     parser.add_argument(
         "--precision",
@@ -70,14 +74,14 @@ def main() -> None:
 
     # Create train dataset (fits scaler)
     train_dataset = PairDataset(
-        x_train_raw, y_train_raw, jitter_std=args.jitter_std, seed=args.seed
+        x_train_raw, y_train_raw, descriptor_jitter_std=args.descriptor_jitter_std, seed=args.seed
     )
     mean = train_dataset.mean
     std = train_dataset.std
 
     # Create val dataset (uses train scaler, NO jitter)
     val_dataset = PairDataset(
-        x_val_raw, y_val_raw, mean=mean, std=std, jitter_std=0.0, seed=args.seed
+        x_val_raw, y_val_raw, mean=mean, std=std, descriptor_jitter_std=0.0, seed=args.seed
     )
 
     train_loader = DataLoader(
