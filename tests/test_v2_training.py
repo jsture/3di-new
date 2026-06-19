@@ -64,7 +64,7 @@ def test_pair_dataset_scaling() -> None:
     x = np.random.randn(10, 10) * 5.0 + 3.0
     y = np.random.randn(10, 10) * 2.0 - 1.0
 
-    dataset = PairDataset(x, y, jitter_std=0.0)
+    dataset = PairDataset(x, y, descriptor_jitter_std=0.0)
     assert dataset.mean.shape == (10,)
     assert dataset.std.shape == (10,)
 
