@@ -116,6 +116,13 @@ def run_evaluate(args: argparse.Namespace) -> None:
 
 def main() -> None:
     """Main CLI driver."""
+    if len(sys.argv) > 1 and sys.argv[1] == "train":
+        from .train import main as train_main
+
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        train_main()
+        return
+
     parser = argparse.ArgumentParser(description="Tdi-v2 CLI tools.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
