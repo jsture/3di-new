@@ -12,7 +12,8 @@ features:
   sequence_delta_convention: j_minus_i
   max_ca_dist: 5.0
 sampling:
-  max_pairs_per_alignment: null
+  # Conservative cap: long alignments otherwise emit disproportionately many residue pairs.
+  max_pairs_per_alignment: 768
   seed: 123
 outputs:
   out_dir: data/processed/scop_ca5_v1

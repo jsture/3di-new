@@ -1,13 +1,16 @@
 """Unit tests for modernized 3Di VAE v2 training pipeline components."""
 
 from pathlib import Path
+from unittest.mock import PropertyMock, patch
 
 import lightning as L
 import numpy as np
+import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from tdi.v2 import (
+    AlignmentBatchSampler,
     EMAVectorQuantizer,
     FSQQuantizer,
     PairDataset,
@@ -502,9 +505,117 @@ def test_contrastive_logit_scale_clamped() -> None:
     scale = model.logit_scale.clamp(max=np.log(100.0)).exp()
     assert scale.item() <= 100.0 + 1e-3
 
-    # Symmetric loss runs and is differentiable.
+    # Symmetric loss runs and is differentiable. Force the aux ramp active (negative warmup
+    # => quantize on and aux_r > 0 at epoch 0) so the contrastive term actually contributes.
+    model.quantizer_warmup_epochs = -1
     x = torch.randn(8, 10)
     y = torch.randn(8, 10)
     loss = model.training_step((x, y), 0)
     loss.backward()
     assert model.logit_scale.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# Staged discretization curriculum (v2_training_plan Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _cpu_trainer(**kwargs) -> L.Trainer:
+    """A minimal CPU trainer for short fits in tests."""
+    return L.Trainer(
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        **kwargs,
+    )
+
+
+def test_warmup_bypasses_quantizer() -> None:
+    """forward(quantize=False) bypasses the codebook: z_q==z, no stats, no codebook update."""
+    model = TdiV2Model(quantizer_type="vq")
+    assert isinstance(model.quantizer, EMAVectorQuantizer)
+    x = torch.randn(8, 10)
+    out = model(x, quantize=False)
+
+    assert torch.equal(out["z"], out["z_q"])
+    assert float(out["vq_loss"]) == 0.0
+    assert float(out["perplexity"]) == 0.0
+    assert torch.all(out["indices"] == 0)
+    # No codebook update happened during the bypass.
+    assert int(model.quantizer.step_counter.item()) == 0
+
+
+def test_kmeans_fires_at_warmup_boundary() -> None:
+    """k-means init runs once when quantization begins (EMA-VQ)."""
+    model = TdiV2Model(quantizer_type="vq", quantizer_warmup_epochs=1, aux_ramp_epochs=1)
+    assert isinstance(model.quantizer, EMAVectorQuantizer)
+    assert not bool(model.quantizer.initialized.item())
+
+    trainer = _cpu_trainer(max_epochs=2)
+    trainer.fit(model, _tiny_loader())
+    assert bool(model.quantizer.initialized.item())
+
+
+def test_warmup_curriculum_noop_for_fsq() -> None:
+    """The warmup/k-means curriculum is a no-op for the FSQ backend."""
+    model = TdiV2Model(quantizer_type="fsq", fsq_levels=[5, 4], quantizer_warmup_epochs=1)
+    trainer = _cpu_trainer(max_epochs=2)
+    trainer.fit(model, _tiny_loader())
+    assert isinstance(model.quantizer, FSQQuantizer)
+
+
+def test_aux_ramp_factor_is_zero_in_warmup_then_one() -> None:
+    """Ramp factor is 0 during warmup, then climbs to 1 over aux_ramp_epochs."""
+    model = TdiV2Model(quantizer_warmup_epochs=2, aux_ramp_epochs=2)
+    expected = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.5, 4: 1.0, 5: 1.0}
+    with patch.object(type(model), "current_epoch", new_callable=PropertyMock) as ce:
+        for epoch, want in expected.items():
+            ce.return_value = epoch
+            assert model._aux_ramp() == pytest.approx(want)
+
+
+def test_alignment_batch_sampler_spans_many_alignments() -> None:
+    """Each batch spans >= alignments_per_batch distinct alignments, reproducibly."""
+    alignment_ids = np.repeat(np.arange(20), 50)  # 20 alignments x 50 rows
+    sampler = AlignmentBatchSampler(alignment_ids, batch_size=64, alignments_per_batch=8, seed=0)
+    batches = list(sampler)
+    assert len(batches) == len(alignment_ids) // 64
+
+    for batch in batches:
+        assert len(batch) <= 64
+        distinct = len({int(alignment_ids[i]) for i in batch})
+        assert distinct >= 8
+
+    # Reproducible under a fixed seed.
+    sampler2 = AlignmentBatchSampler(alignment_ids, batch_size=64, alignments_per_batch=8, seed=0)
+    assert list(sampler2) == batches
+
+
+def test_all_loss_components_logged() -> None:
+    """Every decomposed objective term and per-group recon is logged each epoch."""
+    model = TdiV2Model(
+        quantizer_type="vq",
+        quantizer_warmup_epochs=1,
+        aux_ramp_epochs=1,
+        lambda_contrast=0.05,
+    )
+    trainer = _cpu_trainer(max_epochs=3)
+    trainer.fit(model, _tiny_loader())
+
+    keys = set(trainer.callback_metrics.keys())
+    for name in (
+        "loss_partner",
+        "loss_self",
+        "loss_vq",
+        "loss_usage",
+        "loss_contrast",
+        "loss_total",
+        "recon_angles",
+        "recon_ca_distance",
+        "recon_sequence",
+        "aux_ramp",
+    ):
+        assert name in keys, name
