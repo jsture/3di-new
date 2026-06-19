@@ -15,6 +15,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from lightning.pytorch.utilities.types import OptimizerLRScheduler
+from sklearn.cluster import KMeans
 
 
 class ResidualMLP(nn.Module):
@@ -67,6 +69,29 @@ class ResidualMLP(nn.Module):
         return self.output(h)
 
 
+def _kmeans(x: torch.Tensor, n_clusters: int, seed: int = 0) -> torch.Tensor:
+    """Fit k-means centroids with a fixed seed.
+
+    Args:
+        x: Data points of shape (N, D).
+        n_clusters: Number of centroids to fit.
+        seed: Fixed seed for reproducible centroid initialization.
+
+    Returns:
+        Centroids of shape (n_clusters, D), on the same device/dtype as ``x``.
+    """
+    points = x.detach().cpu().numpy()
+    n_init = min(n_clusters, points.shape[0])
+    kmeans = KMeans(n_clusters=n_init, random_state=seed, n_init="auto").fit(points)
+    centers = torch.from_numpy(kmeans.cluster_centers_).to(device=x.device, dtype=x.dtype)
+
+    # Pad with random points if fewer samples than clusters (degenerate batch).
+    if n_init < n_clusters:
+        pad = x[torch.randint(x.shape[0], (n_clusters - n_init,), device=x.device)]
+        centers = torch.cat([centers, pad], dim=0)
+    return centers
+
+
 class EMAVectorQuantizer(nn.Module):
     """Vector Quantizer using Exponential Moving Average (EMA) codebook updates.
 
@@ -78,6 +103,7 @@ class EMAVectorQuantizer(nn.Module):
     ema_count: torch.Tensor
     ema_sum: torch.Tensor
     step_counter: torch.Tensor
+    initialized: torch.Tensor
 
     def __init__(
         self,
@@ -118,6 +144,27 @@ class EMAVectorQuantizer(nn.Module):
         self.register_buffer("ema_count", torch.zeros(n_states))
         self.register_buffer("ema_sum", embedding.clone())
         self.register_buffer("step_counter", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("initialized", torch.tensor(False))
+
+    @torch.no_grad()
+    def init_codebook(self, z: torch.Tensor) -> None:
+        """Seed the codebook from k-means of real encoder outputs.
+
+        Replaces random init so early code usage is non-arbitrary. Runs k-means in the
+        same space used for lookups (L2-normalized if ``self.l2_normalize``).
+
+        Args:
+            z: Encoder outputs of shape (N, z_dim).
+        """
+        features = F.normalize(z, dim=-1) if self.l2_normalize else z
+        features = features.detach().to(self.embedding.dtype)
+
+        centers = _kmeans(features, self.n_states, seed=0)
+
+        self.embedding.copy_(centers)
+        self.ema_sum.copy_(centers)
+        self.ema_count.fill_(1.0)
+        self.initialized.fill_(True)
 
     def forward(
         self, z: torch.Tensor
@@ -130,63 +177,69 @@ class EMAVectorQuantizer(nn.Module):
         Returns:
             Tuple of (commit_loss, z_q, perplexity, indices, usage, n_replaced).
         """
-        if self.l2_normalize:
-            z_lookup = F.normalize(z, dim=-1)
-            codebook = F.normalize(self.embedding, dim=-1)
-        else:
-            z_lookup = z
-            codebook = self.embedding
+        # Distance lookup, one-hot, and EMA updates must stay fp32 (codebook math).
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            z32 = z.float()
+            if self.l2_normalize:
+                z_lookup = F.normalize(z32, dim=-1)
+                codebook = F.normalize(self.embedding, dim=-1)
+            else:
+                z_lookup = z32
+                codebook = self.embedding
 
-        # Distance computation: d = x^2 + y^2 - 2xy
-        distances = (
-            z_lookup.pow(2).sum(dim=-1, keepdim=True)
-            + codebook.pow(2).sum(dim=-1)
-            - 2.0 * z_lookup @ codebook.t()
-        )
-        indices = distances.argmin(dim=-1)
-
-        # Encodings matrix
-        encodings = F.one_hot(indices, self.n_states).type_as(z)
-        z_q = encodings @ self.embedding
-
-        n_replaced = 0
-        if self.training:
-            self.step_counter += 1
-            counts = encodings.sum(dim=0)
-            sums = encodings.t() @ z.detach()
-
-            # Update moving averages
-            self.ema_count.mul_(self.decay).add_(counts, alpha=1.0 - self.decay)
-            self.ema_sum.mul_(self.decay).add_(sums, alpha=1.0 - self.decay)
-
-            # Laplace smoothed count updates
-            total = self.ema_count.sum()
-            smoothed_count = (
-                (self.ema_count + self.eps) / (total + self.n_states * self.eps) * total
+            # Distance computation: d = x^2 + y^2 - 2xy
+            distances = (
+                z_lookup.pow(2).sum(dim=-1, keepdim=True)
+                + codebook.pow(2).sum(dim=-1)
+                - 2.0 * z_lookup @ codebook.t()
             )
-            self.embedding.copy_(self.ema_sum / smoothed_count.unsqueeze(1))
+            indices = distances.argmin(dim=-1)
 
-            # Dead-code replacement
-            if self.step_counter > self.replacement_warmup_steps:
-                dead = self.ema_count < self.min_count
-                n_dead = int(dead.sum().item())
-                if n_dead > 0:
-                    perm = torch.randperm(z.size(0), device=z.device)
-                    n_to_replace = min(n_dead, z.size(0))
-                    dead_indices = torch.where(dead)[0][:n_to_replace]
-                    replacements = z.detach()[perm[:n_to_replace]]
-                    self.embedding[dead_indices] = replacements
-                    self.ema_count[dead_indices] = self.min_count
-                    self.ema_sum[dead_indices] = replacements * self.min_count
-                    n_replaced = n_to_replace
+            # Encodings matrix
+            encodings = F.one_hot(indices, self.n_states).float()
+            z_q = encodings @ self.embedding
+
+            n_replaced = 0
+            if self.training:
+                self.step_counter += 1
+                counts = encodings.sum(dim=0)
+                sums = encodings.t() @ z32.detach()
+
+                # Update moving averages
+                self.ema_count.mul_(self.decay).add_(counts, alpha=1.0 - self.decay)
+                self.ema_sum.mul_(self.decay).add_(sums, alpha=1.0 - self.decay)
+
+                # Laplace smoothed count updates
+                total = self.ema_count.sum()
+                smoothed_count = (
+                    (self.ema_count + self.eps) / (total + self.n_states * self.eps) * total
+                )
+                self.embedding.copy_(self.ema_sum / smoothed_count.unsqueeze(1))
+
+                # Dead-code replacement
+                if self.step_counter > self.replacement_warmup_steps:
+                    dead = self.ema_count < self.min_count
+                    n_dead = int(dead.sum().item())
+                    if n_dead > 0:
+                        perm = torch.randperm(z.size(0), device=z.device)
+                        n_to_replace = min(n_dead, z.size(0))
+                        dead_indices = torch.where(dead)[0][:n_to_replace]
+                        replacements = z32.detach()[perm[:n_to_replace]]
+                        self.embedding[dead_indices] = replacements
+                        self.ema_count[dead_indices] = self.min_count
+                        self.ema_sum[dead_indices] = replacements * self.min_count
+                        n_replaced = n_to_replace
+
+            usage = encodings.mean(dim=0)
+            perplexity = torch.exp(-(usage * (usage + 1e-10).log()).sum())
+
+        # Cast back to the working dtype for downstream (possibly bf16) ops.
+        z_q = z_q.to(z.dtype)
 
         # Commitment loss to regularize encoder space
         commit_loss = self.commitment_cost * F.mse_loss(z, z_q.detach())
         # Straight-through gradient estimator
         z_q = z + (z_q - z).detach()
-
-        usage = encodings.float().mean(dim=0)
-        perplexity = torch.exp(-(usage * (usage + 1e-10).log()).sum())
 
         return (
             commit_loss,
@@ -365,6 +418,7 @@ class TdiV2Model(L.LightningModule):
         temperature: float = 0.1,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
+        warmup_ratio: float = 0.03,
         loss_type: str = "smooth_l1",
     ) -> None:
         """Initialize the TdiV2Model.
@@ -388,6 +442,7 @@ class TdiV2Model(L.LightningModule):
             temperature: Softmax temperature parameter for contrastive objective.
             lr: Optimizing learning rate.
             weight_decay: L2 parameter regularizer weight.
+            warmup_ratio: Fraction of total steps spent in linear LR warmup.
             loss_type: "smooth_l1" or "gaussian_nll".
         """
         super().__init__()
@@ -412,6 +467,7 @@ class TdiV2Model(L.LightningModule):
         self.temperature = temperature
         self.lr = lr
         self.weight_decay = weight_decay
+        self.warmup_ratio = warmup_ratio
         self.loss_type = loss_type
 
         # Initialize core encoder and decoder blocks
@@ -450,6 +506,8 @@ class TdiV2Model(L.LightningModule):
                 nn.SiLU(),
                 nn.Linear(hidden_dim, hidden_dim),
             )
+            # Learnable temperature (log-scale), clamped at use to <= log(100), CLIP-style.
+            self.logit_scale = nn.Parameter(torch.tensor(float(np.log(1.0 / temperature))))
 
         self.loss_fn = nn.GaussianNLLLoss() if loss_type == "gaussian_nll" else None
 
@@ -501,6 +559,37 @@ class TdiV2Model(L.LightningModule):
         """
         x = (x_raw - self.feature_mean) / self.feature_std
         return self.encode_states(x)
+
+    def init_codebook_from_data(
+        self, loader: torch.utils.data.DataLoader, n_batches: int = 8
+    ) -> None:
+        """Seed the EMA-VQ codebook from k-means of real encoder outputs.
+
+        No-op unless the quantizer is an EMAVectorQuantizer (FSQ unaffected). Runs the
+        encoder over the first ``n_batches`` batches (more than one to avoid single-batch
+        bias) and fits the codebook to the concatenated latents.
+
+        Args:
+            loader: DataLoader yielding (x, y) pairs of scaled features.
+            n_batches: Number of batches to accumulate for k-means.
+        """
+        if not isinstance(self.quantizer, EMAVectorQuantizer):
+            return
+
+        was_training = self.training
+        self.eval()
+        zs = []
+        with torch.no_grad():
+            for i, (x, _y) in enumerate(loader):
+                if i >= n_batches:
+                    break
+                zs.append(self.encoder(x.to(self.device)))
+        if was_training:
+            self.train()
+
+        if not zs:
+            return
+        self.quantizer.init_codebook(torch.cat(zs, dim=0))
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """Standard model pass returning latent projections and losses.
@@ -556,8 +645,10 @@ class TdiV2Model(L.LightningModule):
 
         # Loss calculation
         if self.loss_fn is not None:
-            loss_partner = self.loss_fn(mu_partner, y, var_partner)
-            loss_self = self.loss_fn(mu_self, x, var_self)
+            # NLL term computed in fp32 for numerical stability under bf16.
+            assert var_partner is not None and var_self is not None
+            loss_partner = self.loss_fn(mu_partner.float(), y.float(), var_partner.float())
+            loss_self = self.loss_fn(mu_self.float(), x.float(), var_self.float())
         else:
             loss_partner = F.smooth_l1_loss(mu_partner, y)
             loss_self = F.smooth_l1_loss(mu_self, x)
@@ -576,9 +667,14 @@ class TdiV2Model(L.LightningModule):
             zq_proj = F.normalize(zq_proj, dim=-1)
             h_proj = F.normalize(h_proj, dim=-1)
 
-            logits = zq_proj @ h_proj.t() / self.temperature
+            scale = self.logit_scale.clamp(max=np.log(100.0)).exp()
+            logits = scale * (zq_proj @ h_proj.t())
             labels = torch.arange(logits.shape[0], device=logits.device)
-            loss_contrast = self.lambda_contrast * F.cross_entropy(logits, labels)
+            loss_contrast = (
+                self.lambda_contrast
+                * 0.5
+                * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
+            )
         else:
             loss_contrast = 0.0
 
@@ -613,7 +709,9 @@ class TdiV2Model(L.LightningModule):
         z = out_x["z"]
 
         if self.loss_fn is not None:
-            loss_partner = self.loss_fn(mu_partner, y, var_partner)
+            # NLL term computed in fp32 for numerical stability under bf16.
+            assert var_partner is not None
+            loss_partner = self.loss_fn(mu_partner.float(), y.float(), var_partner.float())
         else:
             loss_partner = F.smooth_l1_loss(mu_partner, y)
 
@@ -724,21 +822,38 @@ class TdiV2Model(L.LightningModule):
         # Clear step cache
         self.validation_step_outputs.clear()
 
-    def configure_optimizers(
-        self,
-    ) -> tuple[list[torch.optim.Optimizer], list[torch.optim.lr_scheduler.CosineAnnealingLR]]:
-        """Setup optimizer and learning rate scheduler."""
+    def configure_optimizers(self) -> OptimizerLRScheduler:
+        """Setup AdamW with no-decay bias/norm groups and warmup→cosine schedule."""
+        # Decay only >=2-D matmul weights; exclude biases and LayerNorm gamma/beta.
+        decay = [p for _, p in self.named_parameters() if p.requires_grad and p.ndim >= 2]
+        no_decay = [p for _, p in self.named_parameters() if p.requires_grad and p.ndim < 2]
         optimizer = torch.optim.AdamW(
-            self.parameters(),
+            [
+                {"params": decay, "weight_decay": self.weight_decay},
+                {"params": no_decay, "weight_decay": 0.0},
+            ],
             lr=self.lr,
-            weight_decay=self.weight_decay,
         )
-        # CosineAnnealingLR for smooth learning rate scheduling
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+
+        # Tie schedule to the real run length, with linear warmup into cosine decay.
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        warmup_steps = max(1, int(self.warmup_ratio * total_steps))
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,
-            T_max=100,  # T_max can be set dynamically during training if needed
+            [
+                torch.optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=1e-2, total_iters=warmup_steps
+                ),
+                torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=max(1, total_steps - warmup_steps)
+                ),
+            ],
+            milestones=[warmup_steps],
         )
-        return [optimizer], [scheduler]
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
 
     def export_model(self, out_dir: Path | str, mean: np.ndarray, std: np.ndarray) -> None:
         """Export state dict, scaler configuration, and centroids to storage.
