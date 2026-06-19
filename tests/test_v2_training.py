@@ -3,7 +3,6 @@
 from pathlib import Path
 
 import numpy as np
-import pytest
 import torch
 
 from tdi.v2 import (
@@ -110,17 +109,19 @@ def test_encode_states_does_not_change_mode() -> None:
 
 
 def test_ca_filter_requires_superposition() -> None:
-    """Verify Ca filtering behaves according to superposition options."""
-    coords1 = np.array([[0.0, 0.0, 0.0]])
-    coords2 = np.array([[100.0, 0.0, 0.0]])
+    """Verify Ca filtering superposes correctly using Kabsch SVD."""
+    # Create two identical sets of coordinates but translated and rotated
+    coords1 = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    coords2 = coords1 + np.array([100.0, 50.0, -20.0])
 
-    idx_1, _idx_2 = filter_ca_distance(
-        np.array([0]), np.array([0]), coords1, coords2, max_ca_dist=None
-    )
-    assert np.array_equal(idx_1, np.array([0]))
+    idx_1 = np.array([0, 1, 2])
+    idx_2 = np.array([0, 1, 2])
 
-    with pytest.raises(NotImplementedError):
-        filter_ca_distance(np.array([0]), np.array([0]), coords1, coords2, max_ca_dist=5.0)
+    v1, v2, dists = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist=1.0)
+    assert np.array_equal(v1, idx_1)
+    assert np.array_equal(v2, idx_2)
+    assert dists is not None
+    assert np.all(dists < 1e-5)
 
 
 def test_parse_cigar_empty_shape() -> None:

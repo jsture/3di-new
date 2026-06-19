@@ -137,16 +137,58 @@ def filter_ca_distance(
     coords1: np.ndarray,
     coords2: np.ndarray,
     max_ca_dist: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Filter residue pairs by Ca-Ca distance after superposition.
 
-    Note: Ca distance filtering requires superposed coordinates or upstream filtered alignments.
+    Uses Kabsch algorithm (SVD) to superpose coords2 onto coords1 using the matched pairs,
+    then filters out pairs whose distance exceeds max_ca_dist.
     """
-    if max_ca_dist is not None:
-        raise NotImplementedError(
-            "Ca distance filtering requires superposed coordinates or upstream filtered alignments."
-        )
-    return idx_1, idx_2
+    if max_ca_dist is None or len(idx_1) < 3:
+        return idx_1, idx_2, None
+
+    # Get coordinates for the matched pairs
+    P = coords1[idx_1]
+    Q = coords2[idx_2]
+
+    # Calculate centroids
+    centroid_P = P.mean(axis=0)
+    centroid_Q = Q.mean(axis=0)
+
+    # Center the coordinates
+    p = P - centroid_P
+    q = Q - centroid_Q
+
+    # Covariance matrix
+    H = q.T @ p
+
+    # SVD
+    U, _S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    # Ensure a proper rotation (det(R) == 1)
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    # Translation vector
+    t = centroid_P - (R @ centroid_Q.T).T
+
+    # Apply transformation to Q
+    Q_rotated = (R @ Q.T).T + t
+
+    # Calculate distances
+    dist = np.linalg.norm(P - Q_rotated, axis=1)
+
+    # Filter
+    mask = dist <= max_ca_dist
+    return idx_1[mask], idx_2[mask], dist[mask]
+
+
+def assert_finite_features(x: np.ndarray, name: str) -> None:
+    """Validate that features contain no NaNs or Infs."""
+    if not np.isfinite(x).all():
+        bad = np.size(x) - np.isfinite(x).sum()
+        raise ValueError(f"{name} contains {bad} non-finite values")
 
 
 def make_bidirectional_pairs(
@@ -170,7 +212,7 @@ def align_features(
     sid2: str,
     cigar_string: str,
     max_ca_dist: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, dict]:
     """Return aligned descriptors for a given alignment between two PDBs.
 
     Filters pairs by local structural consistency using Ca-Ca distance.
@@ -184,7 +226,7 @@ def align_features(
         max_ca_dist: Maximum Ca-Ca distance in Angstroms for structural consistency filtering.
 
     Returns:
-        A tuple of (feat_x, feat_y) containing aligned features.
+        A tuple of (feat_x, feat_y, meta) where meta is a dictionary containing index arrays.
     """
     path1 = os.path.join(pdb_dir, sid1)
     path2 = os.path.join(pdb_dir, sid2)
@@ -194,13 +236,32 @@ def align_features(
 
     idx_pairs = parse_alignment(cigar_string)
     if idx_pairs.shape[0] == 0:
-        return np.zeros((0, 10), dtype=np.float32), np.zeros((0, 10), dtype=np.float32)
+        return np.zeros((0, 10), dtype=np.float32), np.zeros((0, 10), dtype=np.float32), {}
 
     idx_1, idx_2 = idx_pairs.T
     idx_1, idx_2 = filter_valid_pairs(idx_1, idx_2, mask1, mask2)
-    idx_1, idx_2 = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist)
+    idx_1, idx_2, dists = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist)
 
-    return make_bidirectional_pairs(feat1, feat2, idx_1, idx_2)
+    x, y = make_bidirectional_pairs(feat1, feat2, idx_1, idx_2)
+
+    if len(x) > 0:
+        assert_finite_features(x, f"x features from {sid1}-{sid2}")
+        assert_finite_features(y, f"y features from {sid1}-{sid2}")
+
+    # For bidirectional pairs, indices are also bidirectional
+    # First half is sid1->sid2, second half is sid2->sid1
+    if len(idx_1) > 0:
+        meta = {
+            "idx_source": np.concatenate([idx_1, idx_2]),
+            "idx_target": np.concatenate([idx_2, idx_1]),
+            "sid_source": [sid1] * len(idx_1) + [sid2] * len(idx_2),
+            "sid_target": [sid2] * len(idx_1) + [sid1] * len(idx_2),
+            "ca_dist": np.concatenate([dists, dists]) if dists is not None else None,
+        }
+    else:
+        meta = {}
+
+    return x, y, meta
 
 
 def fit_standardizer(x_train: np.ndarray, eps: float = 1e-6) -> tuple[np.ndarray, np.ndarray]:

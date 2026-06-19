@@ -8,7 +8,7 @@ import lightning as L
 import numpy as np
 import torch
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 
 from tdi.v2.model import TdiV2Model
 from tdi.v2.training_data import PairDataset
@@ -19,7 +19,8 @@ def main() -> None:
         description="Train modernized VQ-VAE (v2) model using PyTorch Lightning."
     )
     parser.add_argument("seed", type=int, help="Seed value for reproducibility.")
-    parser.add_argument("data_path", type=str, help="Path to training data .npy file.")
+    parser.add_argument("train_dir", type=str, help="Directory containing training data artifacts.")
+    parser.add_argument("val_dir", type=str, help="Directory containing validation data artifacts.")
     parser.add_argument(
         "out_dir", type=str, help="Output directory to save trained model parameters."
     )
@@ -46,7 +47,6 @@ def main() -> None:
     parser.add_argument(
         "--jitter_std", type=float, default=0.0, help="Coordinate jittering noise std."
     )
-    parser.add_argument("--val_split", type=float, default=0.1, help="Validation split fraction.")
     args = parser.parse_args()
 
     # Seed all sources of randomness
@@ -54,20 +54,24 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     # Load pair data
-    training_data_raw = np.load(args.data_path)
-    x_raw = training_data_raw[:, :, 0]
-    y_raw = training_data_raw[:, :, 1]
+    train_data_raw = np.load(os.path.join(args.train_dir, "data.npy"))
+    x_train_raw = train_data_raw[:, :, 0]
+    y_train_raw = train_data_raw[:, :, 1]
 
-    # Create dataset
-    full_dataset = PairDataset(x_raw, y_raw, jitter_std=args.jitter_std, seed=args.seed)
-    mean = full_dataset.mean
-    std = full_dataset.std
+    val_data_raw = np.load(os.path.join(args.val_dir, "data.npy"))
+    x_val_raw = val_data_raw[:, :, 0]
+    y_val_raw = val_data_raw[:, :, 1]
 
-    # Train/Val Split
-    val_size = int(len(full_dataset) * args.val_split)
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(
-        full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(args.seed)
+    # Create train dataset (fits scaler)
+    train_dataset = PairDataset(
+        x_train_raw, y_train_raw, jitter_std=args.jitter_std, seed=args.seed
+    )
+    mean = train_dataset.mean
+    std = train_dataset.std
+
+    # Create val dataset (uses train scaler, NO jitter)
+    val_dataset = PairDataset(
+        x_val_raw, y_val_raw, mean=mean, std=std, jitter_std=0.0, seed=args.seed
     )
 
     train_loader = DataLoader(
@@ -76,7 +80,7 @@ def main() -> None:
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     # Initialize model
-    input_dim = x_raw.shape[1]
+    input_dim = x_train_raw.shape[1]
     hidden_dim = 64
     z_dim = 4
 
