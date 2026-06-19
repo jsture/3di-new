@@ -18,6 +18,8 @@ import torch.nn.functional as F
 from lightning.pytorch.utilities.types import OptimizerLRScheduler
 from sklearn.cluster import KMeans
 
+from tdi.v2.quantizer_gradients import apply_quantizer_gradient
+
 
 class ResidualMLP(nn.Module):
     """Residual Multi-Layer Perceptron (MLP) for v2.
@@ -116,6 +118,7 @@ class EMAVectorQuantizer(nn.Module):
         l2_normalize: bool = True,
         min_count: float = 1.0,
         replacement_warmup_steps: int = 500,
+        gradient_mode: str = "rotation_trick",
     ) -> None:
         """Initialize the EMAVectorQuantizer.
 
@@ -128,6 +131,7 @@ class EMAVectorQuantizer(nn.Module):
             l2_normalize: If True, uses cosine distance (L2 normalization) for lookups.
             min_count: Minimum EMA usage count threshold for code replacement.
             replacement_warmup_steps: Warmup step count before replacing unused centroids.
+            gradient_mode: Gradient propagation mode ("ste" or "rotation_trick").
         """
         super().__init__()
         self.n_states = n_states
@@ -138,6 +142,7 @@ class EMAVectorQuantizer(nn.Module):
         self.l2_normalize = l2_normalize
         self.min_count = min_count
         self.replacement_warmup_steps = replacement_warmup_steps
+        self.gradient_mode = gradient_mode
 
         # Initialize codebook embedding weights uniformly
         embedding = torch.randn(n_states, z_dim)
@@ -239,8 +244,13 @@ class EMAVectorQuantizer(nn.Module):
 
         # Commitment loss to regularize encoder space
         commit_loss = self.commitment_cost * F.mse_loss(z, z_q.detach())
-        # Straight-through gradient estimator
-        z_q = z + (z_q - z).detach()
+        # Apply the selected surrogate-gradient estimator
+        z_q = apply_quantizer_gradient(
+            z=z,
+            z_q=z_q,
+            mode=self.gradient_mode,
+            eps=self.eps,
+        )
 
         return (
             commit_loss,
@@ -262,16 +272,25 @@ class FSQQuantizer(nn.Module):
     basis: torch.Tensor
     implicit_codebook: torch.Tensor
 
-    def __init__(self, levels: list[int]) -> None:
+    def __init__(
+        self,
+        levels: list[int],
+        gradient_mode: str = "rotation_trick",
+        eps: float = 1e-8,
+    ) -> None:
         """Initialize the FSQQuantizer.
 
         Args:
             levels: Integer quantization steps for each dimension (e.g. [5, 4] for 20 states).
+            gradient_mode: Gradient propagation mode ("ste" or "rotation_trick").
+            eps: Epsilon value.
         """
         super().__init__()
         self.levels = levels
         self.n_states = int(np.prod(levels))
         self.z_dim = len(levels)
+        self.gradient_mode = gradient_mode
+        self.eps = eps
 
         # Coordinate basis coefficients
         basis = []
@@ -323,7 +342,12 @@ class FSQQuantizer(nn.Module):
         self, z: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         z_q, indices = self.quantize(z)
-        z_q = z + (z_q - z).detach()
+        z_q = apply_quantizer_gradient(
+            z=z,
+            z_q=z_q,
+            mode=self.gradient_mode,
+            eps=self.eps,
+        )
 
         encodings = F.one_hot(indices, self.n_states).type_as(z)
         usage = encodings.float().mean(dim=0)
@@ -413,17 +437,18 @@ class TdiV2Model(L.LightningModule):
         l2_normalize: bool = True,
         min_count: float = 1.0,
         replacement_warmup_steps: int = 500,
-        lambda_usage: float = 0.0,
-        lambda_contrast: float = 0.0,
-        lambda_self: float = 0.1,
+        lambda_usage: float = 1e-3,
+        lambda_contrast: float = 0.02,
+        lambda_self: float = 0.05,
         temperature: float = 0.1,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
         warmup_ratio: float = 0.03,
-        quantizer_warmup_epochs: int = 0,
-        aux_ramp_epochs: int = 0,
+        quantizer_warmup_epochs: int = 1,
+        aux_ramp_epochs: int = 1,
         loss_type: str = "smooth_l1",
-        kmeans_init: bool = False,
+        kmeans_init: bool = True,
+        gradient_mode: str = "rotation_trick",
     ) -> None:
         """Initialize the TdiV2Model.
 
@@ -452,6 +477,8 @@ class TdiV2Model(L.LightningModule):
             aux_ramp_epochs: Epochs over which the auxiliary-loss weights ramp 0->1 after
                 quantization begins.
             loss_type: "smooth_l1" or "gaussian_nll".
+            kmeans_init: Whether to run k-means initialization of codebook.
+            gradient_mode: Gradient mode ("ste" or "rotation_trick").
         """
         super().__init__()
         self.save_hyperparameters()
@@ -480,6 +507,7 @@ class TdiV2Model(L.LightningModule):
         self.aux_ramp_epochs = aux_ramp_epochs
         self.loss_type = loss_type
         self.kmeans_init = kmeans_init
+        self.gradient_mode = gradient_mode
 
         # Initialize core encoder and decoder blocks
         self.encoder = ResidualMLP(input_dim, hidden_dim, z_dim, depth=3)
@@ -488,7 +516,7 @@ class TdiV2Model(L.LightningModule):
         # Initialize selected quantizer backend
         if quantizer_type == "fsq":
             assert fsq_levels_resolved is not None
-            self.quantizer = FSQQuantizer(fsq_levels_resolved)
+            self.quantizer = FSQQuantizer(fsq_levels_resolved, gradient_mode=gradient_mode)
         elif quantizer_type in ("vq", "ema_vq"):
             self.quantizer = EMAVectorQuantizer(
                 n_states,
@@ -499,6 +527,7 @@ class TdiV2Model(L.LightningModule):
                 l2_normalize=l2_normalize,
                 min_count=min_count,
                 replacement_warmup_steps=replacement_warmup_steps,
+                gradient_mode=gradient_mode,
             )
         else:
             raise ValueError(f"Unknown quantizer_type: {quantizer_type}")
@@ -948,6 +977,10 @@ class TdiV2Model(L.LightningModule):
             "quantizer_type": self.quantizer_type,
             "fsq_levels": self.fsq_levels,
             "loss_type": self.loss_type,
+            "l2_normalize": getattr(self.quantizer, "l2_normalize", False),
+            "gradient_mode": getattr(self.quantizer, "gradient_mode", "rotation_trick"),
+            "feature_convention": "seq_delta_j_minus_i",
+            "virtual_center": [270.0, 0.0, 2.0],
         }
         with open(out_path / "model_config.json", "w") as f:
             json.dump(config, f, indent=2)
@@ -994,6 +1027,8 @@ class TdiV2Model(L.LightningModule):
             quantizer_type=config["quantizer_type"],
             fsq_levels=config.get("fsq_levels"),
             loss_type=config.get("loss_type", "smooth_l1"),
+            l2_normalize=config.get("l2_normalize", True),
+            gradient_mode=config.get("gradient_mode", "rotation_trick"),
         )
 
         # Load encoder weights
