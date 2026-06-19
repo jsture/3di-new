@@ -4,7 +4,7 @@ import sys
 
 import numpy as np
 
-from tdi import util
+from . import util
 
 
 def load_sequences(seqfile_path: str) -> dict[str, str]:

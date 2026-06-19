@@ -7,7 +7,7 @@ import sys
 import numpy as np
 import torch
 
-from tdi.encode import process_pdb
+from tdi.v1.encode import process_pdb
 
 
 def main() -> None:

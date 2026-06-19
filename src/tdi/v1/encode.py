@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from tdi import features, training_data
+from . import features, training_data
 
 # 50 unique letters defining the structural alphabet states (excluding X/x)
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWYZabcdefghijklmnopqrstuvwyz"

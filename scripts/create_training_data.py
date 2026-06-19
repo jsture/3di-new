@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tdi.training_data import align_features
+from tdi.v1.training_data import align_features
 
 
 def main() -> None:
