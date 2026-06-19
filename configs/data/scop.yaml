@@ -1,0 +1,18 @@
+# SCOPe baseline preprocessing config for the tdi.data pipeline.
+# All preprocessing reads this file; CLI args may override, but the resolved
+# config is recorded in the output manifest.
+dataset:
+  name: scop_baseline
+  pdb_dir: data/external/foldseek_scop40/pdb_by_sid
+  train_pairfile: data/derived/pairfiles/tmaln-06.train.out
+  val_pairfile: data/derived/pairfiles/tmaln-06.val.out
+  scop_lookup: data/raw/scop_lookup.tsv
+features:
+  virtual_center: [270.0, 0.0, 2.0]
+  sequence_delta_convention: j_minus_i
+  max_ca_dist: 5.0
+sampling:
+  max_pairs_per_alignment: null
+  seed: 123
+outputs:
+  out_dir: data/processed/scop_ca5_v1

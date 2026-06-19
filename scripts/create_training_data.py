@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""CLI: extract features from aligned structure pairs to compile VQ-VAE training data."""
+"""CLI: extract features from aligned structure pairs to compile VQ-VAE training data.
+
+Legacy entry point. Prefer the reproducible pipeline:
+``python -m tdi.data build-features --config configs/data/scop.yaml`` (see src/tdi/data/),
+which records a manifest with input/output hashes, metadata, QC, and a report.
+"""
 
 import argparse
 import json
