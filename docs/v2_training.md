@@ -239,3 +239,22 @@ with open(scaler_path) as f:
 print("Scaler Mean:", scaler["mean"])
 print("Scaler Std:", scaler["std"])
 ```
+
+---
+
+## 11. Full Training Command Reference
+
+To execute the standard model training run using the default configuration settings:
+
+```bash
+uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml
+```
+
+To execute with custom parameters via command-line overrides (e.g. running 10 epochs with a specific learning rate):
+
+```bash
+uv run python -m tdi.v2 train \
+  --config configs/train/scop_v2_default.yaml \
+  --training.max_epochs 10 \
+  --optimizer.lr 0.002
+```
