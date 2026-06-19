@@ -10,9 +10,10 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "biopython>=1.87",
+    "lightning>=2.6.5",
     "numpy>=2.4.6",
     "pandas>=3.0.3",
-    "torch>=2.12.1",
+    "torch>2.12",
 ]
 
 [dependency-groups]
