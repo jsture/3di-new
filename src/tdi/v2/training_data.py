@@ -13,8 +13,8 @@ from torch.utils.data import Dataset
 
 from . import features, util
 
-# Cache for computed features to avoid expensive PDB re-parsing
-FEATURE_CACHE: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+# Cache for computed features (vae_features, valid_mask, coords) to avoid expensive PDB re-parsing
+FEATURE_CACHE: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
 
 def jitter_coords(
@@ -43,6 +43,57 @@ def jitter_coords(
     return out
 
 
+def extract_features(
+    pdb_path: str,
+    virt_cb: tuple[float, float, float],
+    jitter_std: float = 0.0,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Calculate 3D descriptors and coordinates for each residue of a PDB file.
+
+    Args:
+        pdb_path: Path to the PDB file.
+        virt_cb: Virtual center coordinate offset parameters (alpha, beta, d).
+        jitter_std: Standard deviation of coordinates jittering noise (0.0 to disable).
+        rng: Optional random generator for jittering.
+
+    Returns:
+        A tuple of (vae_features, valid_mask, coords).
+    """
+    # Check cache if jittering is disabled
+    if jitter_std == 0.0:
+        cached = FEATURE_CACHE.get(pdb_path)
+        if cached is not None:
+            return cached
+
+    # Parse coordinates
+    coords, valid_mask = features.get_coords_from_pdb(pdb_path, full_backbone=True)
+
+    # Apply coordinate-level training augmentation (jittering)
+    if jitter_std > 0.0 and rng is not None:
+        coords = jitter_coords(coords, valid_mask, jitter_std, rng)
+
+    coords_moved = features.move_CB(coords, virt_cb=virt_cb)
+
+    # Convention: sequence delta is partner_index - source_index.
+    # This is intentionally consistent with the existing implementation.
+    partner_idx = features.find_nearest_residues(coords_moved, valid_mask)
+    assert isinstance(partner_idx, np.ndarray)
+    feat, valid_mask2 = features.calc_angles_forloop(coords_moved, partner_idx, valid_mask)
+
+    # Compute sequence delta
+    seq_delta = (partner_idx - np.arange(len(partner_idx)))[:, np.newaxis]
+    seq_dist_log = np.sign(seq_delta) * np.log(np.abs(seq_delta) + 1)
+
+    # Combine structural angles and log sequence distance
+    vae_features = np.hstack([feat, seq_dist_log])
+
+    if jitter_std == 0.0:
+        FEATURE_CACHE[pdb_path] = vae_features, valid_mask2, coords
+
+    return vae_features, valid_mask2, coords
+
+
 def encoder_features(
     pdb_path: str,
     virt_cb: tuple[float, float, float],
@@ -58,39 +109,58 @@ def encoder_features(
         rng: Optional random generator for jittering.
 
     Returns:
-        A tuple of (vae_features, valid_mask):
-            - vae_features: Descriptors shape (N, 10) including local angles and seq log distance.
-            - valid_mask: Boolean mask of valid residues (shape: (N,)).
+        A tuple of (vae_features, valid_mask).
     """
-    # Check cache if jittering is disabled
-    if jitter_std == 0.0:
-        cached = FEATURE_CACHE.get(pdb_path)
-        if cached is not None:
-            return cached
+    feat, mask, _ = extract_features(pdb_path, virt_cb, jitter_std, rng)
+    return feat, mask
 
-    # Parse coordinates
-    coords, valid_mask = features.get_coords_from_pdb(pdb_path, full_backbone=True)
 
-    # Apply coordinate-level training augmentation (jittering)
-    if jitter_std > 0.0 and rng is not None:
-        coords = jitter_coords(coords, valid_mask, jitter_std, rng)
+def parse_alignment(cigar_string: str) -> np.ndarray:
+    """Parse CIGAR alignment string into a coordinate index mapping of matching positions."""
+    return util.parse_cigar(cigar_string)
 
-    coords = features.move_CB(coords, virt_cb=virt_cb)
-    partner_idx = features.find_nearest_residues(coords, valid_mask)
-    assert isinstance(partner_idx, np.ndarray)
-    feat, valid_mask2 = features.calc_angles_forloop(coords, partner_idx, valid_mask)
 
-    # Compute sequence log distance
-    seq_dist = (partner_idx - np.arange(len(partner_idx)))[:, np.newaxis]
-    log_dist = np.sign(seq_dist) * np.log(np.abs(seq_dist) + 1)
+def filter_valid_pairs(
+    idx_1: np.ndarray,
+    idx_2: np.ndarray,
+    mask1: np.ndarray,
+    mask2: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Filter out indices that are invalid in either structure's mask."""
+    valid_mask = mask1[idx_1] & mask2[idx_2]
+    return idx_1[valid_mask], idx_2[valid_mask]
 
-    # Combine structural angles and log sequence distance
-    vae_features = np.hstack([feat, log_dist])
 
-    if jitter_std == 0.0:
-        FEATURE_CACHE[pdb_path] = vae_features, valid_mask2
+def filter_ca_distance(
+    idx_1: np.ndarray,
+    idx_2: np.ndarray,
+    coords1: np.ndarray,
+    coords2: np.ndarray,
+    max_ca_dist: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Filter residue pairs by Ca-Ca distance after superposition.
 
-    return vae_features, valid_mask2
+    Note: Ca distance filtering requires superposed coordinates or upstream filtered alignments.
+    """
+    if max_ca_dist is not None:
+        raise NotImplementedError(
+            "Ca distance filtering requires superposed coordinates or upstream filtered alignments."
+        )
+    return idx_1, idx_2
+
+
+def make_bidirectional_pairs(
+    feat1: np.ndarray,
+    feat2: np.ndarray,
+    idx_1: np.ndarray,
+    idx_2: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Construct symmetric pair features for VQ-VAE target/partner training."""
+    if len(idx_1) == 0:
+        return np.zeros((0, 10), dtype=np.float32), np.zeros((0, 10), dtype=np.float32)
+    x = np.vstack([feat1[idx_1], feat2[idx_2]])
+    y = np.vstack([feat2[idx_2], feat1[idx_1]])
+    return x, y
 
 
 def align_features(
@@ -99,7 +169,7 @@ def align_features(
     sid1: str,
     sid2: str,
     cigar_string: str,
-    max_ca_dist: float | None = 5.0,
+    max_ca_dist: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return aligned descriptors for a given alignment between two PDBs.
 
@@ -116,38 +186,21 @@ def align_features(
     Returns:
         A tuple of (feat_x, feat_y) containing aligned features.
     """
-    idx_1, idx_2 = util.parse_cigar(cigar_string).T
-
     path1 = os.path.join(pdb_dir, sid1)
     path2 = os.path.join(pdb_dir, sid2)
 
-    feat1, mask1 = encoder_features(path1, virtual_center)
-    feat2, mask2 = encoder_features(path2, virtual_center)
+    feat1, mask1, coords1 = extract_features(path1, virtual_center)
+    feat2, mask2, coords2 = extract_features(path2, virtual_center)
 
-    valid_mask = mask1[idx_1] & mask2[idx_2]
-    idx_1 = idx_1[valid_mask]
-    idx_2 = idx_2[valid_mask]
-
-    # Enforce local structural consistency: compute CA-CA distances of aligned residues
-    if max_ca_dist is not None and len(idx_1) > 0:
-        coords1, _ = features.get_coords_from_pdb(path1, full_backbone=False)
-        coords2, _ = features.get_coords_from_pdb(path2, full_backbone=False)
-
-        ca1 = coords1[idx_1, 0:3]
-        ca2 = coords2[idx_2, 0:3]
-        ca_dists = np.linalg.norm(ca1 - ca2, axis=1)
-
-        # Retain only residues that are structurally aligned close enough
-        dist_mask = ca_dists <= max_ca_dist
-        idx_1 = idx_1[dist_mask]
-        idx_2 = idx_2[dist_mask]
-
-    if len(idx_1) == 0:
+    idx_pairs = parse_alignment(cigar_string)
+    if idx_pairs.shape[0] == 0:
         return np.zeros((0, 10), dtype=np.float32), np.zeros((0, 10), dtype=np.float32)
 
-    x = np.vstack([feat1[idx_1], feat2[idx_2]])
-    y = np.vstack([feat2[idx_2], feat1[idx_1]])
-    return x, y
+    idx_1, idx_2 = idx_pairs.T
+    idx_1, idx_2 = filter_valid_pairs(idx_1, idx_2, mask1, mask2)
+    idx_1, idx_2 = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist)
+
+    return make_bidirectional_pairs(feat1, feat2, idx_1, idx_2)
 
 
 def fit_standardizer(x_train: np.ndarray, eps: float = 1e-6) -> tuple[np.ndarray, np.ndarray]:
