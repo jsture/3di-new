@@ -1,6 +1,7 @@
 """Utility helper functions for parsing cigar strings and calculating mutual information."""
 
 import re
+
 import numpy as np
 
 
@@ -29,7 +30,7 @@ def parse_cigar(cigar_string: str) -> np.ndarray:
             ref += cnt
         elif action == "I":
             query += cnt
-        elif action == "M":  # use only Perfect matches (P) for substitution scoring
+        elif action == "M":
             ref += cnt
             query += cnt
         elif action == "P":
@@ -55,5 +56,4 @@ def mutual_information(p_ab: np.ndarray) -> float:
     p_b = p_ab.sum(axis=0)
     with np.errstate(invalid="ignore", divide="ignore"):
         log_scores = np.log2(p_ab / (p_a[:, np.newaxis] * p_b))
-        # Mask calculation for finite entries only
         return float(np.sum(p_ab * log_scores, where=np.isfinite(log_scores)))
