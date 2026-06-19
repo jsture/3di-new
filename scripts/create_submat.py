@@ -7,7 +7,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from tdi.submat import (
+from tdi.v1.submat import (
     accumulate_counts,
     calc_alphabet_mi,
     load_sequences,

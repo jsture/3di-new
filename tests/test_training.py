@@ -4,8 +4,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from tdi import features, util
-from tdi.model import VAE_VQ, Decoder, VectorQuantizer, create_vqvae, fuse_linear_bn
+from tdi.v1 import features, util
+from tdi.v1.model import VAE_VQ, Decoder, VectorQuantizer, create_vqvae, fuse_linear_bn
 
 
 def test_parse_cigar() -> None:

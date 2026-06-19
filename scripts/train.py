@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from tdi.model import create_vqvae, fuse_linear_bn, train_vqvae
+from tdi.v1.model import create_vqvae, fuse_linear_bn, train_vqvae
 
 
 def main() -> None:

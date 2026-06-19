@@ -4,7 +4,7 @@ import os
 
 import numpy as np
 
-from tdi import features, util
+from . import features, util
 
 # Feature cache to avoid recomputing descriptors for the same PDB file
 # maps PDB path to a tuple of (features, valid_mask)
