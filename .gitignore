@@ -232,9 +232,6 @@ __marimo__/
 
 
 # Data
-data/*
-!data/.gitkeep
-
 !data/TmAlphaFold/
 data/TmAlphaFold/*
 !data/TmAlphaFold/README.md
@@ -269,8 +266,40 @@ CLAUDE.md
 # --- Secrets ---
 .pypi-token
 
-# Scratch
-scratch/*
+# Docs
+docs/plans/
 
-# Repomix
-*repomix*.xml
+# Downloaded/extracted external structural data
+data/external/**
+!data/external/
+!data/external/**/
+!data/external/**/manifest.tsv
+!data/external/**/dataset_summary.json
+data/**/downloads/
+data/**/extracted/
+data/**/pdb_by_sid/
+
+# Generated feature/training artifacts
+data/processed/
+data/features/
+data/training_pairs/
+data/**/*.npy
+data/**/*.npz
+data/**/*.pt
+data/**/*.pth
+data/**/*.pkl
+data/**/*.parquet
+data/**/*.arrow
+data/**/*.h5
+data/**/*.hdf5
+
+# Model/checkpoint outputs
+outputs/
+runs/
+checkpoints/
+lightning_logs/
+wandb/
+mlruns/
+
+# Temporary local scratch
+tmp/
