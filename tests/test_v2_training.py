@@ -550,7 +550,9 @@ def test_warmup_bypasses_quantizer() -> None:
 
 def test_kmeans_fires_at_warmup_boundary() -> None:
     """k-means init runs once when quantization begins (EMA-VQ)."""
-    model = TdiV2Model(quantizer_type="vq", quantizer_warmup_epochs=1, aux_ramp_epochs=1)
+    model = TdiV2Model(
+        quantizer_type="vq", quantizer_warmup_epochs=1, aux_ramp_epochs=1, kmeans_init=True
+    )
     assert isinstance(model.quantizer, EMAVectorQuantizer)
     assert not bool(model.quantizer.initialized.item())
 

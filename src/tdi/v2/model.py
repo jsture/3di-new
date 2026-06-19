@@ -413,16 +413,17 @@ class TdiV2Model(L.LightningModule):
         l2_normalize: bool = True,
         min_count: float = 1.0,
         replacement_warmup_steps: int = 500,
-        lambda_usage: float = 1e-3,
-        lambda_contrast: float = 0.05,
+        lambda_usage: float = 0.0,
+        lambda_contrast: float = 0.0,
         lambda_self: float = 0.1,
         temperature: float = 0.1,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
         warmup_ratio: float = 0.03,
-        quantizer_warmup_epochs: int = 2,
-        aux_ramp_epochs: int = 2,
+        quantizer_warmup_epochs: int = 0,
+        aux_ramp_epochs: int = 0,
         loss_type: str = "smooth_l1",
+        kmeans_init: bool = False,
     ) -> None:
         """Initialize the TdiV2Model.
 
@@ -478,6 +479,7 @@ class TdiV2Model(L.LightningModule):
         self.quantizer_warmup_epochs = quantizer_warmup_epochs
         self.aux_ramp_epochs = aux_ramp_epochs
         self.loss_type = loss_type
+        self.kmeans_init = kmeans_init
 
         # Initialize core encoder and decoder blocks
         self.encoder = ResidualMLP(input_dim, hidden_dim, z_dim, depth=3)
@@ -606,6 +608,8 @@ class TdiV2Model(L.LightningModule):
         Fires once, when the first quantized epoch begins, so k-means runs on a useful
         latent manifold rather than an untrained encoder. No-op for FSQ.
         """
+        if not self.kmeans_init:
+            return
         loader = self.trainer.train_dataloader
         if (
             loader is not None

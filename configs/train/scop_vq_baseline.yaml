@@ -1,0 +1,25 @@
+# SCOPe baseline training configuration for v2 model.
+seed: 42
+train_dir: data/processed/scop_ca5_v1
+val_dir: data/processed/scop_ca5_v1
+out_dir: training/scop_vq_baseline
+n_states: 20
+quantizer_type: vq
+max_epochs: 100
+batch_size: 512
+lr: 0.001
+
+# Quantizer and regularizers (disabled for baseline)
+kmeans_init: false
+quantizer_warmup_epochs: 0
+aux_ramp_epochs: 0
+lambda_usage: 0.0
+lambda_contrast: 0.0
+lambda_self: 0.1
+descriptor_jitter_std: 0.0
+
+# Batch composition and hardware (disabled for baseline)
+alignments_per_batch: 0
+accumulate_grad_batches: 1
+precision: 32-true
+torch_compile: false
