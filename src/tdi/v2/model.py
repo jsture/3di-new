@@ -768,9 +768,15 @@ class TdiV2Model(L.LightningModule):
         # fitting the easy sequence dims while ignoring angular geometry).
         if self._trainer is not None and getattr(self._trainer, "_results", None) is not None:
             with torch.no_grad():
-                recon_angles = F.smooth_l1_loss(mu_partner[:, 0:7], y[:, 0:7])
-                recon_ca_distance = F.smooth_l1_loss(mu_partner[:, 7:8], y[:, 7:8])
-                recon_sequence = F.smooth_l1_loss(mu_partner[:, 8:10], y[:, 8:10])
+                recon_angles = F.smooth_l1_loss(
+                    mu_partner[:, 0:7].contiguous(), y[:, 0:7].contiguous()
+                )
+                recon_ca_distance = F.smooth_l1_loss(
+                    mu_partner[:, 7:8].contiguous(), y[:, 7:8].contiguous()
+                )
+                recon_sequence = F.smooth_l1_loss(
+                    mu_partner[:, 8:10].contiguous(), y[:, 8:10].contiguous()
+                )
             self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True)
             self.log("loss_total", total_loss, on_epoch=True)
             self.log("loss_partner", loss_partner, on_epoch=True)

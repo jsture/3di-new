@@ -28,7 +28,7 @@ def run_evaluate(args: argparse.Namespace) -> None:
         for line in f:
             parts = line.rstrip("\n").split()
             if len(parts) >= 3:
-                sid1, sid2, cigar = parts[0], parts[1], parts[2]
+                sid1, sid2, cigar = parts[0], parts[1], parts[-1]
                 unique_sids.add(sid1)
                 unique_sids.add(sid2)
                 alignments.append((sid1, sid2, cigar))

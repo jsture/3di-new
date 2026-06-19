@@ -29,7 +29,7 @@ def _read_pairfile(path: str | Path) -> list[tuple[int, str, str, str]]:
         for source_row, line in enumerate(f):
             parts = line.split()
             if len(parts) >= 3:
-                rows.append((source_row, parts[0], parts[1], parts[2]))
+                rows.append((source_row, parts[0], parts[1], parts[-1]))
     # Sort by content so iteration order is independent of file ordering.
     rows.sort(key=lambda r: (r[1], r[2], r[3], r[0]))
     return rows
