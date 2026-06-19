@@ -4,7 +4,12 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "biopython>=1.87",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "torch>=2.12.1",
+]
 
 [dependency-groups]
 dev = [
