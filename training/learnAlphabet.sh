@@ -42,7 +42,7 @@ fi
 # Filter TM-align pairfile to training PDBs only
 awk 'FNR==NR {pdbs[$1]=1; next}
      ($1 in pdbs) && ($2 in pdbs) {print $1,$2,$10}' \
-    "$PDBS_TRAIN" data/tmaln-06.out > tmp/pairfile_train.out
+    "$PDBS_TRAIN" ../data/tmaln-06.out > tmp/pairfile_train.out
 
 # Generate training features
 uv run ../scripts/create_training_data.py \
@@ -63,7 +63,7 @@ for ((seed=0; seed<TRIES; seed++)); do
         --mat tmp/sub_score.mat
 
     ./run-benchmark.sh tmp/encoder.pt tmp/states.txt tmp/sub_score.mat \
-        "$PDBS_VAL" data/scop_lookup.tsv $THETA $TAU $D X >> "$OUTPUT_DIR/log.txt"
+        "$PDBS_VAL" ../data/scop_lookup.tsv $THETA $TAU $D X >> "$OUTPUT_DIR/log.txt"
 done
 
 # Pick best seed (normalized against TMAalign reference AUCs)
@@ -76,7 +76,7 @@ uv run ../scripts/train.py "$SEED" tmp/vaevq_training_data.npy "$OUTPUT_DIR" "$K
 # Build final substitution matrix (includes all training PDBs)
 awk 'FNR==NR {pdbs[$1]=1; next}
      ($1 in pdbs) && ($2 in pdbs) {print $1,$2,$10}' \
-    "$PDBS_TRAIN" data/tmaln-06.out > tmp/pairfile_submat.out
+    "$PDBS_TRAIN" ../data/tmaln-06.out > tmp/pairfile_submat.out
 
 $RUN uv run ../scripts/encode_pdbs.py "$OUTPUT_DIR/encoder.pt" "$OUTPUT_DIR/states.txt" \
     --pdb_dir tmp/pdb --virt $THETA $TAU $D \

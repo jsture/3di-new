@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument(
         "--lookup-file",
         type=str,
-        default="data/scop_lookup.tsv",
+        default=str(Path(__file__).parent.parent / "data" / "scop_lookup.tsv"),
         help="Path to the SCOP classification lookup mapping TSV file.",
     )
     parser.add_argument(

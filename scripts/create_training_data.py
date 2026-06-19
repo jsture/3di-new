@@ -22,8 +22,7 @@ def main() -> None:
     parser.add_argument("out", type=str, help="Output path for the .npy training data file.")
     args = parser.parse_args()
 
-    data_dir = Path(__file__).parent.parent / "training" / "data"
-    pdbs_train_path = data_dir / "pdbs_train.txt"
+    pdbs_train_path = Path(__file__).parent.parent / "data" / "pdbs_train.txt"
 
     with open(pdbs_train_path) as file:
         pdbs_train = set(file.read().splitlines())
