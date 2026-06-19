@@ -1,40 +1,43 @@
-# SCOPe baseline training configuration for v2 model.
 model:
   input_dim: 10
   hidden_dim: 64
   z_dim: 4
   n_states: 20
-  norm: layernorm
-  activation: silu
-  quantizer: ema_vq
-  quantizer_gradient: ste
+  quantizer_type: ema_vq
+  loss_type: smooth_l1
+quantizer:
+  l2_normalize: true
+  decay: 0.99
+  commitment_cost: 0.25
+  min_count: 1.0
+  replacement_warmup_steps: 500
+  gradient_mode: ste
   kmeans_init: true
+  kmeans_seed: 0
+  kmeans_init_batches: 16
+  kmeans_init_samples: 50000
 loss:
-  primary: smooth_l1
-  commitment_weight: 0.25
-  usage_weight: 0.0
-  contrastive_weight: 0.0
-  self_reconstruction_weight: 0.0
-data:
-  train_dir: data/processed/scop_ca5_v1
-  val_dir: data/processed/scop_ca5_v1
-  max_ca_dist: 5.0
-  standardize_features: true
-  sampler: random
-  max_pairs_per_alignment: null
+  lambda_self: 0.0
+  lambda_usage: 0.0
+  lambda_contrast: 0.0
+  temperature: 0.1
+training:
+  batch_size: 512
+  max_epochs: 20
+  quantizer_warmup_epochs: 0
+  aux_ramp_epochs: 1
+  precision: 32-true
+  seed: 42
+  accumulate_grad_batches: 1
 optimizer:
-  type: adamw
   lr: 0.001
   weight_decay: 0.0001
-  exclude_bias_and_norm_from_decay: true
+  warmup_ratio: 0.03
   gradient_clip_val: 1.0
-  warmup_steps: 500
-  scheduler: cosine_by_total_steps
-training:
-  seed: 42
-  precision: 32-true
-  continuous_warmup_epochs: 0
-  max_epochs: 20
-  batch_size: 512
-  accumulate_grad_batches: 1
-  torch_compile: false
+data:
+  processed_dir: data/processed/scop_ca5_v1
+  descriptor_jitter_std: 0.0
+  sampler: random
+  alignments_per_batch: null
+outputs:
+  out_dir: outputs/models/scop_vq_baseline_seed42
