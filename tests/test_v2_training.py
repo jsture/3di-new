@@ -236,3 +236,155 @@ def test_make_bidirectional_pairs() -> None:
     x, y = make_bidirectional_pairs(feat1, feat2, idx_1, idx_2)
     assert x.shape == (4, 10)
     assert y.shape == (4, 10)
+
+
+def test_ca_filter_12d_coordinates() -> None:
+    """Verify filter_ca_distance works with full backbone (12D) coordinates."""
+    ca1 = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    ca2 = ca1 + np.array([10.0, -5.0, 2.0])
+
+    coords1 = np.zeros((3, 12))
+    coords2 = np.zeros((3, 12))
+    coords1[:, 0:3] = ca1
+    coords2[:, 0:3] = ca2
+
+    idx_1 = np.array([0, 1, 2])
+    idx_2 = np.array([0, 1, 2])
+
+    v1, v2, dists = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist=1.0)
+    assert np.array_equal(v1, idx_1)
+    assert np.array_equal(v2, idx_2)
+    assert dists is not None
+    assert np.all(dists < 1e-5)
+
+
+def test_deterministic_rng_capping() -> None:
+    """Verify that alignment-specific hashing and rng choice are reproducible."""
+    alignment_id = "d1qksa1-d1gwua_"
+    seed = 123
+    import hashlib
+
+    hasher = hashlib.sha256(f"{alignment_id}:{seed}".encode())
+    cap_seed = int(hasher.hexdigest(), 16) % (2**32)
+
+    rng1 = np.random.default_rng(cap_seed)
+    rng2 = np.random.default_rng(cap_seed)
+
+    choices1 = rng1.choice(100, 10, replace=False)
+    choices2 = rng2.choice(100, 10, replace=False)
+    assert np.array_equal(choices1, choices2)
+
+
+def test_scop_grouping_logic(tmp_path: Path) -> None:
+    """Verify make_splits.py logic with SCOP lookup fold/superfamily grouping."""
+    lookup_file = tmp_path / "scop_lookup.tsv"
+    with open(lookup_file, "w") as f:
+        f.write("d1qksa1\ta.3.1.2\n")
+        f.write("d1gwua_\ta.3.1.5\n")
+        f.write("d1i17a_\tb.1.1.1\n")
+
+    pdbs_file = tmp_path / "pdbs.txt"
+    with open(pdbs_file, "w") as f:
+        f.write("d1qksa1\n")
+        f.write("d1gwua_\n")
+        f.write("d1i17a_\n")
+        f.write("d_fallback\n")
+
+    import subprocess
+
+    import pandas as pd
+
+    out_dir = tmp_path / "splits"
+    cmd = [
+        "python3",
+        "scripts/make_splits.py",
+        str(pdbs_file),
+        str(out_dir),
+        "--scop_lookup",
+        str(lookup_file),
+        "--group_by",
+        "superfamily",
+        "--seed",
+        "42",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    assert (out_dir / "train_manifest.csv").exists()
+    assert (out_dir / "val_manifest.csv").exists()
+
+    df = pd.read_csv(out_dir / "train_manifest.csv")
+    row_q = df[df["structure_id"] == "d1qksa1"].iloc[0]
+    row_g = df[df["structure_id"] == "d1gwua_"].iloc[0]
+    assert row_q["group_id"] == "a.3.1"
+    assert row_g["group_id"] == "a.3.1"
+
+
+def test_cli_evaluate_end_to_end(tmp_path: Path) -> None:
+    """Verify tdi-v2 evaluate command end-to-end with mock inputs."""
+    # 1. Export a dummy model
+    from tdi.v2 import TdiV2Model
+
+    model = TdiV2Model(quantizer_type="fsq", fsq_levels=[5, 4])
+    model_dir = tmp_path / "exported_model"
+    mean = np.zeros(10)
+    std = np.ones(10)
+    model.export_model(model_dir, mean=mean, std=std)
+
+    # 2. Create a dummy PDB file
+    pdb_dir = tmp_path / "pdbs"
+    pdb_dir.mkdir()
+    pdb_content = (
+        "HEADER    MOCK PROTEIN\n"
+        "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+        "ATOM      2  CA  ALA A   1       1.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      3  C   ALA A   1       2.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      4  O   ALA A   1       2.000   1.000   0.000  1.00  0.00           O\n"
+        "ATOM      5  CB  ALA A   1       1.000   1.000   0.000  1.00  0.00           C\n"
+        "ATOM      6  N   GLY A   2       3.000   0.000   0.000  1.00  0.00           N\n"
+        "ATOM      7  CA  GLY A   2       4.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      8  C   GLY A   2       5.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      9  O   GLY A   2       5.000   1.000   0.000  1.00  0.00           O\n"
+        "ATOM     10  N   ALA A   3       6.000   0.000   0.000  1.00  0.00           N\n"
+        "ATOM     11  CA  ALA A   3       7.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM     12  C   ALA A   3       8.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM     13  O   ALA A   3       8.000   1.000   0.000  1.00  0.00           O\n"
+        "ATOM     14  CB  ALA A   3       7.000   1.000   0.000  1.00  0.00           C\n"
+        "TER\n"
+    )
+    with open(pdb_dir / "d1qksa1.pdb", "w") as f:
+        f.write(pdb_content)
+    with open(pdb_dir / "d1gwua_.pdb", "w") as f:
+        f.write(pdb_content)
+
+    # 3. Create a dummy pairfile
+    pairfile = tmp_path / "pairs.txt"
+    with open(pairfile, "w") as f:
+        f.write("d1qksa1 d1gwua_ 3M\n")
+
+    # 4. Invoke CLI evaluate command via subprocess
+    import subprocess
+
+    out_dir = tmp_path / "eval_out"
+    cmd = [
+        "python3",
+        "-m",
+        "tdi.v2.cli",
+        "evaluate",
+        "--model_dir",
+        str(model_dir),
+        "--pdb_dir",
+        str(pdb_dir),
+        "--pairfile",
+        str(pairfile),
+        "--out_dir",
+        str(out_dir),
+        "--virt",
+        "0.0",
+        "0.0",
+        "1.0",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    assert (out_dir / "sequences.txt").exists()
+    assert (out_dir / "submat.txt").exists()
+    assert (out_dir / "evaluation_report.json").exists()

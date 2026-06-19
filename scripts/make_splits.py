@@ -15,6 +15,19 @@ def main() -> None:
     parser.add_argument("out_dir", type=str, help="Output directory for manifests.")
     parser.add_argument("--val_split", type=float, default=0.1, help="Validation split fraction.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for splitting.")
+    parser.add_argument(
+        "--group_by",
+        type=str,
+        default="superfamily",
+        choices=["fold", "superfamily", "pdb"],
+        help="Grouping level to partition splits.",
+    )
+    parser.add_argument(
+        "--scop_lookup",
+        type=str,
+        default="data/raw/scop_lookup.tsv",
+        help="Path to SCOP classification lookup mapping TSV file.",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -22,15 +35,44 @@ def main() -> None:
     with open(args.input) as f:
         sids = f.read().splitlines()
 
+    scop_lookup = {}
+    if args.group_by in ("fold", "superfamily"):
+        lookup_path = Path(args.scop_lookup)
+        if lookup_path.exists():
+            with open(lookup_path) as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        scop_lookup[parts[0]] = parts[1]
+        else:
+            print(
+                f"Warning: SCOP lookup file {args.scop_lookup} not found. "
+                "Falling back to PDB grouping."
+            )
+
     # Group by PDB ID to prevent cross-domain leakage
     # SCOP SID format is typically d[pdb_id][chain][domain] -> e.g., d1qksa1
     # PDB ID is usually chars 1 to 5 (4 chars long). If not standard, group by the whole SID.
     groups: dict[str, list[str]] = defaultdict(list)
+    fallback_count = 0
     for sid in sids:
-        if sid.startswith("d") and len(sid) >= 5:
-            group_id = sid[1:5]
-        else:
-            group_id = sid
+        group_id = None
+        if args.group_by in ("fold", "superfamily") and sid in scop_lookup:
+            classification = scop_lookup[sid]
+            parts = classification.split(".")
+            if args.group_by == "fold":
+                group_id = ".".join(parts[:2])
+            else:
+                group_id = ".".join(parts[:3])
+
+        # Fallback to PDB grouping if SCOP class lookup fails
+        if group_id is None:
+            if args.group_by in ("fold", "superfamily") and len(scop_lookup) > 0:
+                fallback_count += 1
+            if sid.startswith("d") and len(sid) >= 5:
+                group_id = sid[1:5]
+            else:
+                group_id = sid
         groups[group_id].append(sid)
 
     # Shuffle groups
@@ -63,6 +105,9 @@ def main() -> None:
                     f_train.write(f"{sid},{group_id},train\n")
                     train_count += 1
 
+    if fallback_count > 0:
+        print(f"Homology grouping: {fallback_count} SIDs fell back to PDB ID grouping.")
+    print(f"Total unique groups: {len(groups)}")
     print(f"Split complete: {train_count} train SIDs, {val_count} val SIDs.")
     print(f"Manifests saved to {out_dir}")
 

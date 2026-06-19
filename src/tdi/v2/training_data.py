@@ -143,12 +143,12 @@ def filter_ca_distance(
     Uses Kabsch algorithm (SVD) to superpose coords2 onto coords1 using the matched pairs,
     then filters out pairs whose distance exceeds max_ca_dist.
     """
-    if max_ca_dist is None or len(idx_1) < 3:
+    if len(idx_1) < 3:
         return idx_1, idx_2, None
 
-    # Get coordinates for the matched pairs
-    P = coords1[idx_1]
-    Q = coords2[idx_2]
+    # Get C-alpha coordinates (columns 0:3) for the matched pairs
+    P = coords1[idx_1, 0:3]
+    Q = coords2[idx_2, 0:3]
 
     # Calculate centroids
     centroid_P = P.mean(axis=0)
@@ -179,9 +179,11 @@ def filter_ca_distance(
     # Calculate distances
     dist = np.linalg.norm(P - Q_rotated, axis=1)
 
-    # Filter
-    mask = dist <= max_ca_dist
-    return idx_1[mask], idx_2[mask], dist[mask]
+    if max_ca_dist is not None:
+        mask = dist <= max_ca_dist
+        return idx_1[mask], idx_2[mask], dist[mask]
+
+    return idx_1, idx_2, dist
 
 
 def assert_finite_features(x: np.ndarray, name: str) -> None:
@@ -212,6 +214,8 @@ def align_features(
     sid2: str,
     cigar_string: str,
     max_ca_dist: float | None = None,
+    max_pairs: int | None = None,
+    seed: int = 123,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Return aligned descriptors for a given alignment between two PDBs.
 
@@ -224,6 +228,8 @@ def align_features(
         sid2: Structural ID of second protein.
         cigar_string: The alignment CIGAR string mapping residues.
         max_ca_dist: Maximum Ca-Ca distance in Angstroms for structural consistency filtering.
+        max_pairs: Optional maximum bidirectional pairs to generate.
+        seed: Base random seed for sub-sampling reproducibility.
 
     Returns:
         A tuple of (feat_x, feat_y, meta) where meta is a dictionary containing index arrays.
@@ -235,12 +241,45 @@ def align_features(
     feat2, mask2, coords2 = extract_features(path2, virtual_center)
 
     idx_pairs = parse_alignment(cigar_string)
-    if idx_pairs.shape[0] == 0:
-        return np.zeros((0, 10), dtype=np.float32), np.zeros((0, 10), dtype=np.float32), {}
+    n_pairs_before_filters = idx_pairs.shape[0]
+    if n_pairs_before_filters == 0:
+        return (
+            np.zeros((0, 10), dtype=np.float32),
+            np.zeros((0, 10), dtype=np.float32),
+            {
+                "n_pairs_before_filters": 0,
+                "n_pairs_after_descriptor_validity": 0,
+                "n_pairs_after_ca_filter": 0,
+                "n_pairs_after_max_pairs": 0,
+                "cap_seed": None,
+            },
+        )
 
     idx_1, idx_2 = idx_pairs.T
     idx_1, idx_2 = filter_valid_pairs(idx_1, idx_2, mask1, mask2)
+    n_pairs_after_descriptor_validity = len(idx_1)
+
     idx_1, idx_2, dists = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist)
+    n_pairs_after_ca_filter = len(idx_1)
+
+    # Sub-sample before bidirectional mapping if max_pairs is set
+    cap_seed = None
+    if max_pairs is not None and len(idx_1) > max_pairs // 2:
+        alignment_id = f"{sid1}-{sid2}"
+        import hashlib
+
+        hasher = hashlib.sha256(f"{alignment_id}:{seed}".encode())
+        cap_seed = int(hasher.hexdigest(), 16) % (2**32)
+
+        rng = np.random.default_rng(cap_seed)
+        keep_size = max_pairs // 2
+        idx = rng.choice(len(idx_1), keep_size, replace=False)
+        idx_1 = idx_1[idx]
+        idx_2 = idx_2[idx]
+        if dists is not None:
+            dists = dists[idx]
+
+    n_pairs_after_max_pairs = len(idx_1)
 
     x, y = make_bidirectional_pairs(feat1, feat2, idx_1, idx_2)
 
@@ -251,15 +290,36 @@ def align_features(
     # For bidirectional pairs, indices are also bidirectional
     # First half is sid1->sid2, second half is sid2->sid1
     if len(idx_1) > 0:
+        ca1 = coords1[idx_1, 0:3]
+        ca2 = coords2[idx_2, 0:3]
+        raw_dists = np.linalg.norm(ca1 - ca2, axis=1)
+
+        if dists is not None:
+            superposed_dists = np.concatenate([dists, dists])
+        else:
+            superposed_dists = np.full(len(idx_1) * 2, np.nan)
+
         meta = {
             "idx_source": np.concatenate([idx_1, idx_2]),
             "idx_target": np.concatenate([idx_2, idx_1]),
             "sid_source": [sid1] * len(idx_1) + [sid2] * len(idx_2),
             "sid_target": [sid2] * len(idx_1) + [sid1] * len(idx_2),
-            "ca_dist": np.concatenate([dists, dists]) if dists is not None else None,
+            "ca_dist_superposed": superposed_dists,
+            "ca_dist_raw": np.concatenate([raw_dists, raw_dists]),
+            "n_pairs_before_filters": n_pairs_before_filters,
+            "n_pairs_after_descriptor_validity": n_pairs_after_descriptor_validity,
+            "n_pairs_after_ca_filter": n_pairs_after_ca_filter,
+            "n_pairs_after_max_pairs": n_pairs_after_max_pairs,
+            "cap_seed": cap_seed,
         }
     else:
-        meta = {}
+        meta = {
+            "n_pairs_before_filters": n_pairs_before_filters,
+            "n_pairs_after_descriptor_validity": n_pairs_after_descriptor_validity,
+            "n_pairs_after_ca_filter": n_pairs_after_ca_filter,
+            "n_pairs_after_max_pairs": n_pairs_after_max_pairs,
+            "cap_seed": cap_seed,
+        }
 
     return x, y, meta
 
