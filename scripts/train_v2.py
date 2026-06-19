@@ -282,39 +282,79 @@ def main() -> None:
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
+    # Map CLI options to nested config keys (section, key)
+    cli_mapping = {
+        "seed": ("training", "seed"),
+        "train_dir": ("data", "train_dir"),
+        "val_dir": ("data", "val_dir"),
+        "out_dir": ("training", "out_dir"),
+        "n_states": ("model", "n_states"),
+        "quantizer_type": ("model", "quantizer"),
+        "fsq_levels": ("model", "fsq_levels"),
+        "max_epochs": ("training", "max_epochs"),
+        "batch_size": ("training", "batch_size"),
+        "lr": ("optimizer", "lr"),
+        "kmeans_init": ("model", "kmeans_init"),
+        "quantizer_warmup_epochs": ("training", "continuous_warmup_epochs"),
+        "aux_ramp_epochs": ("training", "aux_ramp_epochs"),
+        "lambda_contrast": ("loss", "contrastive_weight"),
+        "lambda_usage": ("loss", "usage_weight"),
+        "lambda_self": ("loss", "self_reconstruction_weight"),
+        "descriptor_jitter_std": ("data", "descriptor_jitter_std"),
+        "alignments_per_batch": ("data", "alignments_per_batch"),
+        "accumulate_grad_batches": ("training", "accumulate_grad_batches"),
+        "precision": ("training", "precision"),
+        "torch_compile": ("training", "torch_compile"),
+        "decay": ("model", "decay"),
+        "eps": ("model", "eps"),
+        "commitment_cost": ("loss", "commitment_weight"),
+        "l2_normalize": ("model", "l2_normalize"),
+        "min_count": ("model", "min_count"),
+        "replacement_warmup_steps": ("model", "replacement_warmup_steps"),
+        "weight_decay": ("optimizer", "weight_decay"),
+        "warmup_ratio": ("optimizer", "warmup_ratio"),
+        "loss_type": ("loss", "primary"),
+    }
+
     # Merge override options that were explicitly passed in the CLI
     for key, value in vars(args).items():
         if key == "config":
             continue
         if value is not None:
-            config[key] = value
+            if key in cli_mapping:
+                section, nested_key = cli_mapping[key]
+                if section not in config:
+                    config[section] = {}
+                config[section][nested_key] = value
+            else:
+                config[key] = value
 
     # Ensure required configuration keys are present
     required_keys = [
-        "seed",
-        "train_dir",
-        "val_dir",
-        "out_dir",
-        "n_states",
-        "quantizer_type",
-        "max_epochs",
-        "batch_size",
-        "lr",
+        ("training", "seed"),
+        ("data", "train_dir"),
+        ("data", "val_dir"),
+        ("training", "out_dir"),
+        ("model", "n_states"),
+        ("model", "quantizer"),
+        ("training", "max_epochs"),
+        ("training", "batch_size"),
+        ("optimizer", "lr"),
     ]
-    for k in required_keys:
-        if k not in config:
-            raise ValueError(f"Missing required configuration key: {k}")
+    for section, key in required_keys:
+        if section not in config or key not in config[section]:
+            raise ValueError(f"Missing required configuration key: {section}.{key}")
 
     # Seed all sources of randomness
-    L.seed_everything(config["seed"])
-    torch.manual_seed(config["seed"])
+    L.seed_everything(config["training"]["seed"])
+    torch.manual_seed(config["training"]["seed"])
 
     # Load pair data
-    train_data_raw = np.load(os.path.join(config["train_dir"], "data.npy"))
+    train_data_raw = np.load(os.path.join(config["data"]["train_dir"], "data.npy"))
     x_train_raw = train_data_raw[:, :, 0]
     y_train_raw = train_data_raw[:, :, 1]
 
-    val_data_raw = np.load(os.path.join(config["val_dir"], "data.npy"))
+    val_data_raw = np.load(os.path.join(config["data"]["val_dir"], "data.npy"))
     x_val_raw = val_data_raw[:, :, 0]
     y_val_raw = val_data_raw[:, :, 1]
 
@@ -322,72 +362,81 @@ def main() -> None:
     train_dataset = PairDataset(
         x_train_raw,
         y_train_raw,
-        descriptor_jitter_std=config.get("descriptor_jitter_std", 0.0),
-        seed=config["seed"],
+        descriptor_jitter_std=config["data"].get("descriptor_jitter_std", 0.0),
+        seed=config["training"]["seed"],
     )
     mean = train_dataset.mean
     std = train_dataset.std
 
     # Create val dataset (uses train scaler, NO jitter)
     val_dataset = PairDataset(
-        x_val_raw, y_val_raw, mean=mean, std=std, descriptor_jitter_std=0.0, seed=config["seed"]
+        x_val_raw,
+        y_val_raw,
+        mean=mean,
+        std=std,
+        descriptor_jitter_std=0.0,
+        seed=config["training"]["seed"],
     )
 
     # Alignment-aware batching when requested and metadata is available; else flat random.
-    alignments_per_batch = config.get("alignments_per_batch", 0)
-    alignment_ids = _load_alignment_ids(config["train_dir"], len(x_train_raw))
+    alignments_per_batch = config["data"].get("alignments_per_batch", 0)
+    alignment_ids = _load_alignment_ids(config["data"]["train_dir"], len(x_train_raw))
     if alignments_per_batch > 0 and alignment_ids is not None:
         sampler = AlignmentBatchSampler(
             alignment_ids,
-            batch_size=config["batch_size"],
+            batch_size=config["training"]["batch_size"],
             alignments_per_batch=alignments_per_batch,
-            seed=config["seed"],
+            seed=config["training"]["seed"],
         )
         train_loader = DataLoader(train_dataset, batch_sampler=sampler, num_workers=0)
     else:
         if alignments_per_batch > 0:
             print("alignment-aware sampling requested but no row-aligned metadata; using random.")
         train_loader = DataLoader(
-            train_dataset, batch_size=config["batch_size"], shuffle=True, num_workers=0
+            train_dataset, batch_size=config["training"]["batch_size"], shuffle=True, num_workers=0
         )
     val_loader = DataLoader(
-        val_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=0
+        val_dataset, batch_size=config["training"]["batch_size"], shuffle=False, num_workers=0
     )
 
     # Initialize model
     input_dim = x_train_raw.shape[1]
-    hidden_dim = 64
-    z_dim = 4
+    hidden_dim = config["model"].get("hidden_dim", 64)
+    z_dim = config["model"].get("z_dim", 4)
+
+    # Map the quantizer parameter to match model input 'quantizer_type'
+    quantizer = config["model"]["quantizer"]
+    quantizer_type = "vq" if quantizer in ("vq", "ema_vq") else quantizer
 
     # Build model using config parameters
     model = TdiV2Model(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         z_dim=z_dim,
-        n_states=config["n_states"],
-        quantizer_type=config["quantizer_type"],
-        fsq_levels=config.get("fsq_levels"),
-        decay=config.get("decay", 0.99),
-        eps=config.get("eps", 1e-5),
-        commitment_cost=config.get("commitment_cost", 0.25),
-        l2_normalize=config.get("l2_normalize", True),
-        min_count=config.get("min_count", 1.0),
-        replacement_warmup_steps=config.get("replacement_warmup_steps", 500),
-        lambda_usage=config.get("lambda_usage", 0.0),
-        lambda_contrast=config.get("lambda_contrast", 0.0),
-        lambda_self=config.get("lambda_self", 0.1),
-        temperature=config.get("temperature", 0.1),
-        lr=config["lr"],
-        weight_decay=config.get("weight_decay", 1e-4),
-        warmup_ratio=config.get("warmup_ratio", 0.03),
-        quantizer_warmup_epochs=config.get("quantizer_warmup_epochs", 0),
-        aux_ramp_epochs=config.get("aux_ramp_epochs", 0),
-        loss_type=config.get("loss_type", "smooth_l1"),
-        kmeans_init=config.get("kmeans_init", False),
+        n_states=config["model"]["n_states"],
+        quantizer_type=quantizer_type,
+        fsq_levels=config["model"].get("fsq_levels"),
+        decay=config["model"].get("decay", 0.99),
+        eps=config["model"].get("eps", 1e-5),
+        commitment_cost=config.get("loss", {}).get("commitment_weight", 0.25),
+        l2_normalize=config["model"].get("l2_normalize", True),
+        min_count=config["model"].get("min_count", 1.0),
+        replacement_warmup_steps=config["model"].get("replacement_warmup_steps", 500),
+        lambda_usage=config.get("loss", {}).get("usage_weight", 0.0),
+        lambda_contrast=config.get("loss", {}).get("contrastive_weight", 0.0),
+        lambda_self=config.get("loss", {}).get("self_reconstruction_weight", 0.1),
+        temperature=config.get("loss", {}).get("temperature", 0.1),
+        lr=config["optimizer"]["lr"],
+        weight_decay=config.get("optimizer", {}).get("weight_decay", 1e-4),
+        warmup_ratio=config.get("optimizer", {}).get("warmup_ratio", 0.03),
+        quantizer_warmup_epochs=config["training"].get("continuous_warmup_epochs", 0),
+        aux_ramp_epochs=config["training"].get("aux_ramp_epochs", 0),
+        loss_type=config.get("loss", {}).get("primary", "smooth_l1"),
+        kmeans_init=config["model"].get("kmeans_init", False),
     )
 
     model_to_fit: L.LightningModule = model
-    if config.get("torch_compile", False):
+    if config["training"].get("torch_compile", False):
         print("Compiling model with torch.compile...")
         compiled = torch.compile(model)
         if isinstance(compiled, L.LightningModule):
@@ -399,17 +448,17 @@ def main() -> None:
         mode="max",
         save_top_k=1,
         filename="best-checkpoint-{epoch:02d}-{val_score:.2f}",
-        dirpath=config["out_dir"],
+        dirpath=config["training"]["out_dir"],
     )
     early_stopping = EarlyStopping(monitor="val_score", mode="max", patience=10)
 
     # Lightning Trainer
     trainer = L.Trainer(
-        max_epochs=config["max_epochs"],
+        max_epochs=config["training"]["max_epochs"],
         accelerator="auto",
         devices="auto",
-        precision=config.get("precision", "bf16-mixed"),
-        accumulate_grad_batches=config.get("accumulate_grad_batches", 4),
+        precision=config["training"].get("precision", "bf16-mixed"),
+        accumulate_grad_batches=config["training"].get("accumulate_grad_batches", 4),
         callbacks=[checkpoint_callback, early_stopping],
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
@@ -427,8 +476,8 @@ def main() -> None:
         best_model = model
 
     # Export best model
-    best_model.export_model(config["out_dir"], mean=mean, std=std)
-    print(f"Exported best model and scaler to {config['out_dir']}")
+    best_model.export_model(config["training"]["out_dir"], mean=mean, std=std)
+    print(f"Exported best model and scaler to {config['training']['out_dir']}")
 
 
 if __name__ == "__main__":
