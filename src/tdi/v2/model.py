@@ -420,6 +420,8 @@ class TdiV2Model(L.LightningModule):
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
         warmup_ratio: float = 0.03,
+        quantizer_warmup_epochs: int = 2,
+        aux_ramp_epochs: int = 2,
         loss_type: str = "smooth_l1",
     ) -> None:
         """Initialize the TdiV2Model.
@@ -444,6 +446,10 @@ class TdiV2Model(L.LightningModule):
             lr: Optimizing learning rate.
             weight_decay: L2 parameter regularizer weight.
             warmup_ratio: Fraction of total steps spent in linear LR warmup.
+            quantizer_warmup_epochs: Epochs of continuous (quantizer-bypassed) training before
+                discretization begins. k-means codebook init fires at this boundary.
+            aux_ramp_epochs: Epochs over which the auxiliary-loss weights ramp 0->1 after
+                quantization begins.
             loss_type: "smooth_l1" or "gaussian_nll".
         """
         super().__init__()
@@ -469,6 +475,8 @@ class TdiV2Model(L.LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
         self.warmup_ratio = warmup_ratio
+        self.quantizer_warmup_epochs = quantizer_warmup_epochs
+        self.aux_ramp_epochs = aux_ramp_epochs
         self.loss_type = loss_type
 
         # Initialize core encoder and decoder blocks
@@ -592,17 +600,53 @@ class TdiV2Model(L.LightningModule):
             return
         self.quantizer.init_codebook(torch.cat(zs, dim=0))
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    def on_train_epoch_start(self) -> None:
+        """Seed the codebook from warmed-up latents exactly at the warmup boundary.
+
+        Fires once, when the first quantized epoch begins, so k-means runs on a useful
+        latent manifold rather than an untrained encoder. No-op for FSQ.
+        """
+        loader = self.trainer.train_dataloader
+        if (
+            loader is not None
+            and self.current_epoch == self.quantizer_warmup_epochs
+            and isinstance(self.quantizer, EMAVectorQuantizer)
+            and not bool(self.quantizer.initialized.item())
+        ):
+            self.init_codebook_from_data(loader)
+
+    def _aux_ramp(self) -> float:
+        """Auxiliary-loss ramp factor: 0 during warmup, rising to 1 over aux_ramp_epochs."""
+        if self.current_epoch < self.quantizer_warmup_epochs:
+            return 0.0
+        progress = (self.current_epoch - self.quantizer_warmup_epochs) / max(
+            1, self.aux_ramp_epochs
+        )
+        return float(min(1.0, max(0.0, progress)))
+
+    def forward(self, x: torch.Tensor, quantize: bool = True) -> dict[str, torch.Tensor]:
         """Standard model pass returning latent projections and losses.
 
         Args:
             x: Input feature tensor of shape (N, input_dim).
+            quantize: If True, pass latents through the quantizer. If False (continuous
+                warmup), bypass the codebook entirely: ``z_q = z``, ``vq_loss = 0``, and
+                codebook stats are placeholders.
 
         Returns:
             Dict containing reconstruction losses, codebook metrics, and latent values.
         """
         z = self.encoder(x)
-        vq_loss, z_q, perplexity, indices, usage, n_replaced = self.quantizer(z)
+        if quantize:
+            vq_loss, z_q, perplexity, indices, usage, n_replaced = self.quantizer(z)
+        else:
+            # Continuous warmup: decode straight from z, no codebook updates or stats.
+            z_q = z
+            vq_loss = torch.zeros((), device=z.device)
+            indices = torch.zeros(z.shape[0], dtype=torch.long, device=z.device)
+            usage = torch.zeros(self.n_states, device=z.device)
+            perplexity = torch.zeros((), device=z.device)
+            n_replaced = torch.zeros((), dtype=torch.long, device=z.device)
         mu_partner, var_partner = self.decoder(z_q, partner=True)
         mu_self, var_self = self.decoder(z_q, partner=False)
 
@@ -633,7 +677,12 @@ class TdiV2Model(L.LightningModule):
             Total optimized loss value.
         """
         x, y = batch
-        out = self(x)
+
+        # Continuous warmup: bypass the quantizer until quantizer_warmup_epochs.
+        quantize = self.current_epoch >= self.quantizer_warmup_epochs
+        aux_r = self._aux_ramp()
+
+        out = self(x, quantize=quantize)
         vq_loss = out["vq_loss"]
         z_q_x = out["z_q"]
         perplexity = out["perplexity"]
@@ -660,8 +709,8 @@ class TdiV2Model(L.LightningModule):
         usage_entropy = -(usage_x * (usage_x + 1e-10).log()).sum()
         loss_usage = -self.lambda_usage * usage_entropy
 
-        # Contrastive objective
-        if self.lambda_contrast > 0.0:
+        # Contrastive objective (skip entirely while the aux ramp is zero, i.e. during warmup)
+        if self.lambda_contrast > 0.0 and aux_r > 0.0:
             zq_proj = self.source_projector(z_q_x)
             h_proj = self.target_projector(y)
 
@@ -677,15 +726,31 @@ class TdiV2Model(L.LightningModule):
                 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
             )
         else:
-            loss_contrast = 0.0
+            loss_contrast = torch.zeros((), device=x.device)
 
-        total_loss = recon_loss + vq_loss + loss_usage + loss_contrast
+        # Partner prediction is always full strength; auxiliary terms ramp 0->1 after warmup.
+        total_loss = recon_loss + aux_r * (vq_loss + loss_usage + loss_contrast)
 
-        # Log training statistics
+        # Log every objective term + per-feature-group reconstruction (catches the model
+        # fitting the easy sequence dims while ignoring angular geometry).
         if self._trainer is not None and getattr(self._trainer, "_results", None) is not None:
+            with torch.no_grad():
+                recon_angles = F.smooth_l1_loss(mu_partner[:, 0:7], y[:, 0:7])
+                recon_ca_distance = F.smooth_l1_loss(mu_partner[:, 7:8], y[:, 7:8])
+                recon_sequence = F.smooth_l1_loss(mu_partner[:, 8:10], y[:, 8:10])
             self.log("train_loss", total_loss, on_step=True, on_epoch=True, prog_bar=True)
+            self.log("loss_total", total_loss, on_epoch=True)
+            self.log("loss_partner", loss_partner, on_epoch=True)
+            self.log("loss_self", loss_self, on_epoch=True)
             self.log("train_recon_loss", recon_loss, on_epoch=True)
+            self.log("loss_vq", vq_loss, on_epoch=True)
             self.log("train_vq_loss", vq_loss, on_epoch=True)
+            self.log("loss_usage", loss_usage, on_epoch=True)
+            self.log("loss_contrast", loss_contrast, on_epoch=True)
+            self.log("aux_ramp", aux_r, on_epoch=True)
+            self.log("recon_angles", recon_angles, on_epoch=True)
+            self.log("recon_ca_distance", recon_ca_distance, on_epoch=True)
+            self.log("recon_sequence", recon_sequence, on_epoch=True)
             self.log("train_perplexity", perplexity, on_epoch=True, prog_bar=True)
             self.log("dead_codes_replaced", n_replaced.float(), prog_bar=False)
 

@@ -11,7 +11,24 @@ from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from torch.utils.data import DataLoader
 
 from tdi.v2.model import TdiV2Model
-from tdi.v2.training_data import PairDataset
+from tdi.v2.training_data import AlignmentBatchSampler, PairDataset
+
+
+def _load_alignment_ids(data_dir: str, n_rows: int) -> np.ndarray | None:
+    """Load per-row alignment ids from a metadata parquet if present and row-aligned.
+
+    Looks for ``train_metadata.parquet`` then ``metadata.parquet`` in ``data_dir``; returns
+    the ``alignment_id`` column only when it exists and matches ``n_rows``, else None.
+    """
+    import pandas as pd
+
+    for name in ("train_metadata.parquet", "metadata.parquet"):
+        path = os.path.join(data_dir, name)
+        if os.path.exists(path):
+            df = pd.read_parquet(path)
+            if "alignment_id" in df.columns and len(df) == n_rows:
+                return df["alignment_id"].to_numpy()
+    return None
 
 
 def main() -> None:
@@ -57,6 +74,19 @@ def main() -> None:
         default="bf16-mixed",
         help="Trainer precision (e.g. bf16-mixed, 32-true). Use 32-true on non-bf16 hardware.",
     )
+    parser.add_argument(
+        "--accumulate_grad_batches",
+        type=int,
+        default=4,
+        help="Gradient accumulation steps; larger effective batch without more memory.",
+    )
+    parser.add_argument(
+        "--alignments_per_batch",
+        type=int,
+        default=0,
+        help="If >0 and metadata.parquet is present, use an alignment-aware batch sampler "
+        "drawing this many distinct alignments per batch (better contrastive negatives).",
+    )
     args = parser.parse_args()
 
     # Seed all sources of randomness
@@ -84,9 +114,22 @@ def main() -> None:
         x_val_raw, y_val_raw, mean=mean, std=std, descriptor_jitter_std=0.0, seed=args.seed
     )
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0
-    )
+    # Alignment-aware batching when requested and metadata is available; else flat random.
+    alignment_ids = _load_alignment_ids(args.train_dir, len(x_train_raw))
+    if args.alignments_per_batch > 0 and alignment_ids is not None:
+        sampler = AlignmentBatchSampler(
+            alignment_ids,
+            batch_size=args.batch_size,
+            alignments_per_batch=args.alignments_per_batch,
+            seed=args.seed,
+        )
+        train_loader = DataLoader(train_dataset, batch_sampler=sampler, num_workers=0)
+    else:
+        if args.alignments_per_batch > 0:
+            print("alignment-aware sampling requested but no row-aligned metadata; using random.")
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0
+        )
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     # Initialize model
@@ -120,14 +163,14 @@ def main() -> None:
         accelerator="auto",
         devices="auto",
         precision=args.precision,
+        accumulate_grad_batches=args.accumulate_grad_batches,
         callbacks=[checkpoint_callback, early_stopping],
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
     )
 
-    # Seed EMA-VQ codebook from real encoder outputs (no-op for FSQ)
-    model.init_codebook_from_data(train_loader)
-
+    # k-means codebook init now runs inside the model at the warmup boundary
+    # (on_train_epoch_start), seeded from warmed-up latents instead of an untrained encoder.
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
     # Load best checkpoint
