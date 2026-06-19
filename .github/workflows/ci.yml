@@ -28,13 +28,13 @@ jobs:
         run: uv sync --all-extras
 
       - name: Ruff lint
-        run: uv run ruff check src/tmspirit
+        run: uv run ruff check src/tdi
 
       - name: Ruff format check
-        run: uv run ruff format --check src/tmspirit
+        run: uv run ruff format --check src/tdi
 
-      - name: Mypy
-        run: uv run mypy src/tmspirit
+      - name: Pyright
+        run: uv run pyright src/tdi
         continue-on-error: true
 
   test:
@@ -56,4 +56,4 @@ jobs:
         run: uv sync --all-extras --python ${{ matrix.python-version }}
 
       - name: Run tests
-        run: uv run --python ${{ matrix.python-version }} pytest -q --cov=tmspirit --cov-report=xml
+        run: uv run --python ${{ matrix.python-version }} pytest -q --cov=tdi --cov-report=xml

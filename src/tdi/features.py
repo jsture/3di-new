@@ -1,10 +1,9 @@
-"""Feature extraction utilities for parsing protein structure PDB files and generating 3D descriptors."""
+"""Feature extraction: parse PDB files and compute 3Di structural descriptors."""
 
-from typing import List, Tuple, Union, Optional
 import numpy as np
-from numpy.linalg import norm
 from Bio.PDB import PDBParser
 from Bio.PDB.Residue import Residue
+from numpy.linalg import norm
 
 # Standard distance between C_alpha and C_beta in Angstroms
 DISTANCE_ALPHA_BETA: float = 1.5336
@@ -36,7 +35,6 @@ def approx_c_beta_position(
     u1 = b1 / norm(b1)
     u2 = b2 / norm(b2)
 
-    # direction from c_alpha to c_beta
     v4 = -(1.0 / 3.0) * v1 + np.sqrt(8.0) / 3.0 * norm(v1) * (
         -(1.0 / 2.0) * u1 - np.sqrt(3.0) / 2.0 * u2
     )
@@ -45,8 +43,8 @@ def approx_c_beta_position(
 
 
 def get_atom_coordinates(
-    chain: List[Residue], verbose: bool = False, full_backbone: bool = False
-) -> Tuple[np.ndarray, np.ndarray]:
+    chain: list[Residue], verbose: bool = False, full_backbone: bool = False
+) -> tuple[np.ndarray, np.ndarray]:
     """Get CA/CB coordinates from list of biopython residues.
 
     C betas from GLY are approximated.
@@ -68,7 +66,7 @@ def get_atom_coordinates(
     for i, res in enumerate(chain):
         is_hetatm = len(res.id[0].strip())
         if is_hetatm:
-            continue  # skip HETATMs
+            continue
 
         ca_atoms = [atom for atom in res if atom.name == "CA"]
         if len(ca_atoms) != 1:
@@ -83,7 +81,7 @@ def get_atom_coordinates(
                 coords[i, 3:6] = cb_atoms[0].coord
             elif verbose:
                 print(f"No CB found [{i}] {chain.full_id}")
-        else:  # approx CB position
+        else:
             n_atoms = [atom for atom in res if atom.name == "N"]
             co_atoms = [atom for atom in res if atom.name == "C"]
             if len(ca_atoms) != 1 or len(n_atoms) != 1 or len(co_atoms) != 1:
@@ -124,9 +122,9 @@ def find_nearest_residues(
     valid_mask: np.ndarray,
     k: int = 1,
     return_dist: bool = False,
-    min_seq_dist: Optional[int] = 1,
+    min_seq_dist: int | None = 1,
     fall_back_dist: float = 10.0,
-) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Find indices of the k-th nearest neighbors comparing C_beta distances.
 
     Args:
@@ -143,14 +141,9 @@ def find_nearest_residues(
     assert not np.isnan(coords[valid_mask, 3:6]).any()
     dist = distance_matrix(coords[:, 3:6], coords[:, 3:6])
 
-    # Remove zeros on diagonal
     dist[np.eye(dist.shape[0], dtype=bool)] = np.inf
-
-    # Do not match invalid residues
     dist[~valid_mask, :] = np.inf
     dist[:, ~valid_mask] = np.inf
-
-    # No pairing with first or last residues
     dist[:, 0] = np.inf
     dist[0, :] = np.inf
     dist[:, -1] = np.inf
@@ -159,18 +152,14 @@ def find_nearest_residues(
     if min_seq_dist is not None and min_seq_dist != 1:
         n = dist.shape[0]
 
-        # Indices without restriction
         j_no_min_seq = dist.argmin(axis=0)
 
-        # Mask residues closer than min_seq_dist in sequence
         for offset in range(-min_seq_dist + 1, min_seq_dist):
             i_idx, j_idx = np.where(np.eye(n, k=offset, dtype=bool))
             dist[i_idx, j_idx] = np.inf
 
         j = dist.argmin(axis=0)
         fall_back_mask = dist.min(axis=0) >= fall_back_dist
-
-        # If no pairs within fall_back_dist found, lift restriction
         j[fall_back_mask] = j_no_min_seq[fall_back_mask]
     else:
         current_k = k
@@ -244,7 +233,7 @@ def calc_angles(coords: np.ndarray, i: int, j: int) -> np.ndarray:
 
 def calc_angles_forloop(
     coords: np.ndarray, partner_idx: np.ndarray, valid_mask: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Calculate angles for all valid residues and their nearest partners.
 
     Args:
@@ -270,9 +259,7 @@ def calc_angles_forloop(
     return out, new_valid_mask
 
 
-def get_coords_from_pdb(
-    path: str, full_backbone: bool = False
-) -> Tuple[np.ndarray, np.ndarray]:
+def get_coords_from_pdb(path: str, full_backbone: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Read a PDB file and return CA and CB coordinates (+ optional N and C).
 
     Args:
@@ -286,7 +273,7 @@ def get_coords_from_pdb(
     structure = parser.get_structure("None", path)
 
     model = structure[0]
-    chain = list(model.get_chains())[0]
+    chain = next(iter(model.get_chains()))
 
     coords, valid_mask = get_atom_coordinates(
         list(chain.get_residues()), full_backbone=full_backbone
@@ -297,7 +284,7 @@ def get_coords_from_pdb(
 def move_CB(
     coords: np.ndarray,
     c_alpha_beta_distance_scale: float = 1.0,
-    virt_cb: Optional[Tuple[float, float, float]] = None,
+    virt_cb: tuple[float, float, float] | None = None,
 ) -> np.ndarray:
     """Adjust C_beta coordinates based on a distance scale or virtual angle projections.
 
@@ -309,13 +296,11 @@ def move_CB(
     Returns:
         Adjusted coordinates array.
     """
-    # Replace CB coordinates with position along CA-CB vector
     if c_alpha_beta_distance_scale != 1.0 and virt_cb is None:
         ca = coords[:, 0:3]
         cb = coords[:, 3:6]
         coords[:, 3:6] = (cb - ca) * c_alpha_beta_distance_scale + ca
 
-    # Instead of CB, use point defined by two angles and a distance
     if virt_cb is not None:
         alpha_deg, beta_deg, d = virt_cb
         alpha = np.radians(alpha_deg)
@@ -327,20 +312,17 @@ def move_CB(
 
         v = cb - ca
 
-        # Normal angle (between CA-N and CA-VIRT)
         a = cb - ca
         b = n_atm - ca
         cross_prod = np.cross(a, b)
         k = cross_prod / np.linalg.norm(cross_prod, axis=1, keepdims=True)
 
-        # Rodrigues rotation formula for alpha
         v = (
             v * np.cos(alpha)
             + np.cross(k, v) * np.sin(alpha)
             + k * (k * v).sum(axis=1, keepdims=True) * (1 - np.cos(alpha))
         )
 
-        # Dihedral angle (axis: CA-N, CO, VIRT)
         k = (n_atm - ca) / np.linalg.norm(n_atm - ca, axis=1, keepdims=True)
         v = (
             v * np.cos(beta)
