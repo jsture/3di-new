@@ -2,6 +2,7 @@
 """CLI: extract features from aligned structure pairs to compile VQ-VAE training data."""
 
 import argparse
+import json
 import random
 from pathlib import Path
 
@@ -33,13 +34,18 @@ def main() -> None:
         default=5.0,
         help="Max C-alpha distance filter after superposition.",
     )
+    parser.add_argument(
+        "--seed", type=int, default=123, help="Seed value for sub-sampling reproducibility."
+    )
     args = parser.parse_args()
 
     # Load allowed SIDs from manifest
     allowed_sids = set()
+    sid2group = {}
     if args.manifest:
         df_manifest = pd.read_csv(args.manifest)
         allowed_sids = set(df_manifest["structure_id"].values)
+        sid2group = dict(zip(df_manifest["structure_id"], df_manifest["group_id"]))
     else:
         pdbs_train_path = Path(__file__).parent.parent / "data" / "raw" / "pdbs_train.txt"
         if pdbs_train_path.exists():
@@ -63,23 +69,46 @@ def main() -> None:
 
     xy_list = []
     meta_list = []
+    cap_records = []
+
+    # Report accumulators
+    n_pairs_before_filters_total = 0
+    n_pairs_after_descriptor_validity_total = 0
+    n_pairs_after_ca_filter_total = 0
+    n_pairs_after_max_pairs_total = 0
 
     for sid1, sid2, cigar_string in alignments:
         try:
             x, y, meta = align_features(
-                args.pdb_dir, virtual_center, sid1, sid2, cigar_string, max_ca_dist=args.max_ca_dist
+                args.pdb_dir,
+                virtual_center,
+                sid1,
+                sid2,
+                cigar_string,
+                max_ca_dist=args.max_ca_dist,
+                max_pairs=args.max_pairs,
+                seed=args.seed,
+            )
+
+            # Track filter counts
+            n_pairs_before_filters_total += meta.get("n_pairs_before_filters", 0)
+            n_pairs_after_descriptor_validity_total += meta.get(
+                "n_pairs_after_descriptor_validity", 0
+            )
+            n_pairs_after_ca_filter_total += meta.get("n_pairs_after_ca_filter", 0)
+            n_pairs_after_max_pairs_total += meta.get("n_pairs_after_max_pairs", 0)
+
+            # Track pair cap info
+            cap_records.append(
+                {
+                    "alignment_id": f"{sid1}-{sid2}",
+                    "n_pairs_before_cap": meta.get("n_pairs_after_ca_filter", 0),
+                    "n_pairs_after_cap": meta.get("n_pairs_after_max_pairs", 0),
+                    "cap_seed": meta.get("cap_seed"),
+                }
             )
 
             if len(x) > 0:
-                if len(x) > args.max_pairs:
-                    # Randomly sub-sample
-                    idx = np.random.choice(len(x), args.max_pairs, replace=False)
-                    x = x[idx]
-                    y = y[idx]
-                    for k in meta:
-                        if meta[k] is not None:
-                            meta[k] = np.array(meta[k])[idx]
-
                 xy_list.append((x, y))
 
                 # Expand meta dict to rows
@@ -89,7 +118,13 @@ def main() -> None:
                         "sid_target": meta["sid_target"][i],
                         "idx_source": meta["idx_source"][i],
                         "idx_target": meta["idx_target"][i],
-                        "ca_dist": meta["ca_dist"][i] if meta["ca_dist"] is not None else None,
+                        "ca_dist_superposed": (
+                            meta["ca_dist_superposed"][i]
+                            if meta["ca_dist_superposed"] is not None
+                            else None
+                        ),
+                        "ca_dist_raw": meta["ca_dist_raw"][i],
+                        "group_source": sid2group.get(meta["sid_source"][i], meta["sid_source"][i]),
                     }
                     meta_list.append(row)
         except Exception as e:
@@ -98,11 +133,15 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Save cap records
+    df_caps = pd.DataFrame(cap_records)
+    df_caps.to_csv(out_dir / "alignment_pair_caps.csv", index=False)
+
     if xy_list:
         x_feat = np.vstack([x for x, y in xy_list])
         y_feat = np.vstack([y for x, y in xy_list])
 
-        # We save x and y explicitly instead of dstack for clarity, but maintaining legacy behavior
+        # We save x and y explicitly instead of dstack for clarity, but maintaining legacy behavior.
         # Since v2 train script uses training_data_raw[:, :, 0], we stick to dstack.
         stacked = np.dstack([x_feat, y_feat])
         np.save(out_dir / "data.npy", stacked)
@@ -110,6 +149,65 @@ def main() -> None:
         # Save metadata
         df_meta = pd.DataFrame(meta_list)
         df_meta.to_parquet(out_dir / "metadata.parquet", index=False)
+
+        # Compute report statistics
+        unique_sids = set(df_meta["sid_source"].unique()) | set(df_meta["sid_target"].unique())
+        examples_per_alignment = [len(x) for x, y in xy_list]
+
+        # Histogram for examples per alignment
+        align_hist_counts, align_hist_bins = np.histogram(
+            examples_per_alignment, bins=[0, 10, 50, 100, 200, 500, 1000]
+        )
+
+        # Histogram for examples per source group
+        group_counts = df_meta["group_source"].value_counts().tolist()
+        group_hist_counts, group_hist_bins = np.histogram(
+            group_counts, bins=[0, 10, 50, 100, 500, 1000, 5000, 10000]
+        )
+
+        # Quantiles of superposed CA distance
+        non_null_dists = df_meta["ca_dist_superposed"].dropna().values
+        if len(non_null_dists) > 0:
+            q_vals = [0, 25, 50, 75, 90, 95, 99, 100]
+            q_results = np.percentile(non_null_dists, q_vals)
+            ca_dist_quantiles = {f"{q}%": float(v) for q, v in zip(q_vals, q_results)}
+        else:
+            ca_dist_quantiles = {}
+
+        # Feature stats
+        feat_mean = x_feat.mean(axis=0).tolist()
+        feat_std = x_feat.std(axis=0).tolist()
+        feat_min = x_feat.min(axis=0).tolist()
+        feat_max = x_feat.max(axis=0).tolist()
+        nan_count = int(np.isnan(x_feat).sum())
+        inf_count = int(np.isinf(x_feat).sum())
+
+        report = {
+            "n_structures": len(unique_sids),
+            "n_alignments": len(xy_list),
+            "n_pairs_before_filters": n_pairs_before_filters_total,
+            "n_pairs_after_descriptor_validity": n_pairs_after_descriptor_validity_total,
+            "n_pairs_after_ca_filter": n_pairs_after_ca_filter_total,
+            "n_pairs_after_max_pairs": n_pairs_after_max_pairs_total,
+            "feature_mean": feat_mean,
+            "feature_std": feat_std,
+            "feature_min": feat_min,
+            "feature_max": feat_max,
+            "nan_count": nan_count,
+            "inf_count": inf_count,
+            "examples_per_alignment_histogram": {
+                "bins": align_hist_bins.tolist(),
+                "counts": align_hist_counts.tolist(),
+            },
+            "examples_per_source_group_histogram": {
+                "bins": group_hist_bins.tolist(),
+                "counts": group_hist_counts.tolist(),
+            },
+            "ca_dist_superposed_quantiles": ca_dist_quantiles,
+        }
+
+        with open(out_dir / "training_data_report.json", "w") as f_rep:
+            json.dump(report, f_rep, indent=2)
 
         print(f"Generated {len(x_feat)} pairs from {len(xy_list)} alignments.")
         print(f"Saved artifacts to {out_dir}")
