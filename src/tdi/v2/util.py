@@ -45,7 +45,7 @@ def parse_cigar(cigar_string: str) -> np.ndarray:
         else:
             raise ValueError(f"Action {action} is not supported.")
 
-    return np.array(matches)
+    return np.array(matches, dtype=np.int64).reshape(-1, 2)
 
 
 def mutual_information(p_ab: np.ndarray) -> float:

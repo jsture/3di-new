@@ -121,14 +121,14 @@ class EMAVectorQuantizer(nn.Module):
 
     def forward(
         self, z: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Perform vector quantization.
 
         Args:
             z: Input continuous latents of shape (N, z_dim).
 
         Returns:
-            Tuple of (commit_loss, z_q, perplexity, indices, usage).
+            Tuple of (commit_loss, z_q, perplexity, indices, usage, n_replaced).
         """
         if self.l2_normalize:
             z_lookup = F.normalize(z, dim=-1)
@@ -149,6 +149,7 @@ class EMAVectorQuantizer(nn.Module):
         encodings = F.one_hot(indices, self.n_states).type_as(z)
         z_q = encodings @ self.embedding
 
+        n_replaced = 0
         if self.training:
             self.step_counter += 1
             counts = encodings.sum(dim=0)
@@ -167,18 +168,17 @@ class EMAVectorQuantizer(nn.Module):
 
             # Dead-code replacement
             if self.step_counter > self.replacement_warmup_steps:
-                unused = self.ema_count < self.min_count
-                if unused.any():
-                    n_unused = unused.sum().item()
+                dead = self.ema_count < self.min_count
+                n_dead = int(dead.sum().item())
+                if n_dead > 0:
                     perm = torch.randperm(z.size(0), device=z.device)
-                    replacements = z[perm[:n_unused]]
-                    n_to_replace = min(n_unused, z.size(0))
-                    unused_indices = torch.where(unused)[0][:n_to_replace]
-
-                    # Replace unused centroids with batch inputs
-                    self.embedding[unused_indices] = replacements[:n_to_replace].detach()
-                    self.ema_count[unused_indices] = 1.0
-                    self.ema_sum[unused_indices] = replacements[:n_to_replace].detach()
+                    n_to_replace = min(n_dead, z.size(0))
+                    dead_indices = torch.where(dead)[0][:n_to_replace]
+                    replacements = z.detach()[perm[:n_to_replace]]
+                    self.embedding[dead_indices] = replacements
+                    self.ema_count[dead_indices] = self.min_count
+                    self.ema_sum[dead_indices] = replacements * self.min_count
+                    n_replaced = n_to_replace
 
         # Commitment loss to regularize encoder space
         commit_loss = self.commitment_cost * F.mse_loss(z, z_q.detach())
@@ -188,7 +188,14 @@ class EMAVectorQuantizer(nn.Module):
         usage = encodings.float().mean(dim=0)
         perplexity = torch.exp(-(usage * (usage + 1e-10).log()).sum())
 
-        return commit_loss, z_q, perplexity, indices, usage
+        return (
+            commit_loss,
+            z_q,
+            perplexity,
+            indices,
+            usage,
+            torch.tensor(n_replaced, device=z.device),
+        )
 
 
 class FSQQuantizer(nn.Module):
@@ -260,7 +267,7 @@ class FSQQuantizer(nn.Module):
 
     def forward(
         self, z: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         z_q, indices = self.quantize(z)
         z_q = z + (z_q - z).detach()
 
@@ -269,7 +276,14 @@ class FSQQuantizer(nn.Module):
         perplexity = torch.exp(-(usage * (usage + 1e-10).log()).sum())
 
         # FSQ requires no commitment loss
-        return torch.tensor(0.0, device=z.device), z_q, perplexity, indices, usage
+        return (
+            torch.tensor(0.0, device=z.device),
+            z_q,
+            perplexity,
+            indices,
+            usage,
+            torch.tensor(0, device=z.device),
+        )
 
 
 class Decoder(nn.Module):
@@ -288,18 +302,16 @@ class Decoder(nn.Module):
         """
         super().__init__()
         self.loss_type = loss_type
-        self.layers = nn.Sequential(
-            nn.Linear(z_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
+        self.trunk = ResidualMLP(z_dim, hidden_dim, hidden_dim, depth=2)
         self.mu_partner = nn.Linear(hidden_dim, input_dim)
         self.mu_self = nn.Linear(hidden_dim, input_dim)
 
         if loss_type == "gaussian_nll":
             self.var_partner = nn.Linear(hidden_dim, input_dim)
             self.var_self = nn.Linear(hidden_dim, input_dim)
+        else:
+            self.var_partner = None
+            self.var_self = None
 
     def forward(
         self, z_q: torch.Tensor, partner: bool = True
@@ -313,27 +325,25 @@ class Decoder(nn.Module):
         Returns:
             Tuple of (mu, var) reconstruction outputs.
         """
-        h = self.layers(z_q)
-        if partner:
-            mu = self.mu_partner(h)
-            if self.loss_type == "gaussian_nll":
-                raw_var = self.var_partner(h)
-                var = F.softplus(raw_var) + 1e-4
-                return mu, var
+        h = self.trunk(z_q)
+        mu_head = self.mu_partner if partner else self.mu_self
+        mu = mu_head(h)
+
+        if self.loss_type != "gaussian_nll":
             return mu, None
-        else:
-            mu = self.mu_self(h)
-            if self.loss_type == "gaussian_nll":
-                raw_var = self.var_self(h)
-                var = F.softplus(raw_var) + 1e-4
-                return mu, var
-            return mu, None
+
+        var_head = self.var_partner if partner else self.var_self
+        assert var_head is not None
+        var = F.softplus(var_head(h)) + 1e-4
+        return mu, var
 
 
 class TdiV2Model(L.LightningModule):
     """Main modernized VQ-VAE model wrapping optimization, logging, and evaluation."""
 
     quantizer: EMAVectorQuantizer | FSQQuantizer
+    feature_mean: torch.Tensor
+    feature_std: torch.Tensor
 
     def __init__(
         self,
@@ -383,11 +393,19 @@ class TdiV2Model(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
+        # Resolve the quantizer dimensionality first
+        fsq_levels_resolved = None
+        if quantizer_type == "fsq":
+            fsq_levels_resolved = fsq_levels if fsq_levels is not None else [5, 4]
+            z_dim = len(fsq_levels_resolved)
+            n_states = int(np.prod(fsq_levels_resolved))
+
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.z_dim = z_dim
         self.n_states = n_states
         self.quantizer_type = quantizer_type
+        self.fsq_levels = fsq_levels_resolved
         self.lambda_usage = lambda_usage
         self.lambda_contrast = lambda_contrast
         self.lambda_self = lambda_self
@@ -402,11 +420,9 @@ class TdiV2Model(L.LightningModule):
 
         # Initialize selected quantizer backend
         if quantizer_type == "fsq":
-            levels = fsq_levels if fsq_levels is not None else [5, 4]
-            self.quantizer = FSQQuantizer(levels)
-            self.n_states = self.quantizer.n_states
-            self.z_dim = self.quantizer.z_dim
-        else:
+            assert fsq_levels_resolved is not None
+            self.quantizer = FSQQuantizer(fsq_levels_resolved)
+        elif quantizer_type in ("vq", "ema_vq"):
             self.quantizer = EMAVectorQuantizer(
                 n_states,
                 z_dim,
@@ -417,6 +433,8 @@ class TdiV2Model(L.LightningModule):
                 min_count=min_count,
                 replacement_warmup_steps=replacement_warmup_steps,
             )
+        else:
+            raise ValueError(f"Unknown quantizer_type: {quantizer_type}")
 
         # Contrastive objective projectors
         if lambda_contrast > 0.0:
@@ -435,9 +453,14 @@ class TdiV2Model(L.LightningModule):
 
         self.loss_fn = nn.GaussianNLLLoss() if loss_type == "gaussian_nll" else None
 
+        # Register standardization buffers for standalone scaled inference
+        self.register_buffer("feature_mean", torch.zeros(input_dim))
+        self.register_buffer("feature_std", torch.ones(input_dim))
+
         # Validation outputs collection
         self.validation_step_outputs = []
 
+    @torch.no_grad()
     def encode_states(self, x: torch.Tensor) -> torch.Tensor:
         """Deterministic inference pathway: maps input features to discrete state IDs.
 
@@ -447,30 +470,65 @@ class TdiV2Model(L.LightningModule):
         Returns:
             Tensor of indices of shape (N,).
         """
-        self.eval()
-        with torch.no_grad():
-            z = self.encoder(x)
-            if isinstance(self.quantizer, EMAVectorQuantizer):
-                if self.quantizer.l2_normalize:
-                    z_lookup = F.normalize(z, dim=-1)
-                    codebook = F.normalize(self.quantizer.embedding, dim=-1)
-                else:
-                    z_lookup = z
-                    codebook = self.quantizer.embedding
+        z = self.encoder(x)
+        if isinstance(self.quantizer, EMAVectorQuantizer):
+            if self.quantizer.l2_normalize:
+                z_lookup = F.normalize(z, dim=-1)
+                codebook = F.normalize(self.quantizer.embedding, dim=-1)
             else:
-                _, indices = self.quantizer.quantize(z)
-                return indices
+                z_lookup = z
+                codebook = self.quantizer.embedding
+        else:
+            _, indices = self.quantizer.quantize(z)
+            return indices
 
-            distances = (
-                z_lookup.pow(2).sum(dim=-1, keepdim=True)
-                + codebook.pow(2).sum(dim=-1)
-                - 2.0 * z_lookup @ codebook.t()
-            )
-            return distances.argmin(dim=-1)
+        distances = (
+            z_lookup.pow(2).sum(dim=-1, keepdim=True)
+            + codebook.pow(2).sum(dim=-1)
+            - 2.0 * z_lookup @ codebook.t()
+        )
+        return distances.argmin(dim=-1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Standard model call, resolves discrete state IDs."""
+    @torch.no_grad()
+    def encode_scaled_states(self, x_raw: torch.Tensor) -> torch.Tensor:
+        """Deterministic inference pathway with standardizing scaling.
+
+        Args:
+            x_raw: Raw input features tensor of shape (N, input_dim).
+
+        Returns:
+            Tensor of indices of shape (N,).
+        """
+        x = (x_raw - self.feature_mean) / self.feature_std
         return self.encode_states(x)
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Standard model pass returning latent projections and losses.
+
+        Args:
+            x: Input feature tensor of shape (N, input_dim).
+
+        Returns:
+            Dict containing reconstruction losses, codebook metrics, and latent values.
+        """
+        z = self.encoder(x)
+        vq_loss, z_q, perplexity, indices, usage, n_replaced = self.quantizer(z)
+        mu_partner, var_partner = self.decoder(z_q, partner=True)
+        mu_self, var_self = self.decoder(z_q, partner=False)
+
+        return {
+            "z": z,
+            "z_q": z_q,
+            "indices": indices,
+            "mu_partner": mu_partner,
+            "var_partner": var_partner,
+            "mu_self": mu_self,
+            "var_self": var_self,
+            "vq_loss": vq_loss,
+            "perplexity": perplexity,
+            "usage": usage,
+            "n_replaced": n_replaced,
+        }
 
     def training_step(
         self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int
@@ -485,13 +543,16 @@ class TdiV2Model(L.LightningModule):
             Total optimized loss value.
         """
         x, y = batch
-        z_x = self.encoder(x)
-        vq_loss, z_q_x, perplexity, _indices_x, usage_x = self.quantizer(z_x)
-
-        # Partner reconstruction
-        mu_partner, var_partner = self.decoder(z_q_x, partner=True)
-        # Self reconstruction
-        mu_self, var_self = self.decoder(z_q_x, partner=False)
+        out = self(x)
+        vq_loss = out["vq_loss"]
+        z_q_x = out["z_q"]
+        perplexity = out["perplexity"]
+        usage_x = out["usage"]
+        mu_partner = out["mu_partner"]
+        var_partner = out["var_partner"]
+        mu_self = out["mu_self"]
+        var_self = out["var_self"]
+        n_replaced = out["n_replaced"]
 
         # Loss calculation
         if self.loss_fn is not None:
@@ -529,6 +590,7 @@ class TdiV2Model(L.LightningModule):
             self.log("train_recon_loss", recon_loss, on_epoch=True)
             self.log("train_vq_loss", vq_loss, on_epoch=True)
             self.log("train_perplexity", perplexity, on_epoch=True, prog_bar=True)
+            self.log("dead_codes_replaced", n_replaced.float(), prog_bar=False)
 
         return total_loss
 
@@ -543,11 +605,12 @@ class TdiV2Model(L.LightningModule):
             Dictionary containing metrics for the step.
         """
         x, y = batch
-        z_x = self.encoder(x)
-        _vq_loss, z_q_x, perplexity, indices_x, _usage_x = self.quantizer(z_x)
+        out_x = self(x)
+        mu_partner = out_x["mu_partner"]
+        var_partner = out_x["var_partner"]
+        indices_x = out_x["indices"]
+        perplexity = out_x["perplexity"]
 
-        # Partner prediction evaluation
-        mu_partner, var_partner = self.decoder(z_q_x, partner=True)
         if self.loss_fn is not None:
             loss_partner = self.loss_fn(mu_partner, y, var_partner)
         else:
@@ -559,8 +622,8 @@ class TdiV2Model(L.LightningModule):
         stability = (indices_x == indices_noisy).float().mean()
 
         # Target sequence discretization to evaluate mutual information
-        z_y = self.encoder(y)
-        _, _, _, indices_y, _ = self.quantizer(z_y)
+        out_y = self(y)
+        indices_y = out_y["indices"]
 
         # Store outputs for epoch level validation pooling
         step_out = {
@@ -667,6 +730,7 @@ class TdiV2Model(L.LightningModule):
             "z_dim": self.z_dim,
             "n_states": self.n_states,
             "quantizer_type": self.quantizer_type,
+            "fsq_levels": self.fsq_levels,
             "loss_type": self.loss_type,
         }
         with open(out_path / "model_config.json", "w") as f:
@@ -680,20 +744,27 @@ class TdiV2Model(L.LightningModule):
         with open(out_path / "feature_scaler.json", "w") as f:
             json.dump(scaler, f, indent=2)
 
-        # Save centroids for indexing lookups (only applicable to EMA VQ backend)
-        if isinstance(self.quantizer, EMAVectorQuantizer):
+        # Save centroids for indexing lookups (only applicable to VQ backend)
+        if self.quantizer_type in ("vq", "ema_vq") and isinstance(
+            self.quantizer, EMAVectorQuantizer
+        ):
             centroids = self.quantizer.embedding.detach().cpu().numpy()
             np.save(out_path / "centroids.npy", centroids)
+        elif self.quantizer_type == "fsq":
+            with open(out_path / "fsq_levels.json", "w") as f:
+                json.dump({"levels": self.fsq_levels}, f, indent=2)
 
     @classmethod
-    def load_from_export(cls, export_dir: Path | str) -> "TdiV2Model":
+    def load_from_export(
+        cls, export_dir: Path | str
+    ) -> tuple["TdiV2Model", np.ndarray, np.ndarray]:
         """Load a TdiV2Model from an exported directory.
 
         Args:
             export_dir: Path to directory containing exported model artifacts.
 
         Returns:
-            Fully loaded TdiV2Model instance.
+            Tuple of (loaded_model, mean_array, std_array).
         """
         export_path = Path(export_dir)
         with open(export_path / "model_config.json") as f:
@@ -705,7 +776,8 @@ class TdiV2Model(L.LightningModule):
             z_dim=config["z_dim"],
             n_states=config["n_states"],
             quantizer_type=config["quantizer_type"],
-            loss_type=config["loss_type"],
+            fsq_levels=config.get("fsq_levels"),
+            loss_type=config.get("loss_type", "smooth_l1"),
         )
 
         # Load encoder weights
@@ -713,12 +785,24 @@ class TdiV2Model(L.LightningModule):
             torch.load(export_path / "encoder_state_dict.pt", map_location="cpu")
         )
 
-        if config["quantizer_type"] == "vq" and (export_path / "centroids.npy").exists():
+        # Load scaler metrics and attach/register buffers
+        with open(export_path / "feature_scaler.json") as f:
+            scaler = json.load(f)
+        mean_arr = np.array(scaler["mean"], dtype=np.float32)
+        std_arr = np.array(scaler["std"], dtype=np.float32)
+
+        model.register_buffer("feature_mean", torch.from_numpy(mean_arr))
+        model.register_buffer("feature_std", torch.from_numpy(std_arr))
+
+        if (
+            config["quantizer_type"] in ("vq", "ema_vq")
+            and (export_path / "centroids.npy").exists()
+        ):
             centroids = np.load(export_path / "centroids.npy")
             model.quantizer.embedding.data = torch.from_numpy(centroids)
 
         model.eval()
-        return model
+        return model, mean_arr, std_arr
 
 
 def create_vqvae(
