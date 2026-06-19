@@ -610,11 +610,39 @@ class TdiV2Model(L.LightningModule):
         var_partner = out_x["var_partner"]
         indices_x = out_x["indices"]
         perplexity = out_x["perplexity"]
+        z = out_x["z"]
 
         if self.loss_fn is not None:
             loss_partner = self.loss_fn(mu_partner, y, var_partner)
         else:
             loss_partner = F.smooth_l1_loss(mu_partner, y)
+
+        # Margin calculation
+        if isinstance(self.quantizer, EMAVectorQuantizer):
+            codebook = self.quantizer.embedding
+            if self.quantizer.l2_normalize:
+                z_lookup = F.normalize(z, dim=-1)
+                codebook = F.normalize(codebook, dim=-1)
+            else:
+                z_lookup = z
+            distances = (
+                z_lookup.pow(2).sum(dim=-1, keepdim=True)
+                + codebook.pow(2).sum(dim=-1)
+                - 2.0 * z_lookup @ codebook.t()
+            )
+            d_sorted, _ = distances.sort(dim=-1)
+            margin = d_sorted[:, 1] - d_sorted[:, 0]
+        else:
+            z_bounded = torch.tanh(z)
+            margins = []
+            for i, level in enumerate(self.quantizer.levels):
+                scale = (level - 1) / 2 if level % 2 == 1 else level / 2
+                if scale > 0:
+                    dist_to_boundary = torch.abs((z_bounded[:, i] * scale) % 1.0 - 0.5) / scale
+                    margins.append(dist_to_boundary)
+                else:
+                    margins.append(torch.ones(z.shape[0], device=z.device))
+            margin = torch.stack(margins, dim=-1).min(dim=-1)[0]
 
         # Perturbation stability calculation (sigma=0.03)
         x_noisy = x + 0.03 * torch.randn_like(x)
@@ -625,11 +653,11 @@ class TdiV2Model(L.LightningModule):
         out_y = self(y)
         indices_y = out_y["indices"]
 
-        # Store outputs for epoch level validation pooling
         step_out = {
             "val_loss": loss_partner,
             "perplexity": perplexity,
             "stability": stability,
+            "margin": margin.mean().detach().cpu(),
             "indices_x": indices_x.detach().cpu(),
             "indices_y": indices_y.detach().cpu(),
         }
@@ -645,10 +673,12 @@ class TdiV2Model(L.LightningModule):
         val_losses = [x["val_loss"] for x in self.validation_step_outputs]
         perplexities = [x["perplexity"] for x in self.validation_step_outputs]
         stabilities = [x["stability"] for x in self.validation_step_outputs]
+        margins = [x["margin"] for x in self.validation_step_outputs]
 
         mean_loss = torch.stack(val_losses).mean()
         mean_perp = torch.stack(perplexities).mean()
         mean_stab = torch.stack(stabilities).mean()
+        mean_margin = torch.stack(margins).mean()
 
         # Collect state predictions to calculate mutual information and entropy
         all_x = torch.cat([x["indices_x"] for x in self.validation_step_outputs]).numpy()
@@ -685,6 +715,7 @@ class TdiV2Model(L.LightningModule):
             self.log("val_partner_loss", mean_loss, prog_bar=True)
             self.log("val_perplexity", mean_perp, prog_bar=True)
             self.log("val_stability", mean_stab)
+            self.log("val_margin", mean_margin)
             self.log("val_entropy", normalized_entropy)
             self.log("val_dead_states", dead_state_fraction)
             self.log("val_aligned_mi", aligned_mi)
