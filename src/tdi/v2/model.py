@@ -81,13 +81,14 @@ def _kmeans(x: torch.Tensor, n_clusters: int, seed: int = 0) -> torch.Tensor:
         Centroids of shape (n_clusters, D), on the same device/dtype as ``x``.
     """
     points = x.detach().cpu().numpy()
-    n_init = min(n_clusters, points.shape[0])
-    kmeans = KMeans(n_clusters=n_init, random_state=seed, n_init="auto").fit(points)
+    # KMeans requires n_clusters <= n_samples; cap then pad the degenerate case below.
+    k = min(n_clusters, points.shape[0])
+    kmeans = KMeans(n_clusters=k, random_state=seed, n_init="auto").fit(points)
     centers = torch.from_numpy(kmeans.cluster_centers_).to(device=x.device, dtype=x.dtype)
 
     # Pad with random points if fewer samples than clusters (degenerate batch).
-    if n_init < n_clusters:
-        pad = x[torch.randint(x.shape[0], (n_clusters - n_init,), device=x.device)]
+    if k < n_clusters:
+        pad = x[torch.randint(x.shape[0], (n_clusters - k,), device=x.device)]
         centers = torch.cat([centers, pad], dim=0)
     return centers
 
