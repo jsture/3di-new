@@ -20,7 +20,10 @@ def render_datacard(manifest: dict[str, Any], report: dict[str, Any]) -> str:
     name = manifest.get("dataset_name", "unknown")
     pre = manifest.get("preprocessing", {})
     inputs = manifest.get("inputs", {})
-    stage = report.get("stage_counts", {})
+    if "train" in report:
+        stage = report["train"].get("stage_counts", {})
+    else:
+        stage = report.get("stage_counts", {})
 
     lines = [
         f"# Data Card — {name}",
