@@ -49,6 +49,14 @@ class OutputsConfig:
 
 
 @dataclass
+class PreprocessingConfig:
+    """Exception/skip threshold parameters."""
+
+    fail_on_skipped_alignments: bool = False
+    max_skipped_fraction: float = 0.01
+
+
+@dataclass
 class DataConfig:
     """Top-level preprocessing config."""
 
@@ -56,6 +64,7 @@ class DataConfig:
     outputs: OutputsConfig
     features: FeaturesConfig = field(default_factory=FeaturesConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain nested dict (JSON/YAML serializable)."""
@@ -98,4 +107,5 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Da
             max_ca_dist=float(features_raw.get("max_ca_dist", 5.0)),
         ),
         sampling=SamplingConfig(**raw.get("sampling", {})),
+        preprocessing=PreprocessingConfig(**raw.get("preprocessing", {})),
     )

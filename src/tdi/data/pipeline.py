@@ -90,12 +90,13 @@ def _process_split(
     cfg: DataConfig,
     pairfile: str,
     scop_lookup: dict[str, str],
-) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, dict[str, int], set[str]]:
-    """Process one split: returns (x, y, metadata, stage_counts, sids)."""
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, dict[str, int], set[str], list[dict[str, Any]]]:
+    """Process one split: returns (x, y, metadata, stage_counts, sids, skipped_records)."""
     alignments = _read_pairfile(pairfile)
     x_list: list[np.ndarray] = []
     y_list: list[np.ndarray] = []
     meta_records: list[dict[str, Any]] = []
+    skipped_records: list[dict[str, Any]] = []
     sids: set[str] = set()
     counts = {
         "n_alignments_read": len(alignments),
@@ -119,8 +120,18 @@ def _process_split(
                 max_pairs=cfg.sampling.max_pairs_per_alignment,
                 seed=cfg.sampling.seed,
             )
-        except Exception:
+        except Exception as exc:
             counts["n_alignments_skipped"] += 1
+            skipped_records.append(
+                {
+                    "source_row": source_row,
+                    "sid1": sid1,
+                    "sid2": sid2,
+                    "cigar": cigar,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
             continue
 
         counts["n_pairs_before_filters"] += meta.get("n_pairs_before_filters", 0)
@@ -143,7 +154,24 @@ def _process_split(
     y_feat = np.vstack(y_list) if y_list else np.zeros((0, 10), dtype=np.float32)
     counts["n_final_examples"] = int(x_feat.shape[0])
     metadata = pd.DataFrame.from_records(meta_records)
-    return x_feat, y_feat, metadata, counts, sids
+
+    # Perform skipped alignment checks
+    total_alignments = len(alignments)
+    if total_alignments > 0:
+        skipped_fraction = counts["n_alignments_skipped"] / total_alignments
+        if cfg.preprocessing.fail_on_skipped_alignments and counts["n_alignments_skipped"] > 0:
+            raise RuntimeError(
+                "Failed on skipped alignments: "
+                f"{counts['n_alignments_skipped']} alignments skipped."
+            )
+        if skipped_fraction > cfg.preprocessing.max_skipped_fraction:
+            if cfg.preprocessing.fail_on_skipped_alignments:
+                raise RuntimeError(
+                    f"Skipped fraction {skipped_fraction:.3f} exceeds "
+                    f"max_skipped_fraction {cfg.preprocessing.max_skipped_fraction:.3f}."
+                )
+
+    return x_feat, y_feat, metadata, counts, sids, skipped_records
 
 
 def build_features(
@@ -175,10 +203,10 @@ def build_features(
 
     scop_lookup = load_scop_lookup(cfg.dataset.scop_lookup)
 
-    x_train, y_train, train_meta, train_counts, train_sids = _process_split(
+    x_train, y_train, train_meta, train_counts, train_sids, train_skipped = _process_split(
         cfg, cfg.dataset.train_pairfile, scop_lookup
     )
-    x_val, y_val, val_meta, _val_counts, val_sids = _process_split(
+    x_val, y_val, val_meta, val_counts, val_sids, val_skipped = _process_split(
         cfg, cfg.dataset.val_pairfile, scop_lookup
     )
 
@@ -194,10 +222,10 @@ def build_features(
 
     # Write arrays + scaler.
     arrays = {
-        "train_pairs": x_train,
-        "train_targets": y_train,
-        "val_pairs": x_val,
-        "val_targets": y_val,
+        "train_x_raw": x_train,
+        "train_y_raw": y_train,
+        "val_x_raw": x_val,
+        "val_y_raw": y_val,
     }
     for name, arr in arrays.items():
         np.save(out_dir / f"{name}.npy", arr)
@@ -207,15 +235,33 @@ def build_features(
     train_meta.to_parquet(out_dir / "train_metadata.parquet", index=False)
     val_meta.to_parquet(out_dir / "val_metadata.parquet", index=False)
 
+    # Write skipped alignments TSVs
+    cols = ["source_row", "sid1", "sid2", "cigar", "error_type", "error"]
+    df_train_skipped = pd.DataFrame(train_skipped, columns=cols)
+    df_train_skipped.to_csv(out_dir / "train_skipped_alignments.tsv", sep="\t", index=False)
+
+    df_val_skipped = pd.DataFrame(val_skipped, columns=cols)
+    df_val_skipped.to_csv(out_dir / "val_skipped_alignments.tsv", sep="\t", index=False)
+
     # Structure-level QC across every referenced structure.
     all_sids = sorted(train_sids | val_sids)
     structures = build_structures_table(all_sids, cfg.dataset.pdb_dir)
     structures.to_parquet(out_dir / "structures.parquet", index=False)
 
-    # Report (train split is the diagnostic of record).
-    report_dict = report.build_report(train_counts, x_train, train_meta)
+    # Report (train + validation splits are compiled).
+    train_report = report.build_report(train_counts, x_train, train_meta)
+    val_report = report.build_report(val_counts, x_val, val_meta)
+    report_dict = {
+        "train": train_report,
+        "val": val_report,
+    }
     with open(out_dir / "report.json", "w") as f:
         json.dump(report_dict, f, indent=2)
+    with open(out_dir / "train_report.json", "w") as f:
+        json.dump(train_report, f, indent=2)
+    with open(out_dir / "val_report.json", "w") as f:
+        json.dump(val_report, f, indent=2)
+
     with open(out_dir / "report.md", "w") as f:
         f.write(report.render_report_md(report_dict, cfg.dataset.name))
 
@@ -249,6 +295,17 @@ def _build_manifest(
             inputs[label] = {"path": path, "sha256": None}
 
     outputs = {name: array_record(arr) for name, arr in arrays.items()}
+    for name in (
+        "train_metadata.parquet",
+        "val_metadata.parquet",
+        "structures.parquet",
+        "scaler.npz",
+        "train_skipped_alignments.tsv",
+        "val_skipped_alignments.tsv",
+    ):
+        path = out_dir / name
+        if path.exists():
+            outputs[name] = {"sha256": sha256_file(path)}
 
     return {
         "dataset_name": cfg.dataset.name,
@@ -261,6 +318,8 @@ def _build_manifest(
             "max_pairs_per_alignment": cfg.sampling.max_pairs_per_alignment,
             "seed": cfg.sampling.seed,
             "standardization": "zscore_train_fit",
+            "fail_on_skipped_alignments": cfg.preprocessing.fail_on_skipped_alignments,
+            "max_skipped_fraction": cfg.preprocessing.max_skipped_fraction,
         },
         "git_commit": git_commit(),
         "config_hash": cfg.config_hash(),

@@ -186,7 +186,7 @@ def test_build_features_metadata_row_count_matches_arrays(tmp_path: Path) -> Non
     config_path = _make_dataset(tmp_path, "out_build")
     out_dir = build_features(config_path)
 
-    train_pairs = np.load(out_dir / "train_pairs.npy")
+    train_pairs = np.load(out_dir / "train_x_raw.npy")
     import pandas as pd
 
     train_meta = pd.read_parquet(out_dir / "train_metadata.parquet")
@@ -227,13 +227,95 @@ def test_build_writes_expected_artifacts(tmp_path: Path) -> None:
     out_dir = build_features(config_path)
     for name in (
         "manifest.json",
-        "train_pairs.npy",
-        "val_pairs.npy",
+        "train_x_raw.npy",
+        "train_y_raw.npy",
+        "val_x_raw.npy",
+        "val_y_raw.npy",
         "scaler.npz",
         "train_metadata.parquet",
         "structures.parquet",
         "report.json",
+        "train_report.json",
+        "val_report.json",
+        "train_skipped_alignments.tsv",
+        "val_skipped_alignments.tsv",
         "report.md",
         "DATACARD.md",
     ):
         assert (out_dir / name).exists(), name
+
+
+def test_build_features_skipped_alignments(tmp_path: Path) -> None:
+    """Verify that a malformed/missing alignment is skipped, logged in the TSV,
+    and does not crash the run.
+    """
+    pdb_dir = tmp_path / "pdbs"
+    pdb_dir.mkdir(exist_ok=True)
+    _write_pdb(pdb_dir / "d1aaaa_", seed=1)
+
+    pairs = tmp_path / "pairs.out"
+    pairs.write_text("d1aaaa_ d1bbbb_ 24P\n")
+
+    config = {
+        "dataset": {
+            "name": "synthetic",
+            "pdb_dir": str(pdb_dir),
+            "train_pairfile": str(pairs),
+            "val_pairfile": str(pairs),
+            "scop_lookup": None,
+        },
+        "features": {"virtual_center": [270.0, 0.0, 2.0], "max_ca_dist": 5.0},
+        "sampling": {"max_pairs_per_alignment": None, "seed": 123},
+        "preprocessing": {
+            "fail_on_skipped_alignments": False,
+            "max_skipped_fraction": 1.0,
+        },
+        "outputs": {"out_dir": str(tmp_path / "out_skipped")},
+    }
+    config_path = tmp_path / "config_skipped.yaml"
+    with open(config_path, "w") as f:
+        yaml.safe_dump(config, f)
+
+    out_dir = build_features(config_path)
+    tsv_path = out_dir / "train_skipped_alignments.tsv"
+    assert tsv_path.exists()
+    import pandas as pd
+
+    df = pd.read_csv(tsv_path, sep="\t")
+    assert len(df) == 1
+    assert df.iloc[0]["sid1"] == "d1aaaa_"
+    assert df.iloc[0]["sid2"] == "d1bbbb_"
+    assert "FileNotFoundError" in str(df.iloc[0]["error_type"])
+
+
+def test_build_features_fail_on_skipped_alignments(tmp_path: Path) -> None:
+    """Verify that if fail_on_skipped_alignments is True, a skip raises RuntimeError."""
+    pdb_dir = tmp_path / "pdbs"
+    pdb_dir.mkdir(exist_ok=True)
+    _write_pdb(pdb_dir / "d1aaaa_", seed=1)
+
+    pairs = tmp_path / "pairs.out"
+    pairs.write_text("d1aaaa_ d1bbbb_ 24P\n")
+
+    config = {
+        "dataset": {
+            "name": "synthetic",
+            "pdb_dir": str(pdb_dir),
+            "train_pairfile": str(pairs),
+            "val_pairfile": str(pairs),
+            "scop_lookup": None,
+        },
+        "features": {"virtual_center": [270.0, 0.0, 2.0], "max_ca_dist": 5.0},
+        "sampling": {"max_pairs_per_alignment": None, "seed": 123},
+        "preprocessing": {
+            "fail_on_skipped_alignments": True,
+            "max_skipped_fraction": 0.01,
+        },
+        "outputs": {"out_dir": str(tmp_path / "out_failed")},
+    }
+    config_path = tmp_path / "config_failed.yaml"
+    with open(config_path, "w") as f:
+        yaml.safe_dump(config, f)
+
+    with pytest.raises(RuntimeError, match="Failed on skipped alignments"):
+        build_features(config_path)
