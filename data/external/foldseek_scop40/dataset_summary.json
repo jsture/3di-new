@@ -1,0 +1,19 @@
+{
+  "archive_path": "data/external/foldseek_scop40/downloads/scop40pdb.tar.gz",
+  "download_source": "https://wwwuser.gwdg.de/~compbiol/foldseek/scop40pdb.tar.gz",
+  "n_structures": 11211,
+  "sid_examples": [
+    "d12asa_",
+    "d16vpa_",
+    "d1914a1",
+    "d1914a2",
+    "d1a04a1",
+    "d1a04a2",
+    "d1a0aa_",
+    "d1a0ca_",
+    "d1a0ia1",
+    "d1a0ia2"
+  ],
+  "total_structure_bytes": 1234637154,
+  "validation": []
+}
