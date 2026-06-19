@@ -1,6 +1,8 @@
 # Training the v2 3Di Model
 
-This document describes the end-to-end workflow for preparing data, validating the pipeline, training the modernized VQ-VAE (v2) model, and evaluating the resulting discrete structural alphabet.
+This document describes the end-to-end workflow for preparing data, validating the pipeline, and training the modernized VQ-VAE (v2) model.
+
+---
 
 ## 1. Expected Data Layout
 
@@ -63,7 +65,7 @@ Expected alignment counts for the default splits:
 
 ## 3. Build Training Arrays (Data Preprocessing)
 
-Features are extracted from aligning residue-descriptor pairs using the configuration file [configs/data/scop.yaml](file:///Users/skn506/Documents/Claude/Projects/3di-new/configs/data/scop.yaml). This step:
+Features are extracted from aligning residue-descriptor pairs using the configuration file [`configs/data/scop.yaml`](../configs/data/scop.yaml). This step:
 1. Expands CIGAR strings to establish residue-to-residue correspondences.
 2. Filters out invalid coordinates/backbones.
 3. Filters by $C_\alpha$ Euclidean distances (maximum distance threshold, e.g., $5.0\text{ \AA}$).
@@ -75,8 +77,11 @@ Run the preprocessing command:
 uv run python -m tdi.data build-features --config configs/data/scop.yaml
 ```
 
+> [!NOTE]
+> The saved `*_raw.npy` arrays contain raw, unstandardized features. The scaling parameters (mean and std) are fit on the training split only and saved to `scaler.npz`. During training, the dataset loader (`PairDataset`) automatically reads these parameters and applies the standardization transformation on-the-fly to both the training and validation arrays.
+
 ### CLI Overrides
-You can override YAML configuration settings on the command line, for example:
+You can override YAML configuration settings on the command line using explicit flags, for example:
 ```bash
 uv run python -m tdi.data build-features \
   --config configs/data/scop.yaml \
@@ -127,11 +132,11 @@ uv run python -m tdi.data report --config configs/data/scop.yaml
 
 ## 5. Model Configuration
 
-Model configurations are defined in [configs/train/scop_v2_default.yaml](file:///Users/skn506/Documents/Claude/Projects/3di-new/configs/train/scop_v2_default.yaml). The configuration schema maps to dataclasses in [src/tdi/v2/train_config.py](file:///Users/skn506/Documents/Claude/Projects/3di-new/src/tdi/v2/train_config.py).
+Model configurations are defined in [`configs/train/scop_v2_default.yaml`](../configs/train/scop_v2_default.yaml). The configuration schema maps to dataclasses in [`src/tdi/v2/train_config.py`](../src/tdi/v2/train_config.py).
 
 Modern default settings in the schema prioritize high codebook usage and robust gradient flow:
 - **`model.quantizer_type`**: `"ema_vq"` (Exponential Moving Average Vector Quantizer).
-- **`quantizer.gradient_mode`**: `"rotation_trick"` (Householder reflection surrogate gradient).
+- **`quantizer.gradient_mode`**: `"rotation_trick"` (surrogate-gradient path that preserves angular and scale information than standard STE).
 - **`quantizer.kmeans_init`**: `True` (Seeding centroids using warmed-up latents via K-Means).
 - **`training.quantizer_warmup_epochs`**: `1` (Continuous latent warmup before quantization is enabled).
 - **`loss.lambda_self` / `lambda_contrast` / `lambda_usage`**: Set to `0.05`, `0.02`, and `0.001` respectively, ensuring aligned feature clustering without code collapse.
@@ -145,6 +150,9 @@ To train the VQ-VAE v2 model using the default configuration file:
 uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml
 ```
 
+> [!NOTE]
+> With `batch_size=512` and `accumulate_grad_batches=4`, the effective training batch size is 2048 examples (512 * 4).
+
 ### Dotted Overrides
 Any nested parameter in the `TrainConfig` schema can be overridden at runtime using dotted notation flags:
 ```bash
@@ -155,11 +163,15 @@ uv run python -m tdi.v2 train \
   --optimizer.lr 0.002
 ```
 
+### Sampler Requirements
+> [!IMPORTANT]
+> The `alignment_balanced` sampler requires training metadata (`train_metadata.parquet`) to contain an `alignment_id` column to group example rows by their source alignment. If metadata is missing or does not contain `alignment_id`, set `data.sampler=random`.
+
 ### Training Pipeline Phases
 1. **Warmup Phase**: The model is fit with continuous latents for the configured `quantizer_warmup_epochs` (default: 1 epoch). The quantization discretization step is bypassed.
 2. **K-Means Initialization**: At the boundary of the warmup epoch, the codebook is initialized by collecting encoder outputs across dataloader batches and clustering them into starting centroids.
 3. **Surrogate Gradients**: Training proceeds with discrete states. Forward lookups map outputs to discrete centroids, and gradients are propagated to the encoder via either standard straight-through estimation (`ste`) or the angular-preserving `rotation_trick` (recommended default).
-4. **Early Stopping**: The run automatically monitors validation performance and exits early if validation scores plateau.
+4. **Early Stopping**: If enabled in the training config, early stopping monitors validation loss and stops after the configured patience epochs.
 5. **Export**: The best model checkpoint is loaded, features are frozen, and final artifacts are exported.
 
 ---
@@ -183,21 +195,7 @@ Downstream encoding, feature representation, and evaluation utilities consume th
 
 ## 8. Downstream Alphabet Evaluation
 
-To evaluate the quality of the discrete structural alphabet, use the `evaluate` subcommand:
-```bash
-uv run python -m tdi.v2 evaluate \
-  --model_dir outputs/models/scop_v2_default_seed1 \
-  --pdb_dir data/external/foldseek_scop40/pdb_by_sid \
-  --pairfile data/derived/pairfiles/tmaln-06.val.out \
-  --out_dir outputs/evaluations/scop_v2_default_seed1 \
-  --virt 270.0 0.0 2.0
-```
-
-### Evaluation Outputs
-This script translates aligned structures into discrete state sequences and outputs:
-- **`sequences.txt`**: Encoded structural alphabet sequence for each Domain ID.
-- **`submat.txt`**: Computed log-odds substitution scoring matrix (similar to BLOSUM/BLAST).
-- **`evaluation_report.json`**: Detailed metrics reporting mutual information (MI) and transition-adjusted mutual information ($MI_{tot}$). Higher mutual information suggests better capture of alignment syntax.
+To evaluate the quality of the discrete structural alphabet, transition counts, substitution matrices, and mutual information metrics, refer to the [Downstream Alphabet Evaluation Guide](v2_evaluation.md).
 
 ---
 

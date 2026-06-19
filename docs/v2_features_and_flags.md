@@ -52,10 +52,10 @@ Parameters specific to VQ/FSQ codebook quantization and updates.
 | :--- | :--- | :--- | :--- |
 | `l2_normalize` | `--quantizer.l2_normalize <bool>`| `True` | Use cosine distance / L2 normalization for VQ lookups. |
 | `decay` | `--quantizer.decay <float>` | `0.99` | EMA decay rate for moving average statistics. |
-| `commitment_cost`| `--quantizer.commitment_cost <float>`| `0.25` | Commiment penalty loss weighting factor. |
+| `commitment_cost`| `--quantizer.commitment_cost <float>`| `0.25` | Commitment penalty loss weighting factor. |
 | `min_count` | `--quantizer.min_count <float>` | `1.0` | Minimum usage count below which codebook centroids are replaced. |
 | `replacement_warmup_steps`| `--quantizer.replacement_warmup_steps <int>`| `500` | Step warmup count before codebook replacements start. |
-| `gradient_mode` | `--quantizer.gradient_mode <str>`| `"rotation_trick"`| Gradient path mode: `"rotation_trick"` (Householder) or `"ste"`. |
+| `gradient_mode` | `--quantizer.gradient_mode <str>`| `"rotation_trick"`| Gradient path mode: `"rotation_trick"` (surrogate-gradient path preserving angular/scale info) or `"ste"`. |
 | `kmeans_init` | `--quantizer.kmeans_init <bool>` | `True` | Seed VQ codebook centroids from warmed-up latents using k-means. |
 | `kmeans_seed` | `--quantizer.kmeans_seed <int>` | `0` | Random seed for k-means fitting. |
 | `kmeans_init_batches`| `--quantizer.kmeans_init_batches <int>`| `16` | Dataloader batches used for k-means fitting. |
@@ -107,6 +107,10 @@ Data loading paths and samplers.
 ### 7. `outputs`
 Output folder locations.
 
-| Key | Dotted CLI Override | Default Value | Description |
-| :--- | :--- | :--- | :--- |
 | `out_dir` | `--outputs.out_dir <path>` | `"outputs/models/scop_v2_default_seed1"` | Path to save exported model artifacts and logs. |
+
+---
+
+> [!WARNING]
+> This reference document describes the `TrainConfig` schema used for model training (`python -m tdi.v2 train`).
+> The `tdi.data` data preprocessing pipeline (`python -m tdi.data build-features`) uses a separate configuration schema and currently supports **only explicit CLI flags** (e.g., `--out_dir`, `--max_ca_dist`, `--max_pairs`, `--seed`) instead of arbitrary dotted overrides.
