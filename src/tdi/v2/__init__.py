@@ -19,6 +19,7 @@ from .model import (
     create_vqvae,
 )
 from .training_data import (
+    AlignmentBatchSampler,
     PairDataset,
     align_features,
     encoder_features,
@@ -27,6 +28,7 @@ from .training_data import (
 )
 
 __all__ = [
+    "AlignmentBatchSampler",
     "EMAVectorQuantizer",
     "FSQQuantizer",
     "PairDataset",
