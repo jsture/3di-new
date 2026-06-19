@@ -47,6 +47,12 @@ def main() -> None:
     parser.add_argument(
         "--jitter_std", type=float, default=0.0, help="Coordinate jittering noise std."
     )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="bf16-mixed",
+        help="Trainer precision (e.g. bf16-mixed, 32-true). Use 32-true on non-bf16 hardware.",
+    )
     args = parser.parse_args()
 
     # Seed all sources of randomness
@@ -109,10 +115,14 @@ def main() -> None:
         max_epochs=args.max_epochs,
         accelerator="auto",
         devices="auto",
+        precision=args.precision,
         callbacks=[checkpoint_callback, early_stopping],
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
     )
+
+    # Seed EMA-VQ codebook from real encoder outputs (no-op for FSQ)
+    model.init_codebook_from_data(train_loader)
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 

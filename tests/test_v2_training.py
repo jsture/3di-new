@@ -2,8 +2,10 @@
 
 from pathlib import Path
 
+import lightning as L
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 from tdi.v2 import (
     EMAVectorQuantizer,
@@ -388,3 +390,121 @@ def test_cli_evaluate_end_to_end(tmp_path: Path) -> None:
     assert (out_dir / "sequences.txt").exists()
     assert (out_dir / "submat.txt").exists()
     assert (out_dir / "evaluation_report.json").exists()
+
+
+def _tiny_loader(n: int = 200, batch_size: int = 10) -> DataLoader:
+    """Build a small (x, y) DataLoader of random scaled features."""
+    x = torch.randn(n, 10)
+    y = torch.randn(n, 10)
+    return DataLoader(TensorDataset(x, y), batch_size=batch_size)
+
+
+def test_kmeans_init_populates_codebook() -> None:
+    """k-means init replaces the random codebook and marks it initialized."""
+    model = TdiV2Model(quantizer_type="vq", n_states=20, z_dim=4)
+    quantizer = model.quantizer
+    assert isinstance(quantizer, EMAVectorQuantizer)
+    before = quantizer.embedding.clone()
+    assert bool(quantizer.initialized.item()) is False
+
+    model.init_codebook_from_data(_tiny_loader(), n_batches=4)
+
+    assert bool(quantizer.initialized.item()) is True
+    assert not torch.equal(before, quantizer.embedding)
+    assert torch.allclose(quantizer.ema_count, torch.ones_like(quantizer.ema_count))
+    assert torch.equal(quantizer.ema_sum, quantizer.embedding)
+
+
+def test_kmeans_init_noop_for_fsq() -> None:
+    """k-means init is a no-op for the FSQ backend."""
+    model = TdiV2Model(quantizer_type="fsq", fsq_levels=[5, 4])
+    # Must not raise and must leave the FSQ quantizer in place.
+    model.init_codebook_from_data(_tiny_loader())
+    assert isinstance(model.quantizer, FSQQuantizer)
+
+
+def test_optimizer_has_two_param_groups_correct_decay() -> None:
+    """AdamW splits decay (>=2-D) from no-decay (bias/norm) groups."""
+    model = TdiV2Model(lambda_contrast=0.0)
+    trainer = L.Trainer(
+        max_steps=2,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+    )
+    trainer.fit(model, _tiny_loader())
+
+    opt = trainer.optimizers[0]
+    assert len(opt.param_groups) == 2
+    decay_g, no_decay_g = opt.param_groups
+    assert decay_g["weight_decay"] == model.weight_decay
+    assert no_decay_g["weight_decay"] == 0.0
+    assert all(p.ndim >= 2 for p in decay_g["params"])
+    assert all(p.ndim < 2 for p in no_decay_g["params"])
+
+    sched = trainer.lr_scheduler_configs[0].scheduler
+    assert isinstance(sched, torch.optim.lr_scheduler.SequentialLR)
+
+
+class _LRRecorder(L.Callback):
+    """Records the optimizer LR at the start of each training batch."""
+
+    def __init__(self) -> None:
+        self.lrs: list[float] = []
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:  # type: ignore[no-untyped-def]
+        self.lrs.append(trainer.optimizers[0].param_groups[0]["lr"])
+
+
+def test_scheduler_warms_up_then_cosines() -> None:
+    """LR rises during warmup then cosine-decays toward zero, per-step."""
+    model = TdiV2Model(lambda_contrast=0.0, warmup_ratio=0.2, lr=1e-3)
+    recorder = _LRRecorder()
+    trainer = L.Trainer(
+        max_epochs=3,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        callbacks=[recorder],
+    )
+    trainer.fit(model, _tiny_loader())
+
+    lrs = recorder.lrs
+    assert len(lrs) > 5
+    peak = max(range(len(lrs)), key=lambda i: lrs[i])
+    assert peak > 0  # warmed up: peak is not the first step
+    assert lrs[-1] < lrs[peak]  # cosine decays after the peak
+    assert lrs[-1] < 0.1 * lrs[peak]  # near zero by the final step
+
+
+def test_contrastive_disabled_is_noop() -> None:
+    """With lambda_contrast=0 there is no logit_scale and the step still runs."""
+    model = TdiV2Model(lambda_contrast=0.0)
+    assert not hasattr(model, "logit_scale")
+    x = torch.randn(8, 10)
+    y = torch.randn(8, 10)
+    out = model.training_step((x, y), 0)
+    assert out.ndim == 0
+
+
+def test_contrastive_logit_scale_clamped() -> None:
+    """Enabled contrastive head exposes a learnable logit_scale clamped at use."""
+    model = TdiV2Model(lambda_contrast=0.05, temperature=0.1)
+    assert hasattr(model, "logit_scale")
+    with torch.no_grad():
+        model.logit_scale.fill_(10.0)  # exp(10) >> 100 before clamp
+    scale = model.logit_scale.clamp(max=np.log(100.0)).exp()
+    assert scale.item() <= 100.0 + 1e-3
+
+    # Symmetric loss runs and is differentiable.
+    x = torch.randn(8, 10)
+    y = torch.randn(8, 10)
+    loss = model.training_step((x, y), 0)
+    loss.backward()
+    assert model.logit_scale.grad is not None
