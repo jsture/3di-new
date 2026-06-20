@@ -65,6 +65,9 @@ def structure_qc(sid: str, pdb_path: str | Path) -> dict[str, object]:
         record["n_residues"] = n_res
         record["n_valid_residues"] = n_valid
         record["valid_fraction"] = float(n_valid / n_res) if n_res else 0.0
+        # These flags mean "at least one residue (including HETATM rows, left NaN by
+        # get_atom_coordinates) lacks the atom" — not "the structure is unusable". They are
+        # therefore True for most real structures; use valid_fraction for a graded measure.
         record["has_missing_ca"] = bool(np.isnan(coords[:, 0:3]).any())
         record["has_missing_backbone"] = bool(np.isnan(coords[:, 6:12]).any())
         record["parse_status"] = "ok" if n_valid > 0 else "no_valid_residues"
