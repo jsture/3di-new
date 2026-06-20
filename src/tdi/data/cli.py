@@ -22,6 +22,10 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
         "features.max_ca_dist": args.max_ca_dist,
         "sampling.max_pairs_per_alignment": args.max_pairs,
         "sampling.seed": args.seed,
+        "features.virtual_center": (
+            tuple(args.virtual_center) if args.virtual_center is not None else None
+        ),
+        "preprocessing.fail_on_skipped_alignments": args.fail_on_skipped,
     }
 
 
@@ -32,6 +36,19 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max_ca_dist", type=float, default=None, help="Override max Ca dist.")
     parser.add_argument("--max_pairs", type=int, default=None, help="Override max pairs/alignment.")
     parser.add_argument("--seed", type=int, default=None, help="Override sampling seed.")
+    parser.add_argument(
+        "--virtual_center",
+        type=float,
+        nargs=3,
+        default=None,
+        help="Override features.virtual_center (three floats).",
+    )
+    parser.add_argument(
+        "--fail_on_skipped",
+        action="store_true",
+        default=None,
+        help="Override preprocessing.fail_on_skipped_alignments to True.",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
