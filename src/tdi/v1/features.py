@@ -1,7 +1,7 @@
 """Feature extraction: parse PDB files and compute 3Di structural descriptors."""
 
 import numpy as np
-from Bio.PDB import PDBParser
+from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.Residue import Residue
 from numpy.linalg import norm
 
@@ -71,7 +71,7 @@ def get_atom_coordinates(
         ca_atoms = [atom for atom in res if atom.name == "CA"]
         if len(ca_atoms) != 1:
             if verbose:
-                print(f"No CA found [{i}] {chain.full_id}")
+                print(f"No CA found [{i}] {res.full_id}")
         else:
             coords[i, 0:3] = ca_atoms[0].coord
 
@@ -80,7 +80,7 @@ def get_atom_coordinates(
             if len(cb_atoms) == 1:
                 coords[i, 3:6] = cb_atoms[0].coord
             elif verbose:
-                print(f"No CB found [{i}] {chain.full_id}")
+                print(f"No CB found [{i}] {res.full_id}")
         else:
             n_atoms = [atom for atom in res if atom.name == "N"]
             co_atoms = [atom for atom in res if atom.name == "C"]
@@ -251,11 +251,11 @@ def calc_angles_forloop(
 
     for i in range(1, n_res - 1):
         if valid_mask[i - 1] and valid_mask[i] and valid_mask[i + 1]:
-            j = partner_idx[i]
+            j = int(partner_idx[i])
             if valid_mask[j + 1] and valid_mask[j - 1]:
                 out[i] = calc_angles(coords, i, j)
 
-    new_valid_mask = ~np.isnan(out).any(axis=1)
+    new_valid_mask = np.asarray(~np.isnan(out).any(axis=1), dtype=bool)
     return out, new_valid_mask
 
 
@@ -271,6 +271,7 @@ def get_coords_from_pdb(path: str, full_backbone: bool = False) -> tuple[np.ndar
     """
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("None", path)
+    assert structure is not None
 
     model = structure[0]
     chain = next(iter(model.get_chains()))

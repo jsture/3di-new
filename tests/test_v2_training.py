@@ -122,7 +122,8 @@ def test_ca_filter_requires_superposition() -> None:
     idx_1 = np.array([0, 1, 2])
     idx_2 = np.array([0, 1, 2])
 
-    v1, v2, dists = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist=1.0)
+    v1, v2, dists, error = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist=1.0)
+    assert error is None
     assert np.array_equal(v1, idx_1)
     assert np.array_equal(v2, idx_2)
     assert dists is not None
@@ -271,7 +272,8 @@ def test_ca_filter_12d_coordinates() -> None:
     idx_1 = np.array([0, 1, 2])
     idx_2 = np.array([0, 1, 2])
 
-    v1, v2, dists = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist=1.0)
+    v1, v2, dists, error = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist=1.0)
+    assert error is None
     assert np.array_equal(v1, idx_1)
     assert np.array_equal(v2, idx_2)
     assert dists is not None

@@ -120,6 +120,7 @@ def train_model(cfg: TrainConfig) -> None:
         std=std,
         descriptor_jitter_std=cfg.data.descriptor_jitter_std,
         seed=cfg.training.seed,
+        fit_scaler=True,
     )
     # Obtain standardized metrics (fitted or loaded)
     mean = train_dataset.mean
@@ -133,6 +134,7 @@ def train_model(cfg: TrainConfig) -> None:
         std=std,
         descriptor_jitter_std=0.0,
         seed=cfg.training.seed,
+        fit_scaler=False,
     )
 
     # Resolve loader batch sampler
@@ -239,9 +241,11 @@ def train_model(cfg: TrainConfig) -> None:
         name="logs",
     )
 
+    min_epochs = cfg.training.quantizer_warmup_epochs + 1
     # Configure Lightning Trainer
     trainer = L.Trainer(
         max_epochs=cfg.training.max_epochs,
+        min_epochs=min_epochs,
         accelerator="auto",
         devices="auto",
         precision=cfg.training.precision,

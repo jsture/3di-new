@@ -140,6 +140,12 @@ def process_pdb(
     # Map descriptors to discrete states
     valid_states = discretize(encoder, centroids, feat[mask], mean, std)
 
+    if len(valid_states) > 0 and np.max(valid_states) >= len(LETTERS):
+        raise ValueError(
+            f"State index {np.max(valid_states)} exceeds available alphabet letters "
+            f"(len={len(LETTERS)})."
+        )
+
     states = np.full(len(mask), -1)
     states[mask] = valid_states
 

@@ -171,7 +171,7 @@ def main() -> None:
         )
 
         # Quantiles of superposed CA distance
-        non_null_dists = df_meta["ca_dist_superposed"].dropna().values
+        non_null_dists = df_meta["ca_dist_superposed"].dropna().to_numpy(dtype=np.float64)
         if len(non_null_dists) > 0:
             q_vals = [0, 25, 50, 75, 90, 95, 99, 100]
             q_results = np.percentile(non_null_dists, q_vals)

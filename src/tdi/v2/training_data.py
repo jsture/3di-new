@@ -152,18 +152,22 @@ def filter_ca_distance(
     coords1: np.ndarray,
     coords2: np.ndarray,
     max_ca_dist: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, str | None]:
     """Filter residue pairs by Ca-Ca distance after superposition.
 
     Uses Kabsch algorithm (SVD) to superpose coords2 onto coords1 using the matched pairs,
-    then filters out pairs whose distance exceeds max_ca_dist.
+    then filters out pairs whose distance exceeds max_ca_dist. Returns the aligned indices,
+    distances, and any degeneracy error classification (or None if successful).
     """
     if len(idx_1) < 3:
-        return idx_1, idx_2, None
+        return idx_1, idx_2, None, "too_few_pairs"
 
     # Get C-alpha coordinates (columns 0:3) for the matched pairs
     P = coords1[idx_1, 0:3]
     Q = coords2[idx_2, 0:3]
+
+    if not np.isfinite(P).all() or not np.isfinite(Q).all():
+        return idx_1[:0], idx_2[:0], np.array([], dtype=np.float32), "nonfinite_coordinates"
 
     # Calculate centroids
     centroid_P = P.mean(axis=0)
@@ -173,11 +177,29 @@ def filter_ca_distance(
     p = P - centroid_P
     q = Q - centroid_Q
 
+    # Tolerance-based rank check: centered coords must span at least 2 dimensions
+    try:
+        s_p = np.linalg.svd(p, compute_uv=False)
+        s_q = np.linalg.svd(q, compute_uv=False)
+        if len(s_p) < 2 or s_p[1] < 1e-6 or len(s_q) < 2 or s_q[1] < 1e-6:
+            return (
+                idx_1[:0],
+                idx_2[:0],
+                np.array([], dtype=np.float32),
+                "rank_deficient_coordinates",
+            )
+    except np.linalg.LinAlgError:
+        return idx_1[:0], idx_2[:0], np.array([], dtype=np.float32), "svd_failed"
+
     # Covariance matrix
     H = q.T @ p
 
     # SVD
-    U, _S, Vt = np.linalg.svd(H)
+    try:
+        U, _S, Vt = np.linalg.svd(H)
+    except np.linalg.LinAlgError:
+        return idx_1[:0], idx_2[:0], np.array([], dtype=np.float32), "svd_failed"
+
     R = Vt.T @ U.T
 
     # Ensure a proper rotation (det(R) == 1)
@@ -196,9 +218,9 @@ def filter_ca_distance(
 
     if max_ca_dist is not None:
         mask = dist <= max_ca_dist
-        return idx_1[mask], idx_2[mask], dist[mask]
+        return idx_1[mask], idx_2[mask], dist[mask], None
 
-    return idx_1, idx_2, dist
+    return idx_1, idx_2, dist, None
 
 
 def assert_finite_features(x: np.ndarray, name: str) -> None:
@@ -275,7 +297,9 @@ def align_features(
     idx_1, idx_2 = filter_valid_pairs(idx_1, idx_2, mask1, mask2)
     n_pairs_after_descriptor_validity = len(idx_1)
 
-    idx_1, idx_2, dists = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist)
+    idx_1, idx_2, dists, kabsch_error = filter_ca_distance(
+        idx_1, idx_2, coords1, coords2, max_ca_dist
+    )
     n_pairs_after_ca_filter = len(idx_1)
 
     # Sub-sample before bidirectional mapping if max_pairs is set
@@ -325,6 +349,7 @@ def align_features(
             "n_pairs_after_ca_filter": n_pairs_after_ca_filter,
             "n_pairs_after_max_pairs": n_pairs_after_max_pairs,
             "cap_seed": cap_seed,
+            "kabsch_error": kabsch_error,
         }
     else:
         meta = {
@@ -333,6 +358,7 @@ def align_features(
             "n_pairs_after_ca_filter": n_pairs_after_ca_filter,
             "n_pairs_after_max_pairs": n_pairs_after_max_pairs,
             "cap_seed": cap_seed,
+            "kabsch_error": kabsch_error,
         }
 
     return x, y, meta
@@ -379,6 +405,7 @@ class PairDataset(Dataset):
         std: np.ndarray | None = None,
         descriptor_jitter_std: float = 0.0,
         seed: int = 42,
+        fit_scaler: bool = False,
     ) -> None:
         """Initialize the PairDataset.
 
@@ -390,20 +417,35 @@ class PairDataset(Dataset):
             descriptor_jitter_std: Experimental noise std applied to scaled input descriptors.
                 Distinct from coordinate-level jitter (see ``extract_features``); default 0.0.
             seed: Base seed for deterministic per-item jitter.
+            fit_scaler: If True, fits scaler parameters (mean/std) internally when omitted.
         """
         assert len(x) == len(y), "Features and targets must have matching length."
         self.raw_x = x.astype(np.float32)
         self.raw_y = y.astype(np.float32)
 
+        if (mean is None) != (std is None):
+            raise ValueError("mean and std must be provided together")
+
         # Standardize features using training statistics
-        if mean is None or std is None:
+        if mean is None:
+            if not fit_scaler:
+                raise ValueError("mean/std required unless fit_scaler=True")
             self.mean, self.std = fit_standardizer(self.raw_x)
         else:
+            assert std is not None
             self.mean = mean.astype(np.float32)
             self.std = std.astype(np.float32)
 
+        assert np.isfinite(self.mean).all(), "Scaler mean contains non-finite values"
+        assert np.isfinite(self.std).all(), "Scaler std contains non-finite values"
+        assert (self.std > 0).all(), "Scaler std contains non-positive values"
+
         self.x_scaled = transform(self.raw_x, self.mean, self.std)
         self.y_scaled = transform(self.raw_y, self.mean, self.std)
+
+        assert_finite_features(self.x_scaled, "x_scaled")
+        assert_finite_features(self.y_scaled, "y_scaled")
+
         self.descriptor_jitter_std = descriptor_jitter_std
         self.seed = seed
         self.epoch = 0

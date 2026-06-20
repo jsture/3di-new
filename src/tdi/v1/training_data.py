@@ -32,6 +32,7 @@ def encoder_features(
     coords, valid_mask = features.get_coords_from_pdb(pdb_path, full_backbone=True)
     coords = features.move_CB(coords, virt_cb=virt_cb)
     partner_idx = features.find_nearest_residues(coords, valid_mask)
+    assert isinstance(partner_idx, np.ndarray)
     feat, valid_mask2 = features.calc_angles_forloop(coords, partner_idx, valid_mask)
 
     seq_dist = (partner_idx - np.arange(len(partner_idx)))[:, np.newaxis]
