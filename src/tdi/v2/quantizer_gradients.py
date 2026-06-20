@@ -1,4 +1,8 @@
-from __future__ import annotations
+"""Surrogate-gradient estimators for the vector-quantization bottleneck.
+
+Provides the standard straight-through estimator and the rotation trick
+(Fifty et al., 2024), selected via :func:`apply_quantizer_gradient`.
+"""
 
 import torch
 import torch.nn.functional as F
@@ -39,7 +43,10 @@ def rotation_trick(
 
     We construct the minimal Householder reflection that maps z's unit
     direction to z_q's unit direction, then apply it to transform
-    backpropagated gradients.
+    backpropagated gradients. Following the published method, the rotation
+    basis and the magnitude rescale are treated as constants (stop-gradient),
+    so ``z_rot`` is a constant linear map ``R @ z`` and the encoder gradient is
+    ``R^T g``. Only detaching the basis (not ``z`` itself) keeps the map linear.
 
     Args:
         z: Continuous latent tensor from encoder of shape (..., dim).
@@ -57,24 +64,24 @@ def rotation_trick(
     z_f = z.float()
     z_q_f = z_q.float()
 
-    # Calculate normalized unit directions for both vectors
-    z_norm = F.normalize(z_f, dim=-1, eps=eps)
-    zq_norm = F.normalize(z_q_f, dim=-1, eps=eps)
+    # Rotation basis is a constant of the transform: detach so gradients do not leak
+    # through the normalize/bisector construction (R must be treated as constant).
+    z_norm = F.normalize(z_f, dim=-1, eps=eps).detach()
+    zq_norm = F.normalize(z_q_f, dim=-1, eps=eps).detach()
 
     # Householder vector for rotating z_norm toward zq_norm.
-    # v = z_norm + zq_norm defines the bisector reflection plane.
-    v = z_norm + zq_norm
-    v = F.normalize(v, dim=-1, eps=eps)
+    # v = z_norm + zq_norm defines the bisector reflection plane (detached basis).
+    v = F.normalize(z_norm + zq_norm, dim=-1, eps=eps)
 
-    # Householder reflection: R(z) = 2 v (v^T z) - z
-    # This reflects z across the bisector plane to align its direction with z_q
+    # Householder reflection: R(z) = 2 v (v^T z) - z, with v constant. This is linear in
+    # z, so autograd yields R^T on the backward pass (the rotation-trick gradient).
     dot = torch.sum(z_f * v, dim=-1, keepdim=True)
     z_rot = 2.0 * v * dot - z_f
 
-    # Match the magnitude of z_q to preserve scale information in the rotated path
+    # Match the magnitude of z_q; the rescale factor is a constant (detached).
     z_q_norm_mag = torch.linalg.vector_norm(z_q_f, dim=-1, keepdim=True).clamp_min(eps)
     z_rot_norm_mag = torch.linalg.vector_norm(z_rot, dim=-1, keepdim=True).clamp_min(eps)
-    z_rot = z_rot * (z_q_norm_mag / z_rot_norm_mag)
+    z_rot = z_rot * (z_q_norm_mag / z_rot_norm_mag).detach()
 
     # Cast back to original input dtype
     z_rot = z_rot.to(original_dtype)
