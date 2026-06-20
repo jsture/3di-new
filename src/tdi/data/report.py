@@ -15,7 +15,7 @@ _SEQ_SEP_EDGES = [1, 2, 5, 13, 25, 65]
 _SEQ_SEP_LABELS = ["1", "2-4", "5-12", "13-24", "25-64", ">64"]
 
 # Ca-distance bins (Angstroms) up to the typical max_ca_dist filter, plus overflow.
-_CA_DIST_EDGES = [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, float("inf")]
+_CA_DIST_EDGES = [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0]
 
 
 def _histogram_from_edges(values: np.ndarray, edges: list[float]) -> list[int]:
@@ -24,6 +24,18 @@ def _histogram_from_edges(values: np.ndarray, edges: list[float]) -> list[int]:
         return [0] * (len(edges) - 1)
     counts, _ = np.histogram(values, bins=edges)
     return [int(c) for c in counts]
+
+
+def _ca_distance_bins(values: np.ndarray) -> list[dict[str, object]]:
+    """Build strict-JSON Ca-distance bins, including explicit overflow."""
+    bounded_counts = _histogram_from_edges(values, _CA_DIST_EDGES)
+    bins = [
+        {"label": f"[{_CA_DIST_EDGES[i]}, {_CA_DIST_EDGES[i + 1]})", "count": count}
+        for i, count in enumerate(bounded_counts)
+    ]
+    overflow = int(np.sum(values >= _CA_DIST_EDGES[-1])) if values.size else 0
+    bins.append({"label": f">={_CA_DIST_EDGES[-1]}", "count": overflow})
+    return bins
 
 
 def _seq_sep_histogram(features: np.ndarray) -> dict[str, int]:
@@ -105,8 +117,7 @@ def build_report(
         "feature_stats": feat_stats,
         "sequence_separation_histogram": _seq_sep_histogram(features),
         "ca_distance_histogram": {
-            "edges": _CA_DIST_EDGES,
-            "counts": _histogram_from_edges(ca_dist, _CA_DIST_EDGES),
+            "bins": _ca_distance_bins(ca_dist),
         },
         "examples_per_fold": _level_counts("fold_source"),
         "examples_per_superfamily": _level_counts("superfamily_source"),
@@ -173,9 +184,8 @@ def render_report_md(report_dict: Mapping[str, object], dataset_name: str) -> st
             ca_hist = split_report["ca_distance_histogram"]
             assert isinstance(ca_hist, dict)
             lines += ["", "### Ca-distance histogram (A)", "", "| Bin | Count |", "| --- | ---: |"]
-            edges, counts = ca_hist["edges"], ca_hist["counts"]
-            for i, c in enumerate(counts):
-                lines.append(f"| [{edges[i]}, {edges[i + 1]}) | {c} |")
+            for bin_record in ca_hist["bins"]:
+                lines.append(f"| {bin_record['label']} | {bin_record['count']} |")
 
             lines += [
                 "",
@@ -208,9 +218,8 @@ def render_report_md(report_dict: Mapping[str, object], dataset_name: str) -> st
         ca_hist = report_dict["ca_distance_histogram"]
         assert isinstance(ca_hist, dict)
         lines += ["", "## Ca-distance histogram (A)", "", "| Bin | Count |", "| --- | ---: |"]
-        edges, counts = ca_hist["edges"], ca_hist["counts"]
-        for i, c in enumerate(counts):
-            lines.append(f"| [{edges[i]}, {edges[i + 1]}) | {c} |")
+        for bin_record in ca_hist["bins"]:
+            lines.append(f"| {bin_record['label']} | {bin_record['count']} |")
 
         lines += ["", f"Stage reconciliation: {'OK' if reconcile(sc) else 'MISMATCH'}", ""]
         return "\n".join(lines)
