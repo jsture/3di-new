@@ -1,15 +1,13 @@
-from __future__ import annotations
-
 import argparse
+import json
 import os
 from pathlib import Path
-from typing import Any
 
 import lightning as L
 import numpy as np
 import torch
 import yaml
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 from torch.utils.data import DataLoader
 
@@ -18,7 +16,25 @@ from tdi.v2.train_config import TrainConfig, load_train_config
 from tdi.v2.training_data import AlignmentBatchSampler, PairDataset
 
 
-def _load_alignment_ids(data_dir: str | Path, n_rows: int) -> np.ndarray[tuple[int], Any] | None:
+class _EpochSeedingCallback(Callback):
+    """Propagate the epoch into the dataset and batch sampler each train epoch.
+
+    Without this, ``PairDataset``/``AlignmentBatchSampler`` keep ``epoch == 0`` for the
+    whole run, so per-epoch descriptor jitter and batch composition never vary.
+    """
+
+    def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        epoch = trainer.current_epoch
+        loader = trainer.train_dataloader
+        if loader is None:
+            return
+        for obj in (getattr(loader, "dataset", None), getattr(loader, "batch_sampler", None)):
+            set_epoch = getattr(obj, "set_epoch", None)
+            if callable(set_epoch):
+                set_epoch(epoch)
+
+
+def _load_alignment_ids(data_dir: str | Path, n_rows: int) -> np.ndarray | None:
     """Load per-row alignment ids from a metadata parquet if present and row-aligned.
 
     Args:
@@ -67,10 +83,14 @@ def train_model(cfg: TrainConfig) -> None:
             x_train_raw = train_data_raw[:, :, 0]
             y_train_raw = train_data_raw[:, :, 1]
 
-            # For validation data, look for data.npy in val subfolder or processed_dir
+            # Validation data must be a distinct file; never silently alias the train set.
             val_data_path = processed_dir / "val" / "data.npy"
             if not val_data_path.exists():
-                val_data_path = processed_dir / "data.npy"
+                raise FileNotFoundError(
+                    f"Training data found at {train_data_path} but no validation data at "
+                    f"{val_data_path}. Provide a separate validation split rather than "
+                    "reusing the training data."
+                )
             val_data_raw = np.load(val_data_path)
             x_val_raw = val_data_raw[:, :, 0]
             y_val_raw = val_data_raw[:, :, 1]
@@ -191,6 +211,9 @@ def train_model(cfg: TrainConfig) -> None:
         aux_ramp_epochs=cfg.training.aux_ramp_epochs,
         loss_type=cfg.model.loss_type,
         kmeans_init=cfg.quantizer.kmeans_init,
+        kmeans_init_batches=cfg.quantizer.kmeans_init_batches,
+        kmeans_seed=cfg.quantizer.kmeans_seed,
+        kmeans_max_samples=cfg.quantizer.kmeans_init_samples,
         gradient_mode=cfg.quantizer.gradient_mode,
     )
 
@@ -224,7 +247,7 @@ def train_model(cfg: TrainConfig) -> None:
         precision=cfg.training.precision,
         accumulate_grad_batches=cfg.training.accumulate_grad_batches,
         logger=logger,
-        callbacks=[checkpoint_callback, early_stopping],
+        callbacks=[checkpoint_callback, early_stopping, _EpochSeedingCallback()],
         gradient_clip_val=cfg.optimizer.gradient_clip_val,
         gradient_clip_algorithm="norm",
         default_root_dir=str(out_dir),
@@ -242,8 +265,25 @@ def train_model(cfg: TrainConfig) -> None:
         print("No checkpoint saved, exporting current model.")
         best_model = model
 
+    # Read feature-build provenance (virtual center / Ca filter) from the data report if
+    # present, so the exported config records what was actually used rather than guessing.
+    virtual_center = None
+    max_ca_dist = None
+    report_path = processed_dir / "training_data_report.json"
+    if report_path.exists():
+        with open(report_path) as f:
+            data_report = json.load(f)
+        virtual_center = data_report.get("virtual_center")
+        max_ca_dist = data_report.get("max_ca_dist")
+
     # Save best model to export files
-    best_model.export_model(out_dir, mean=mean, std=std)
+    best_model.export_model(
+        out_dir,
+        mean=mean,
+        std=std,
+        virtual_center=virtual_center,
+        max_ca_dist=max_ca_dist,
+    )
 
     # Save training_config.yaml in the output directory
     with open(out_dir / "training_config.yaml", "w") as f:
