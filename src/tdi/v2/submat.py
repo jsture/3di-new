@@ -40,8 +40,11 @@ def calc_alphabet_mi(counts: np.ndarray, counts_prev: np.ndarray) -> tuple[float
     Returns:
         A tuple of (MI, adjusted transition MI).
     """
-    mi = util.mutual_information(counts / counts.sum())
-    mi_prev = util.mutual_information(counts_prev / counts_prev.sum())
+    mi = util.mutual_information(counts / counts.sum()) if counts.sum() > 0 else 0.0
+    # Guard the lagged matrix: no adjacent pairs -> zero baseline (avoid 0/0).
+    mi_prev = (
+        util.mutual_information(counts_prev / counts_prev.sum()) if counts_prev.sum() > 0 else 0.0
+    )
     # Adjust for sequential dependency baseline
     mi_tot = mi - (1 - 0.057) * mi_prev
     return mi, mi_tot
@@ -131,19 +134,23 @@ def accumulate_counts(
             idx_1, idx_2 = idx_pairs.T
             for k in range(idx_1.shape[0]):
                 i, j = idx_1[k], idx_2[k]
-                row = letter2idx[seq1[i]]
-                col = letter2idx[seq2[j]]
-                counts[row, col] += 1
-                counts[col, row] += 1
+                # Skip positions whose state is not in the alphabet (e.g. the invalid
+                # state for residues without valid descriptors): they have no index.
+                a1 = letter2idx.get(seq1[i])
+                a2 = letter2idx.get(seq2[j])
+                if a1 is None or a2 is None:
+                    continue
+                counts[a1, a2] += 1
+                counts[a2, a1] += 1
 
                 # Lagged counts accumulation for transition adjustments
                 if j > 0 and idx_2[k - 1] == j - 1:
-                    row = letter2idx[seq1[i]]
-                    col = letter2idx[seq2[j - 1]]
-                    counts_prev[row, col] += 1
+                    prev = letter2idx.get(seq2[j - 1])
+                    if prev is not None:
+                        counts_prev[a1, prev] += 1
                 if i > 0 and idx_1[k - 1] == i - 1:
-                    row = letter2idx[seq2[j]]
-                    col = letter2idx[seq1[i - 1]]
-                    counts_prev[row, col] += 1
+                    prev = letter2idx.get(seq1[i - 1])
+                    if prev is not None:
+                        counts_prev[a2, prev] += 1
 
     return counts, counts_prev

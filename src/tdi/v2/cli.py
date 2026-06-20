@@ -21,17 +21,15 @@ def run_evaluate(args: argparse.Namespace) -> None:
     print(f"Loading exported model from {args.model_dir}...")
     model, mean, std = TdiV2Model.load_from_export(args.model_dir)
 
-    # 2. Extract unique structure identifiers from pairfile
+    # 2. Extract unique structure identifiers from pairfile.
+    # The CIGAR is the third column, matching submat.accumulate_counts (parts[2]).
     unique_sids = set()
-    alignments = []
     with open(args.pairfile) as f:
         for line in f:
             parts = line.rstrip("\n").split()
             if len(parts) >= 3:
-                sid1, sid2, cigar = parts[0], parts[1], parts[-1]
-                unique_sids.add(sid1)
-                unique_sids.add(sid2)
-                alignments.append((sid1, sid2, cigar))
+                unique_sids.add(parts[0])
+                unique_sids.add(parts[1])
 
     # 3. Encode PDB files into 3Di sequences
     print(f"Encoding {len(unique_sids)} PDB files using trained encoder...")

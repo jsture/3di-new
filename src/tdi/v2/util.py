@@ -27,8 +27,9 @@ def parse_cigar(cigar_string: str) -> np.ndarray:
     ref, query = 0, 0
     matches = []
 
-    # Regex search for CIGAR counts and actions
-    for cnt_str, action in re.findall(r"([0-9]*)([IDMP])", cigar_string):
+    # Match counts followed by any letter op so unsupported ops are rejected (not
+    # silently skipped, which would desynchronize the reference/query indices).
+    for cnt_str, action in re.findall(r"([0-9]*)([A-Za-z])", cigar_string):
         cnt = int(cnt_str) if cnt_str else 1
 
         if action == "D":
