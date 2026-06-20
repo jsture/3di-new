@@ -87,7 +87,11 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Da
         Resolved DataConfig.
     """
     with open(path) as f:
-        raw: dict[str, Any] = yaml.safe_load(f)
+        loaded = yaml.safe_load(f)
+
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Config {path} did not parse to a mapping (got {type(loaded).__name__}).")
+    raw: dict[str, Any] = loaded
 
     if overrides:
         for dotted, value in overrides.items():
@@ -95,6 +99,10 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Da
                 continue
             section, key = dotted.split(".", 1)
             raw.setdefault(section, {})[key] = value
+
+    for required in ("dataset", "outputs"):
+        if required not in raw:
+            raise ValueError(f"Config {path} is missing required section '{required}'.")
 
     features_raw = raw.get("features", {})
     vc = features_raw.get("virtual_center", [270.0, 0.0, 2.0])

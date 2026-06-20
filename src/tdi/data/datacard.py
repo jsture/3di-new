@@ -33,7 +33,9 @@ def render_datacard(manifest: dict[str, Any], report: dict[str, Any]) -> str:
     ]
     for label, rec in inputs.items():
         path = rec.get("path") if isinstance(rec, dict) else rec
-        sha = rec.get("sha256", "")[:12] if isinstance(rec, dict) else ""
+        # sha256 may be absent (key missing) or explicitly None (file missing at build time);
+        # `or ""` handles both so slicing never hits None.
+        sha = (rec.get("sha256") or "")[:12] if isinstance(rec, dict) else ""
         lines.append(f"- **{label}**: `{path}` (sha256 `{sha}…`)")
 
     lines += [
