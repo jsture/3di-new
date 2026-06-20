@@ -122,6 +122,40 @@ def test_calc_angles_forloop_with_sentinel_partner() -> None:
     assert not mask_vec[2]  # sentinel row stays invalid
 
 
+def test_find_nearest_residues_sqeuclidean_parity() -> None:
+    """Squared-distance search returns the same partners and true (euclidean) distances.
+
+    Mirrors the 6-residue fixture from test_v2_detailed; partner indices are invariant to
+    the monotonic sqrt, and return_dist must still report true euclidean distances.
+    """
+    coords = np.zeros((6, 6))
+    coords[:, 3:6] = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.2, 0.0],
+            [0.0, 2.5, 0.0],
+            [0.0, 15.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+    valid_mask = np.ones(6, dtype=bool)
+
+    # Index parity with the known-good expectations.
+    near = find_nearest_residues(coords, valid_mask, min_seq_dist=1)
+    far = find_nearest_residues(coords, valid_mask, min_seq_dist=2, fall_back_dist=20.0)
+    assert isinstance(near, np.ndarray) and isinstance(far, np.ndarray)
+    assert near[2] == 1
+    assert far[2] == 4
+
+    # return_dist distances are true euclidean distances to the chosen partner.
+    partners, dists = find_nearest_residues(coords, valid_mask, return_dist=True)
+    full = distance_matrix(coords[:, 3:6], coords[:, 3:6])
+    for i in range(6):
+        if np.isfinite(dists[i]) and partners[i] >= 0:
+            assert np.isclose(dists[i], full[partners[i], i], atol=1e-6)
+
+
 def test_find_nearest_residues_return_dist_sentinel() -> None:
     """return_dist path reports inf distance for sentinel (no-partner) residues."""
     coords = np.zeros((3, 6))

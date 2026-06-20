@@ -154,7 +154,12 @@ def find_nearest_residues(
         Indices of nearest residues (shape: (N,)), and optionally the distances.
     """
     assert not np.isnan(coords[valid_mask, 3:6]).any()
-    dist = distance_matrix(coords[:, 3:6], coords[:, 3:6])
+    # Work in squared distances: argmin and the threshold compare are invariant to the
+    # monotonic sqrt, so skipping it avoids an N*N square-root over the whole matrix. The
+    # fall-back threshold is squared below and only the selected partner distances are
+    # sqrt-ed back to true distances for the return_dist path.
+    cb = coords[:, 3:6]
+    dist = cdist(cb, cb, "sqeuclidean")
 
     # Mask self-distances and invalid coordinate indices
     dist[np.eye(dist.shape[0], dtype=bool)] = np.inf
@@ -182,7 +187,8 @@ def find_nearest_residues(
             dist[i_idx, j_idx] = np.inf
 
         j = dist.argmin(axis=0)
-        fall_back_mask = dist.min(axis=0) >= fall_back_dist
+        # Compare against the squared threshold since dist holds squared distances.
+        fall_back_mask = dist.min(axis=0) >= fall_back_dist**2
         j[fall_back_mask] = j_no_min_seq[fall_back_mask]
     else:
         current_k = k
@@ -198,7 +204,8 @@ def find_nearest_residues(
     j[no_partner] = -1
 
     if return_dist:
-        return j, dist[j, np.arange(dist.shape[0])]
+        # dist is squared; sqrt only the selected partners back to true distances.
+        return j, np.sqrt(dist[j, np.arange(dist.shape[0])])
     return j
 
 
