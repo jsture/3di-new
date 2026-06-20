@@ -97,7 +97,27 @@ def run_evaluate(args: argparse.Namespace) -> None:
         write_mat(f_mat, list(alphabet), scores)
     print(f"Saved substitution matrix to {mat_path}")
 
-    # 9. Compile evaluation summary report
+    # 9. State-usage diagnostics over the encoded sequences. Mirrors the per-state usage,
+    # dead-state fraction, and normalized entropy the model computes in validation, surfaced
+    # at evaluation time. Invalid-state characters are not in letter2idx and are excluded.
+    usage_counts = np.zeros(n_states, dtype=np.int64)
+    for seq in sid2seq.values():
+        for ch in seq:
+            state_idx = letter2idx.get(ch)
+            if state_idx is not None:
+                usage_counts[state_idx] += 1
+    total_states = int(usage_counts.sum())
+    if total_states > 0:
+        p = usage_counts / total_states
+        with np.errstate(divide="ignore", invalid="ignore"):
+            entropy = float(-(p * np.log(p + 1e-10)).sum())
+        normalized_entropy = entropy / np.log(n_states) if n_states > 1 else 0.0
+        dead_state_fraction = float(np.sum(p < 1e-5) / n_states)
+    else:
+        normalized_entropy = 0.0
+        dead_state_fraction = 1.0
+
+    # 10. Compile evaluation summary report
     report = {
         "n_sequences": len(sid2seq),
         "total_counts": int(counts.sum()),
@@ -105,6 +125,9 @@ def run_evaluate(args: argparse.Namespace) -> None:
         "mi_tot": float(mi_tot),
         "n_letters": n_states,
         "letters": alphabet,
+        "state_usage": usage_counts.tolist(),
+        "dead_state_fraction": dead_state_fraction,
+        "normalized_entropy": normalized_entropy,
     }
     report_path = out_dir / "evaluation_report.json"
     with open(report_path, "w") as f_rep:

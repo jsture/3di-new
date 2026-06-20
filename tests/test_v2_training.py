@@ -409,6 +409,22 @@ def test_cli_evaluate_end_to_end(tmp_path: Path) -> None:
     assert (out_dir / "submat.txt").exists()
     assert (out_dir / "evaluation_report.json").exists()
 
+    # 5. The report carries the state-usage diagnostics and they reconcile with the sequences.
+    import json
+
+    with open(out_dir / "evaluation_report.json") as f:
+        report = json.load(f)
+    assert len(report["state_usage"]) == report["n_letters"]
+    assert 0.0 <= report["dead_state_fraction"] <= 1.0
+    assert 0.0 <= report["normalized_entropy"] <= 1.0
+
+    alphabet = set(report["letters"])
+    seq_text = (out_dir / "sequences.txt").read_text()
+    expected_total = sum(
+        ch in alphabet for line in seq_text.splitlines() for ch in line.split(maxsplit=1)[1]
+    )
+    assert sum(report["state_usage"]) == expected_total
+
 
 def _tiny_loader(n: int = 200, batch_size: int = 10) -> DataLoader:
     """Build a small (x, y) DataLoader of random scaled features."""
