@@ -191,6 +191,20 @@ def test_ca_filter_rejects_rank_deficient_coordinates(coords: np.ndarray) -> Non
     assert len(dists) == 0
 
 
+def test_ca_filter_drops_too_few_pairs() -> None:
+    """Too-few-pair superposition inputs are dropped instead of emitted with NaN distance."""
+    coords = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64)
+    idx = np.array([0, 1])
+
+    v1, v2, dists, error = filter_ca_distance(idx, idx, coords, coords)
+
+    assert error == "too_few_pairs"
+    assert len(v1) == 0
+    assert len(v2) == 0
+    assert dists is not None
+    assert len(dists) == 0
+
+
 def test_ca_filter_max_distance_uses_superposed_distances() -> None:
     """Verify max_ca_dist is applied after superposition, not on raw distances."""
     coords1 = np.array(

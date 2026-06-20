@@ -187,8 +187,10 @@ def _process_split(
         # Track degenerate Kabsch structural alignments
         if meta.get("kabsch_error") is not None:
             counts["n_alignments_dropped_degenerate_kabsch"] += 1
-            counts["n_pairs_dropped_degenerate_kabsch"] += meta.get(
-                "n_pairs_after_descriptor_validity", 0
+            counts["n_pairs_dropped_degenerate_kabsch"] += max(
+                0,
+                meta.get("n_pairs_after_descriptor_validity", 0)
+                - meta.get("n_pairs_after_ca_filter", 0),
             )
             if len(counts["degenerate_kabsch_alignment_ids_sample"]) < 10:
                 counts["degenerate_kabsch_alignment_ids_sample"].append(
@@ -356,11 +358,11 @@ def build_features(
         "val": val_report,
     }
     with open(out_dir / "report.json", "w") as f:
-        json.dump(report_dict, f, indent=2)
+        json.dump(report_dict, f, indent=2, allow_nan=False)
     with open(out_dir / "train_report.json", "w") as f:
-        json.dump(train_report, f, indent=2)
+        json.dump(train_report, f, indent=2, allow_nan=False)
     with open(out_dir / "val_report.json", "w") as f:
-        json.dump(val_report, f, indent=2)
+        json.dump(val_report, f, indent=2, allow_nan=False)
 
     with open(out_dir / "report.md", "w") as f:
         f.write(report.render_report_md(report_dict, cfg.dataset.name))
@@ -368,7 +370,7 @@ def build_features(
     # Manifest with input + output hashes.
     manifest = _build_manifest(cfg, arrays, out_dir)
     with open(out_dir / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
+        json.dump(manifest, f, indent=2, allow_nan=False)
 
     # Data card derived from manifest + report.
     with open(out_dir / "DATACARD.md", "w") as f:

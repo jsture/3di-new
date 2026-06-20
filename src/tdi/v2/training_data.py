@@ -177,7 +177,7 @@ def filter_ca_distance(
     any degeneracy error classification (or None if successful).
     """
     if len(idx_1) < 3:
-        return idx_1, idx_2, None, "too_few_pairs"
+        return idx_1[:0], idx_2[:0], np.array([], dtype=np.float32), "too_few_pairs"
 
     # Get C-alpha coordinates (columns 0:3) for the matched pairs
     P = coords1[idx_1, 0:3]

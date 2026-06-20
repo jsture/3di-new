@@ -10,6 +10,9 @@ import numpy as np
 
 from tdi.v2.util import parse_cigar
 
+_CIGAR_RE = re.compile(r"(?:\d*[IDMP])+")
+_TOKEN_RE = re.compile(r"([0-9]*)([IDMP])")
+
 
 class CigarValidationError(ValueError):
     """Raised when a CIGAR string violates the expected pair semantics."""
@@ -39,25 +42,53 @@ def validate_cigar(cigar_string: str, n_ref: int, n_query: int) -> np.ndarray:
         HETATM rows included (see ``get_atom_coordinates``). If the aligner that emitted the
         CIGAR numbered residues differently, in-range-but-misaligned pairs pass this check.
     """
-    pairs = parse_cigar(cigar_string)
+    if not cigar_string or _CIGAR_RE.fullmatch(cigar_string) is None:
+        raise CigarValidationError(f"CIGAR {cigar_string!r} is malformed.")
+
+    tokens: list[tuple[int, str]] = []
+    for cnt_str, action in _TOKEN_RE.findall(cigar_string):
+        cnt = int(cnt_str) if cnt_str else 1
+        if cnt <= 0:
+            raise CigarValidationError(
+                f"CIGAR {cigar_string!r}: zero-length operation {cnt}{action}."
+            )
+        tokens.append((cnt, action))
+
+    ref = 0
+    query = 0
+    for cnt, action in tokens:
+        if action == "D":
+            ref += cnt
+        elif action == "I":
+            query += cnt
+        elif action in ("M", "P"):
+            ref += cnt
+            query += cnt
+        if ref > n_ref:
+            raise CigarValidationError(f"CIGAR {cigar_string!r}: ref cursor {ref} > n_ref {n_ref}.")
+        if query > n_query:
+            raise CigarValidationError(
+                f"CIGAR {cigar_string!r}: query cursor {query} > n_query {n_query}."
+            )
+
+    try:
+        pairs = parse_cigar(cigar_string)
+    except ValueError as exc:
+        raise CigarValidationError(f"CIGAR {cigar_string!r} is malformed: {exc}") from exc
+
+    if pairs.size == 0:
+        return np.zeros((0, 2), dtype=np.int64)
 
     if pairs.ndim != 2 or pairs.shape[1] != 2:
         raise CigarValidationError(f"CIGAR {cigar_string!r} did not parse to (N, 2) pairs.")
 
     # Expected pair count: sum of P-run lengths (P defaults to count 1 when bare).
-    expected = sum(
-        int(cnt) if cnt else 1
-        for cnt, action in re.findall(r"([0-9]*)([IDMP])", cigar_string)
-        if action == "P"
-    )
+    expected = sum(cnt for cnt, action in tokens if action == "P")
     if pairs.shape[0] != expected:
         raise CigarValidationError(
             f"CIGAR {cigar_string!r}: parsed {pairs.shape[0]} pairs but expected {expected} "
             "from P-run lengths."
         )
-
-    if pairs.shape[0] == 0:
-        return pairs
 
     if pairs.min() < 0:
         raise CigarValidationError(f"CIGAR {cigar_string!r}: negative index pair.")

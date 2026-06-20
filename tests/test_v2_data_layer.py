@@ -1,5 +1,6 @@
 """Unit tests for the tdi.data preprocessing pipeline and Phase 0 correctness fixes."""
 
+import json
 import os
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import pytest
 import yaml
 from torch.utils.data import DataLoader
 
-from tdi.data import build_features, validate_cigar
+from tdi.data import build_features, validate_cigar, validate_dataset
 from tdi.data.cigar import CigarValidationError
 from tdi.data.config import load_config
 from tdi.v2 import features
@@ -136,6 +137,26 @@ def test_cigar_validator_rejects_out_of_range() -> None:
         validate_cigar("5P", n_ref=3, n_query=5)
 
 
+@pytest.mark.parametrize("cigar", ["10P_BAD_TRAILING_TEXT", "1P1X", "0P", "0M", ""])
+def test_cigar_validator_rejects_malformed_or_zero_length(cigar: str) -> None:
+    """Malformed, partially parseable, and zero-length CIGAR ops are rejected."""
+    with pytest.raises(CigarValidationError):
+        validate_cigar(cigar, n_ref=20, n_query=20)
+
+
+def test_cigar_validator_rejects_cursor_walk_out_of_bounds() -> None:
+    """Non-emitting operations must still respect total structure lengths."""
+    with pytest.raises(CigarValidationError):
+        validate_cigar("999M", n_ref=20, n_query=20)
+
+
+def test_cigar_validator_accepts_no_p_cigar_empty_pairs() -> None:
+    """Valid CIGARs without P pairs return an empty two-column pair array."""
+    pairs = validate_cigar("10M5I3D", n_ref=13, n_query=15)
+    assert pairs.shape == (0, 2)
+    assert pairs.dtype == np.int64
+
+
 # ---------------------------------------------------------------------------
 # Config + full build (Tasks 1.1, 1.3, 1.7)
 # ---------------------------------------------------------------------------
@@ -181,6 +202,17 @@ def test_config_roundtrip_and_hash(tmp_path: Path) -> None:
     assert cfg2.config_hash() != h1
 
 
+def test_config_rejects_unimplemented_sequence_delta_convention(tmp_path: Path) -> None:
+    """Unsupported sequence-delta conventions fail instead of being mislabeled."""
+    config_path = _make_dataset(tmp_path, "out_bad_delta")
+    config = yaml.safe_load(config_path.read_text())
+    config.setdefault("features", {})["sequence_delta_convention"] = "i_minus_j"
+    config_path.write_text(yaml.safe_dump(config))
+
+    with pytest.raises(ValueError, match="j_minus_i"):
+        load_config(config_path)
+
+
 def test_build_features_metadata_row_count_matches_arrays(tmp_path: Path) -> None:
     """Pair metadata row count equals the pairs array length, per split."""
     config_path = _make_dataset(tmp_path, "out_build")
@@ -195,6 +227,15 @@ def test_build_features_metadata_row_count_matches_arrays(tmp_path: Path) -> Non
     # Expected metadata columns exist (SCOP join present even when lookup is empty).
     for col in ("row_id", "alignment_id", "fold_source", "ca_dist_superposed"):
         assert col in train_meta.columns
+
+
+def test_validate_dataset_summary_is_strict_json_serializable(tmp_path: Path) -> None:
+    """Validation summaries use Python scalar counts, not NumPy scalar values."""
+    config_path = _make_dataset(tmp_path, "out_validate")
+    summary = validate_dataset(config_path)
+
+    assert all(type(value) is int for value in summary.values())
+    json.dumps(summary, indent=2, allow_nan=False)
 
 
 def test_build_refuses_overwrite(tmp_path: Path) -> None:
@@ -243,6 +284,59 @@ def test_build_writes_expected_artifacts(tmp_path: Path) -> None:
         "DATACARD.md",
     ):
         assert (out_dir / name).exists(), name
+
+
+def test_report_json_uses_labeled_strict_ca_bins(tmp_path: Path) -> None:
+    """Ca-distance histograms avoid non-standard Infinity values."""
+    config_path = _make_dataset(tmp_path, "out_report_bins")
+    out_dir = build_features(config_path)
+
+    report = json.loads((out_dir / "report.json").read_text())
+    json.dumps(report, indent=2, allow_nan=False)
+    ca_hist = report["train"]["ca_distance_histogram"]
+    assert set(ca_hist) == {"bins"}
+    assert ca_hist["bins"][-1]["label"] == ">=5.0"
+    assert all("count" in bin_record for bin_record in ca_hist["bins"])
+
+
+def test_too_few_pairs_build_drops_without_nan_metadata(tmp_path: Path) -> None:
+    """Too-few-pair Kabsch inputs drop pairs instead of emitting NaN metadata rows."""
+    pdb_dir = tmp_path / "pdbs"
+    pdb_dir.mkdir(exist_ok=True)
+    for sid_seed, sid in enumerate(("d1aaaa_", "d1bbbb_")):
+        _write_pdb(pdb_dir / sid, seed=sid_seed + 1)
+
+    pairs = tmp_path / "pairs.out"
+    pairs.write_text("d1aaaa_ d1bbbb_ 8M2P\n")
+
+    config = {
+        "dataset": {
+            "name": "synthetic",
+            "pdb_dir": str(pdb_dir),
+            "train_pairfile": str(pairs),
+            "val_pairfile": str(pairs),
+            "scop_lookup": None,
+        },
+        "features": {"virtual_center": [270.0, 0.0, 2.0], "max_ca_dist": 5.0},
+        "sampling": {"max_pairs_per_alignment": None, "seed": 123},
+        "outputs": {"out_dir": str(tmp_path / "out_too_few")},
+    }
+    config_path = tmp_path / "config_too_few.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+
+    out_dir = build_features(config_path)
+    import pandas as pd
+
+    train_pairs = np.load(out_dir / "train_x_raw.npy")
+    train_meta = pd.read_parquet(out_dir / "train_metadata.parquet")
+    report = json.loads((out_dir / "report.json").read_text())
+
+    assert train_pairs.shape == (0, 10)
+    assert list(train_meta.columns)
+    assert "ca_dist_superposed" in train_meta.columns
+    assert train_meta["ca_dist_superposed"].isna().sum() == 0
+    assert report["train"]["stage_counts"]["n_alignments_dropped_degenerate_kabsch"] == 1
+    assert report["train"]["stage_counts"]["n_pairs_dropped_degenerate_kabsch"] == 2
 
 
 def test_build_features_skipped_alignments(tmp_path: Path) -> None:

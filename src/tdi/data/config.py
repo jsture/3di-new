@@ -107,12 +107,16 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Da
 
     features_raw = raw.get("features", {})
     vc = features_raw.get("virtual_center", [270.0, 0.0, 2.0])
+    sequence_delta_convention = features_raw.get("sequence_delta_convention", "j_minus_i")
+    if sequence_delta_convention != "j_minus_i":
+        raise ValueError("Only sequence_delta_convention='j_minus_i' is currently implemented.")
+
     return DataConfig(
         dataset=DatasetConfig(**raw["dataset"]),
         outputs=OutputsConfig(**raw["outputs"]),
         features=FeaturesConfig(
             virtual_center=(float(vc[0]), float(vc[1]), float(vc[2])),
-            sequence_delta_convention=features_raw.get("sequence_delta_convention", "j_minus_i"),
+            sequence_delta_convention=sequence_delta_convention,
             max_ca_dist=float(features_raw.get("max_ca_dist", 5.0)),
         ),
         sampling=SamplingConfig(**raw.get("sampling", {})),
