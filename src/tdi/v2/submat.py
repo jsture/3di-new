@@ -134,6 +134,9 @@ def accumulate_counts(
             idx_1, idx_2 = idx_pairs.T
             for k in range(idx_1.shape[0]):
                 i, j = idx_1[k], idx_2[k]
+                # Bounds check to prevent out-of-bounds indexing on seq1/seq2
+                if i >= len(seq1) or j >= len(seq2):
+                    continue
                 # Skip positions whose state is not in the alphabet (e.g. the invalid
                 # state for residues without valid descriptors): they have no index.
                 a1 = letter2idx.get(seq1[i])
@@ -143,12 +146,13 @@ def accumulate_counts(
                 counts[a1, a2] += 1
                 counts[a2, a1] += 1
 
-                # Lagged counts accumulation for transition adjustments
-                if j > 0 and idx_2[k - 1] == j - 1:
+                # Lagged counts accumulation for transition adjustments.
+                # Restrict updates to k > 0 to prevent a negative index lag check.
+                if k > 0 and j > 0 and idx_2[k - 1] == j - 1:
                     prev = letter2idx.get(seq2[j - 1])
                     if prev is not None:
                         counts_prev[a1, prev] += 1
-                if i > 0 and idx_1[k - 1] == i - 1:
+                if k > 0 and i > 0 and idx_1[k - 1] == i - 1:
                     prev = letter2idx.get(seq1[i - 1])
                     if prev is not None:
                         counts_prev[a2, prev] += 1

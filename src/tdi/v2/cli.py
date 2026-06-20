@@ -22,6 +22,21 @@ def run_evaluate(args: argparse.Namespace) -> None:
     print(f"Loading exported model from {args.model_dir}...")
     model, mean, std = TdiV2Model.load_from_export(args.model_dir)
 
+    if model.n_states > len(LETTERS):
+        raise ValueError(
+            f"Model has {model.n_states} states, but only {len(LETTERS)} letters are available "
+            f"in the letters alphabet definition."
+        )
+
+    # Resolve virtual center from args or config
+    if args.virt is not None:
+        virt_cb = (args.virt[0], args.virt[1], args.virt[2])
+    elif getattr(model, "virtual_center", None) is not None:
+        assert model.virtual_center is not None
+        virt_cb = tuple(model.virtual_center)
+    else:
+        raise ValueError("Virtual center not found in model config, and --virt was not provided.")
+
     # 2. Extract unique structure identifiers from pairfile.
     unique_sids = set()
     with open(args.pairfile) as f:
@@ -34,7 +49,7 @@ def run_evaluate(args: argparse.Namespace) -> None:
     # 3. Encode PDB files into 3Di sequences
     print(f"Encoding {len(unique_sids)} PDB files using trained encoder...")
     sid2seq = {}
-    virt_cb = (args.virt[0], args.virt[1], args.virt[2])
+    failed_sids = []
     for sid in sorted(unique_sids):
         try:
             resolved_path = resolve_pdb_path(args.pdb_dir, sid)
@@ -51,6 +66,28 @@ def run_evaluate(args: argparse.Namespace) -> None:
             sid2seq[sid] = seq
         except Exception as e:
             print(f"Error encoding {sid}: {e}", file=sys.stderr)
+            failed_sids.append(sid)
+
+    n_requested = len(unique_sids)
+    n_encoded = len(sid2seq)
+    n_failed = len(failed_sids)
+    failure_rate = n_failed / n_requested if n_requested > 0 else 0.0
+    failed_sids_sample = failed_sids[:10]
+
+    # Report failure diagnostics in stdout
+    print(
+        f"Encoding diagnostics: requested {n_requested}, encoded {n_encoded}, "
+        f"failed {n_failed} ({failure_rate:.1%})."
+    )
+    if n_failed > 0:
+        print(f"Failed sample IDs: {failed_sids_sample}", file=sys.stderr)
+
+    if failure_rate > args.max_failure_rate:
+        raise RuntimeError(
+            f"Encoding failure rate {failure_rate:.1%} exceeds maximum allowed "
+            f"threshold {args.max_failure_rate:.1%} (failed: {n_failed}/{n_requested}). "
+            f"Failed sample: {failed_sids_sample}"
+        )
 
     # 4. Save sequences to sequences.txt
     seq_path = out_dir / "sequences.txt"

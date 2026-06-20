@@ -199,6 +199,10 @@ def fuse_linear_bn(linear: nn.Linear, bn: nn.BatchNorm1d) -> nn.Linear:
         eps = bn.eps
         gamma = bn.weight
         beta = bn.bias
+        assert mean is not None
+        assert var is not None
+        assert gamma is not None
+        assert beta is not None
 
         w = linear.weight
         b = linear.bias if linear.bias is not None else torch.zeros_like(mean)

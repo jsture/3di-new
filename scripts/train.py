@@ -49,10 +49,18 @@ def main() -> None:
     model.eval()
     model.cpu()
 
+    encoder_0 = model.encoder[0]
+    encoder_1 = model.encoder[1]
+    encoder_3 = model.encoder[3]
+    encoder_4 = model.encoder[4]
+    assert isinstance(encoder_0, nn.Linear)
+    assert isinstance(encoder_1, nn.BatchNorm1d)
+    assert isinstance(encoder_3, nn.Linear)
+    assert isinstance(encoder_4, nn.BatchNorm1d)
     encoder_fused = nn.Sequential(
-        fuse_linear_bn(model.encoder[0], model.encoder[1]),
+        fuse_linear_bn(encoder_0, encoder_1),
         model.encoder[2],
-        fuse_linear_bn(model.encoder[3], model.encoder[4]),
+        fuse_linear_bn(encoder_3, encoder_4),
         model.encoder[5],
         model.encoder[6],
     )

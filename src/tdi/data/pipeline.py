@@ -135,6 +135,9 @@ def _process_split(
         "n_pairs_after_ca_filter": 0,
         "n_pairs_after_max_pairs": 0,
         "n_final_examples": 0,
+        "n_alignments_dropped_degenerate_kabsch": 0,
+        "n_pairs_dropped_degenerate_kabsch": 0,
+        "degenerate_kabsch_alignment_ids_sample": [],
     }
 
     total = len(alignments)
@@ -180,6 +183,17 @@ def _process_split(
         )
         counts["n_pairs_after_ca_filter"] += meta.get("n_pairs_after_ca_filter", 0)
         counts["n_pairs_after_max_pairs"] += meta.get("n_pairs_after_max_pairs", 0)
+
+        # Track degenerate Kabsch structural alignments
+        if meta.get("kabsch_error") is not None:
+            counts["n_alignments_dropped_degenerate_kabsch"] += 1
+            counts["n_pairs_dropped_degenerate_kabsch"] += meta.get(
+                "n_pairs_after_descriptor_validity", 0
+            )
+            if len(counts["degenerate_kabsch_alignment_ids_sample"]) < 10:
+                counts["degenerate_kabsch_alignment_ids_sample"].append(
+                    f"{sid1}-{sid2} ({meta['kabsch_error']})"
+                )
 
         if len(x) == 0:
             counts["n_alignments_empty"] += 1

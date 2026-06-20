@@ -173,6 +173,8 @@ class EMAVectorQuantizer(nn.Module):
 
         # Initialize codebook embedding weights uniformly
         embedding = torch.randn(n_states, z_dim)
+        if l2_normalize:
+            embedding = F.normalize(embedding, dim=-1)
         self.register_buffer("embedding", embedding)
         self.register_buffer("ema_count", torch.zeros(n_states))
         self.register_buffer("ema_sum", embedding.clone())
@@ -196,8 +198,11 @@ class EMAVectorQuantizer(nn.Module):
         centers = _kmeans(features, self.n_states, seed=seed)
 
         self.embedding.copy_(centers)
-        self.ema_sum.copy_(centers)
+        if self.l2_normalize:
+            self.embedding.copy_(F.normalize(self.embedding, dim=-1))
         self.ema_count.fill_(1.0)
+        count = self.ema_count.clamp_min(self.eps)
+        self.ema_sum.copy_(self.embedding * count.unsqueeze(1))
         self.initialized.fill_(True)
 
     def forward(
@@ -251,6 +256,11 @@ class EMAVectorQuantizer(nn.Module):
                         self.ema_count[dead_indices] = self.min_count
                         self.ema_sum[dead_indices] = replacements * self.min_count
                         n_replaced = n_to_replace
+
+                if self.l2_normalize:
+                    self.embedding.copy_(F.normalize(self.embedding, dim=-1))
+                    count = self.ema_count.clamp_min(self.eps)
+                    self.ema_sum.copy_(self.embedding * count.unsqueeze(1))
 
             usage = encodings.mean(dim=0)
             perplexity = torch.exp(-(usage * (usage + 1e-10).log()).sum())
@@ -339,12 +349,12 @@ class FSQQuantizer(nn.Module):
         for i, level in enumerate(self.levels):
             if level % 2 == 1:
                 val = (z_bounded[:, i] + 1.0) / 2.0 * (level - 1)
-                val_q = torch.round(val)
+                val_q = torch.round(val).clamp(0, level - 1)
                 mapped = val_q / (level - 1) * 2.0 - 1.0
                 idx = val_q.long()
             else:
                 val = (z_bounded[:, i] + 1.0 - 1.0 / level) / 2.0 * (level - 1)
-                val_q = torch.round(val)
+                val_q = torch.round(val).clamp(0, level - 1)
                 mapped = val_q / (level - 1) * (2.0 - 2.0 / level) - 1.0 + 1.0 / level
                 idx = val_q.long()
 
@@ -535,6 +545,7 @@ class TdiV2Model(L.LightningModule):
         self.kmeans_seed = kmeans_seed
         self.kmeans_max_samples = kmeans_max_samples
         self.gradient_mode = gradient_mode
+        self.virtual_center = None
 
         # Initialize core encoder and decoder blocks
         self.encoder = ResidualMLP(input_dim, hidden_dim, z_dim, depth=3)
@@ -850,7 +861,8 @@ class TdiV2Model(L.LightningModule):
             Dictionary containing metrics for the step.
         """
         x, y = batch
-        out_x = self(x)
+        quantize = self.current_epoch >= self.quantizer_warmup_epochs
+        out_x = self(x, quantize=quantize)
         mu_partner = out_x["mu_partner"]
         var_partner = out_x["var_partner"]
         indices_x = out_x["indices"]
@@ -889,7 +901,7 @@ class TdiV2Model(L.LightningModule):
         stability = (indices_x == indices_noisy).float().mean()
 
         # Target sequence discretization to evaluate mutual information
-        out_y = self(y)
+        out_y = self(y, quantize=quantize)
         indices_y = out_y["indices"]
 
         step_out = {
@@ -947,17 +959,21 @@ class TdiV2Model(L.LightningModule):
             aligned_mi = np.sum(p_xy * log_ratio, where=np.isfinite(log_ratio))
 
         # Composite validation score (lower loss, higher entropy, fewer dead states)
-        val_score = -mean_loss.item() + 0.05 * normalized_entropy - 0.10 * dead_state_fraction
+        if self.current_epoch < self.quantizer_warmup_epochs:
+            val_score = -mean_loss.item()
+        else:
+            val_score = -mean_loss.item() + 0.05 * normalized_entropy - 0.10 * dead_state_fraction
 
         # Log pooled statistics
         if self._can_log:
             self.log("val_partner_loss", mean_loss, prog_bar=True)
-            self.log("val_perplexity", mean_perp, prog_bar=True)
-            self.log("val_stability", mean_stab)
-            self.log("val_margin", mean_margin)
-            self.log("val_entropy", normalized_entropy)
-            self.log("val_dead_states", dead_state_fraction)
-            self.log("val_aligned_mi", aligned_mi)
+            if self.current_epoch >= self.quantizer_warmup_epochs:
+                self.log("val_perplexity", mean_perp, prog_bar=True)
+                self.log("val_stability", mean_stab)
+                self.log("val_margin", mean_margin)
+                self.log("val_entropy", normalized_entropy)
+                self.log("val_dead_states", dead_state_fraction)
+                self.log("val_aligned_mi", aligned_mi)
             self.log("val_score", val_score, prog_bar=True)
 
         # Clear step cache
@@ -1078,6 +1094,26 @@ class TdiV2Model(L.LightningModule):
         with open(export_path / "model_config.json") as f:
             config = json.load(f)
 
+        # 1. Validate quantizer type is known
+        q_type = config.get("quantizer_type")
+        if q_type not in ("vq", "ema_vq", "fsq"):
+            raise ValueError(f"Unknown quantizer_type in config: {q_type}")
+
+        # 2. Validate quantizer parameters match states
+        n_states = config["n_states"]
+        if q_type == "fsq":
+            levels = config.get("fsq_levels")
+            if not levels:
+                raise ValueError("fsq_levels must be present in config for FSQ quantizer.")
+            expected_states = 1
+            for lvl in levels:
+                expected_states *= lvl
+            if n_states != expected_states:
+                raise ValueError(
+                    f"n_states ({n_states}) does not match product of fsq_levels ({levels}) "
+                    f"which equals {expected_states}."
+                )
+
         model = cls(
             input_dim=config["input_dim"],
             hidden_dim=config["hidden_dim"],
@@ -1089,33 +1125,64 @@ class TdiV2Model(L.LightningModule):
             l2_normalize=config.get("l2_normalize", True),
             gradient_mode=config.get("gradient_mode", "rotation_trick"),
         )
+        model.virtual_center = config.get("virtual_center")
 
         # Load encoder weights
-        model.encoder.load_state_dict(
-            torch.load(export_path / "encoder_state_dict.pt", map_location="cpu")
-        )
+        encoder_path = export_path / "encoder_state_dict.pt"
+        if not encoder_path.exists():
+            raise FileNotFoundError(f"Encoder state dict not found: {encoder_path}")
+        model.encoder.load_state_dict(torch.load(encoder_path, map_location="cpu"))
 
-        # Load decoder weights when present (optional, so older encoder-only exports still load).
+        # Load decoder weights when present
         decoder_path = export_path / "decoder_state_dict.pt"
         if decoder_path.exists():
             model.decoder.load_state_dict(torch.load(decoder_path, map_location="cpu"))
 
         # Load scaler metrics and attach/register buffers
-        with open(export_path / "feature_scaler.json") as f:
+        scaler_path = export_path / "feature_scaler.json"
+        if not scaler_path.exists():
+            raise FileNotFoundError(f"Feature scaler configuration not found: {scaler_path}")
+        with open(scaler_path) as f:
             scaler = json.load(f)
         mean_arr = np.array(scaler["mean"], dtype=np.float32)
         std_arr = np.array(scaler["std"], dtype=np.float32)
 
+        # Validate scaler consistency and finiteness
+        input_dim = config["input_dim"]
+        if len(mean_arr) != input_dim:
+            raise ValueError(
+                f"Feature mean length ({len(mean_arr)}) does not match input_dim ({input_dim})."
+            )
+        if len(std_arr) != input_dim:
+            raise ValueError(
+                f"Feature std length ({len(std_arr)}) does not match input_dim ({input_dim})."
+            )
+        if not np.isfinite(mean_arr).all():
+            raise ValueError("Feature mean contains non-finite values.")
+        if not np.isfinite(std_arr).all():
+            raise ValueError("Feature std contains non-finite values.")
+        if (std_arr <= 0).any():
+            raise ValueError("Feature std contains non-positive values.")
+
         model.register_buffer("feature_mean", torch.tensor(mean_arr))
         model.register_buffer("feature_std", torch.tensor(std_arr))
 
-        if (
-            config["quantizer_type"] in ("vq", "ema_vq")
-            and (export_path / "centroids.npy").exists()
-            and isinstance(model.quantizer, EMAVectorQuantizer)
-        ):
-            centroids = np.load(export_path / "centroids.npy")
-            model.quantizer.embedding.data = torch.tensor(centroids)
+        if config["quantizer_type"] in ("vq", "ema_vq"):
+            centroids_path = export_path / "centroids.npy"
+            if not centroids_path.exists():
+                raise FileNotFoundError(f"Centroids file not found: {centroids_path}")
+            centroids = np.load(centroids_path)
+            if len(centroids) != n_states:
+                raise ValueError(
+                    f"Number of centroids ({len(centroids)}) does not match n_states ({n_states})."
+                )
+            z_dim = config["z_dim"]
+            if centroids.shape[1] != z_dim:
+                raise ValueError(
+                    f"Centroids dimension ({centroids.shape[1]}) does not match z_dim ({z_dim})."
+                )
+            if isinstance(model.quantizer, EMAVectorQuantizer):
+                model.quantizer.embedding.data = torch.tensor(centroids)
 
         model.eval()
         return model, mean_arr, std_arr

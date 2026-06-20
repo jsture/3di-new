@@ -111,7 +111,7 @@ def copy_response_with_progress(response, out, chunk_size: int = 1024 * 1024) ->
                 )
             last_update = now
 
-        elif should_log_percent:
+        elif should_log_percent and total is not None:
             percent = downloaded * 100 / total
             print(
                 f"Downloaded {format_bytes(downloaded)} / {format_bytes(total)} ({percent:.1f}%)",
