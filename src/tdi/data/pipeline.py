@@ -16,10 +16,12 @@ import pandas as pd
 
 from tdi.data import datacard, report
 from tdi.data.config import DataConfig, load_config
-from tdi.data.hashing import array_record, git_commit, sha256_file
+from tdi.data.hashing import array_record, git_commit, git_dirty, sha256_file
 from tdi.data.scop import classify, load_scop_lookup
 from tdi.data.structures import build_structures_table
+from tdi.data.validate import validate_dataset
 from tdi.v2.training_data import align_features, fit_standardizer
+from tdi.v2.util import parse_pairfile_line
 
 # Column order for per-pair metadata; also used to give an empty split a typed,
 # column-bearing DataFrame (so downstream report/parquet code never sees a column-less frame).
@@ -50,9 +52,10 @@ def _read_pairfile(path: str | Path) -> list[tuple[int, str, str, str]]:
     rows: list[tuple[int, str, str, str]] = []
     with open(path) as f:
         for source_row, line in enumerate(f):
-            parts = line.split()
-            if len(parts) >= 3:
-                rows.append((source_row, parts[0], parts[1], parts[-1]))
+            res = parse_pairfile_line(line)
+            if res is not None:
+                sid1, sid2, cigar = res
+                rows.append((source_row, sid1, sid2, cigar))
     # Sort by content so iteration order is independent of file ordering.
     rows.sort(key=lambda r: (r[1], r[2], r[3], r[0]))
     return rows
@@ -237,10 +240,25 @@ def build_features(
 
     scop_lookup = load_scop_lookup(cfg.dataset.scop_lookup)
 
-    x_train, y_train, train_meta, train_counts, train_sids, train_skipped = _process_split(
+    # 1. Collect all referenced SIDs from the split pairfiles.
+    train_alignments = _read_pairfile(cfg.dataset.train_pairfile)
+    val_alignments = _read_pairfile(cfg.dataset.val_pairfile)
+    referenced = set()
+    for _row, sid1, sid2, _cigar in train_alignments + val_alignments:
+        referenced.update([sid1, sid2])
+    all_sids = sorted(referenced)
+
+    # 2. Build the structures table exactly once.
+    structures = build_structures_table(all_sids, cfg.dataset.pdb_dir)
+
+    # 3. Early CIGAR validation if configured.
+    if cfg.preprocessing.validate_cigars:
+        validate_dataset(config_path, overrides=overrides, prebuilt_structures=structures)
+
+    x_train, y_train, train_meta, train_counts, _train_sids, train_skipped = _process_split(
         cfg, cfg.dataset.train_pairfile, scop_lookup
     )
-    x_val, y_val, val_meta, val_counts, val_sids, val_skipped = _process_split(
+    x_val, y_val, val_meta, val_counts, _val_sids, val_skipped = _process_split(
         cfg, cfg.dataset.val_pairfile, scop_lookup
     )
 
@@ -288,8 +306,6 @@ def build_features(
     df_val_skipped.to_csv(out_dir / "val_skipped_alignments.tsv", sep="\t", index=False)
 
     # Structure-level QC across every referenced structure.
-    all_sids = sorted(train_sids | val_sids)
-    structures = build_structures_table(all_sids, cfg.dataset.pdb_dir)
     structures.to_parquet(out_dir / "structures.parquet", index=False)
 
     # Report (train + validation splits are compiled).
@@ -366,6 +382,7 @@ def _build_manifest(
             "max_skipped_fraction": cfg.preprocessing.max_skipped_fraction,
         },
         "git_commit": git_commit(),
+        "git_dirty": git_dirty(),
         "config_hash": cfg.config_hash(),
         "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
     }
