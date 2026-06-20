@@ -6,7 +6,6 @@ a data card, and a manifest recording input/output hashes for reproducibility.
 """
 
 import datetime
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -25,25 +24,23 @@ from tdi.v2.util import parse_pairfile_line
 
 # Column order for per-pair metadata; also used to give an empty split a typed,
 # column-bearing DataFrame (so downstream report/parquet code never sees a column-less frame).
+# Lean-but-auditable: alignment_id encodes the source row (and split via the pairfile stem),
+# so the standalone source_pairfile_row / SHA row_id are redundant and dropped. split_group_*
+# records the leakage-grouping level actually used by scripts/make_splits.py (superfamily).
 _METADATA_COLUMNS = [
-    "row_id",
+    "alignment_id",
     "sid_source",
     "sid_target",
     "idx_source",
     "idx_target",
-    "alignment_id",
-    "source_pairfile_row",
-    "ca_dist_superposed",
-    "ca_dist_raw",
-    "source_is_forward",
-    "scop_source",
-    "scop_target",
+    "split_group_source",
+    "split_group_target",
     "fold_source",
     "fold_target",
     "superfamily_source",
     "superfamily_target",
-    "family_source",
-    "family_target",
+    "ca_dist_raw",
+    "ca_dist_superposed",
 ]
 
 
@@ -61,52 +58,41 @@ def _read_pairfile(path: str | Path) -> list[tuple[int, str, str, str]]:
     return rows
 
 
-def _row_id(alignment_id: str, idx_src: int, idx_tgt: int, direction: str) -> str:
-    """Stable per-pair id from alignment + indices + direction."""
-    return hashlib.sha256(f"{alignment_id}:{idx_src}:{idx_tgt}:{direction}".encode()).hexdigest()
-
-
 def _split_metadata(
     meta: dict[str, Any],
     sid1: str,
     sid2: str,
     source_row: int,
+    pairfile_stem: str,
     scop_lookup: dict[str, str],
 ) -> list[dict[str, Any]]:
     """Expand one alignment's meta arrays into per-pair metadata records."""
     n = len(meta["idx_source"])
-    alignment_id = f"{sid1}:{sid2}:{source_row}"
-    forward_count = n // 2  # align_features emits forward half then reverse half
+    # Enriched alignment_id encodes the pairfile (and thus the split), source row, and both
+    # sids, so a metadata row maps back to its exact source line without a separate column.
+    alignment_id = f"{pairfile_stem}:{source_row}:{sid1}:{sid2}"
     records: list[dict[str, Any]] = []
     for i in range(n):
         sid_src = meta["sid_source"][i]
         sid_tgt = meta["sid_target"][i]
-        idx_src = int(meta["idx_source"][i])
-        idx_tgt = int(meta["idx_target"][i])
-        is_forward = i < forward_count
-        direction = "forward" if is_forward else "reverse"
         src_scop = classify(scop_lookup.get(sid_src))
         tgt_scop = classify(scop_lookup.get(sid_tgt))
         records.append(
             {
-                "row_id": _row_id(alignment_id, idx_src, idx_tgt, direction),
+                "alignment_id": alignment_id,
                 "sid_source": sid_src,
                 "sid_target": sid_tgt,
-                "idx_source": idx_src,
-                "idx_target": idx_tgt,
-                "alignment_id": alignment_id,
-                "source_pairfile_row": source_row,
-                "ca_dist_superposed": float(meta["ca_dist_superposed"][i]),
-                "ca_dist_raw": float(meta["ca_dist_raw"][i]),
-                "source_is_forward": is_forward,
-                "scop_source": src_scop["scop"],
-                "scop_target": tgt_scop["scop"],
+                "idx_source": int(meta["idx_source"][i]),
+                "idx_target": int(meta["idx_target"][i]),
+                # Leakage-grouping level used by make_splits.py is superfamily.
+                "split_group_source": src_scop["superfamily"],
+                "split_group_target": tgt_scop["superfamily"],
                 "fold_source": src_scop["fold"],
                 "fold_target": tgt_scop["fold"],
                 "superfamily_source": src_scop["superfamily"],
                 "superfamily_target": tgt_scop["superfamily"],
-                "family_source": src_scop["family"],
-                "family_target": tgt_scop["family"],
+                "ca_dist_raw": float(meta["ca_dist_raw"][i]),
+                "ca_dist_superposed": float(meta["ca_dist_superposed"][i]),
             }
         )
     return records
@@ -119,6 +105,7 @@ def _process_split(
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, dict[str, int], set[str], list[dict[str, Any]]]:
     """Process one split: returns (x, y, metadata, stage_counts, sids, skipped_records)."""
     alignments = _read_pairfile(pairfile)
+    pairfile_stem = Path(pairfile).stem
     x_list: list[np.ndarray] = []
     y_list: list[np.ndarray] = []
     meta_records: list[dict[str, Any]] = []
@@ -203,7 +190,9 @@ def _process_split(
 
         x_list.append(x)
         y_list.append(y)
-        meta_records.extend(_split_metadata(meta, sid1, sid2, source_row, scop_lookup))
+        meta_records.extend(
+            _split_metadata(meta, sid1, sid2, source_row, pairfile_stem, scop_lookup)
+        )
 
     x_feat = np.vstack(x_list) if x_list else np.zeros((0, 10), dtype=np.float32)
     y_feat = np.vstack(y_list) if y_list else np.zeros((0, 10), dtype=np.float32)
@@ -349,20 +338,16 @@ def build_features(
     # Structure-level QC across every referenced structure.
     structures.to_parquet(out_dir / "structures.parquet", index=False)
 
-    # Report (train + validation splits are compiled).
-    print("Compiling reports, datacard, and writing manifest...")
-    train_report = report.build_report(train_counts, x_train, train_meta)
-    val_report = report.build_report(val_counts, x_val, val_meta)
+    # Report: one joint train/val report.json (the per-split duplicates are dropped). The
+    # seq-separation and Ca-distance histograms are gated behind full_report (off by default).
+    print("Compiling report, datacard, and writing manifest...")
+    full_report = cfg.preprocessing.full_report
     report_dict = {
-        "train": train_report,
-        "val": val_report,
+        "train": report.build_report(train_counts, x_train, train_meta, full_report=full_report),
+        "val": report.build_report(val_counts, x_val, val_meta, full_report=full_report),
     }
     with open(out_dir / "report.json", "w") as f:
         json.dump(report_dict, f, indent=2, allow_nan=False)
-    with open(out_dir / "train_report.json", "w") as f:
-        json.dump(train_report, f, indent=2, allow_nan=False)
-    with open(out_dir / "val_report.json", "w") as f:
-        json.dump(val_report, f, indent=2, allow_nan=False)
 
     with open(out_dir / "report.md", "w") as f:
         f.write(report.render_report_md(report_dict, cfg.dataset.name))

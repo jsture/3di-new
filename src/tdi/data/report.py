@@ -62,6 +62,7 @@ def build_report(
     stage_counts: dict[str, int],
     features: np.ndarray,
     metadata: pd.DataFrame,
+    full_report: bool = False,
 ) -> dict[str, object]:
     """Assemble the report dict.
 
@@ -70,6 +71,8 @@ def build_report(
             each filter) plus ``n_final_examples``.
         features: Final stacked input feature array of shape (N, D).
         metadata: Pair metadata table (one row per final example).
+        full_report: If True, also include the seq-separation and Ca-distance histograms
+            (off by default to keep the report lean).
 
     Returns:
         JSON-serializable report dict.
@@ -112,17 +115,17 @@ def build_report(
         "max": features.max(axis=0).tolist() if features.size else [],
     }
 
-    return {
+    report: dict[str, object] = {
         "stage_counts": stage_counts,
         "feature_stats": feat_stats,
-        "sequence_separation_histogram": _seq_sep_histogram(features),
-        "ca_distance_histogram": {
-            "bins": _ca_distance_bins(ca_dist),
-        },
         "examples_per_fold": _level_counts("fold_source"),
         "examples_per_superfamily": _level_counts("superfamily_source"),
         "examples_per_alignment": _alignment_quantiles(),
     }
+    if full_report:
+        report["sequence_separation_histogram"] = _seq_sep_histogram(features)
+        report["ca_distance_histogram"] = {"bins": _ca_distance_bins(ca_dist)}
+    return report
 
 
 def reconcile(stage_counts: dict[str, int]) -> bool:
@@ -170,22 +173,31 @@ def render_report_md(report_dict: Mapping[str, object], dataset_name: str) -> st
             for key, val in sc.items():
                 lines.append(f"| {key} | {val} |")
 
-            seq_hist = split_report["sequence_separation_histogram"]
-            assert isinstance(seq_hist, dict)
-            lines += [
-                "",
-                "### Sequence-separation histogram",
-                "",
-                "| Bin | Count |",
-                "| --- | ---: |",
-            ]
-            lines += [f"| {k} | {v} |" for k, v in seq_hist.items()]
+            # Histograms are present only when the build ran with --full-report.
+            if "sequence_separation_histogram" in split_report:
+                seq_hist = split_report["sequence_separation_histogram"]
+                assert isinstance(seq_hist, dict)
+                lines += [
+                    "",
+                    "### Sequence-separation histogram",
+                    "",
+                    "| Bin | Count |",
+                    "| --- | ---: |",
+                ]
+                lines += [f"| {k} | {v} |" for k, v in seq_hist.items()]
 
-            ca_hist = split_report["ca_distance_histogram"]
-            assert isinstance(ca_hist, dict)
-            lines += ["", "### Ca-distance histogram (A)", "", "| Bin | Count |", "| --- | ---: |"]
-            for bin_record in ca_hist["bins"]:
-                lines.append(f"| {bin_record['label']} | {bin_record['count']} |")
+            if "ca_distance_histogram" in split_report:
+                ca_hist = split_report["ca_distance_histogram"]
+                assert isinstance(ca_hist, dict)
+                lines += [
+                    "",
+                    "### Ca-distance histogram (A)",
+                    "",
+                    "| Bin | Count |",
+                    "| --- | ---: |",
+                ]
+                for bin_record in ca_hist["bins"]:
+                    lines.append(f"| {bin_record['label']} | {bin_record['count']} |")
 
             lines += [
                 "",
@@ -210,16 +222,24 @@ def render_report_md(report_dict: Mapping[str, object], dataset_name: str) -> st
         for key, val in sc.items():
             lines.append(f"| {key} | {val} |")
 
-        seq_hist = report_dict["sequence_separation_histogram"]
-        assert isinstance(seq_hist, dict)
-        lines += ["", "## Sequence-separation histogram", "", "| Bin | Count |", "| --- | ---: |"]
-        lines += [f"| {k} | {v} |" for k, v in seq_hist.items()]
+        if "sequence_separation_histogram" in report_dict:
+            seq_hist = report_dict["sequence_separation_histogram"]
+            assert isinstance(seq_hist, dict)
+            lines += [
+                "",
+                "## Sequence-separation histogram",
+                "",
+                "| Bin | Count |",
+                "| --- | ---: |",
+            ]
+            lines += [f"| {k} | {v} |" for k, v in seq_hist.items()]
 
-        ca_hist = report_dict["ca_distance_histogram"]
-        assert isinstance(ca_hist, dict)
-        lines += ["", "## Ca-distance histogram (A)", "", "| Bin | Count |", "| --- | ---: |"]
-        for bin_record in ca_hist["bins"]:
-            lines.append(f"| {bin_record['label']} | {bin_record['count']} |")
+        if "ca_distance_histogram" in report_dict:
+            ca_hist = report_dict["ca_distance_histogram"]
+            assert isinstance(ca_hist, dict)
+            lines += ["", "## Ca-distance histogram (A)", "", "| Bin | Count |", "| --- | ---: |"]
+            for bin_record in ca_hist["bins"]:
+                lines.append(f"| {bin_record['label']} | {bin_record['count']} |")
 
         lines += ["", f"Stage reconciliation: {'OK' if reconcile(sc) else 'MISMATCH'}", ""]
         return "\n".join(lines)

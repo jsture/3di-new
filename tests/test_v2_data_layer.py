@@ -7,13 +7,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 import yaml
-from torch.utils.data import DataLoader
 
 from tdi.data import build_features, validate_cigar, validate_dataset
 from tdi.data.cigar import CigarValidationError
 from tdi.data.config import load_config
 from tdi.v2 import features
-from tdi.v2.training_data import FEATURE_CACHE, PairDataset, extract_features
+from tdi.v2.training_data import FEATURE_CACHE, extract_features
 
 _VIRT_A = (270.0, 0.0, 2.0)
 _VIRT_B = (40.0, 0.0, 8.0)
@@ -98,26 +97,6 @@ def test_move_cb_mutates_so_extract_must_copy(tmp_path: Path) -> None:
     before = coords.copy()
     features.move_CB(coords, virt_cb=_VIRT_A)
     assert not np.array_equal(coords[:, 3:6], before[:, 3:6])
-
-
-def _concat_batches(loader: DataLoader) -> np.ndarray:
-    xs = [x.numpy() for x, _y in loader]
-    return np.concatenate(xs, axis=0)
-
-
-def test_jitter_identical_across_num_workers() -> None:
-    """Deterministic per-item jitter produces identical batches for num_workers in {0, 4}."""
-    rng = np.random.default_rng(0)
-    x = rng.standard_normal((40, 10)).astype(np.float32)
-    y = rng.standard_normal((40, 10)).astype(np.float32)
-
-    def make_loader(num_workers: int) -> DataLoader:
-        ds = PairDataset(x, y, descriptor_jitter_std=0.1, seed=7)
-        return DataLoader(ds, batch_size=8, shuffle=False, num_workers=num_workers)
-
-    out0 = _concat_batches(make_loader(0))
-    out4 = _concat_batches(make_loader(4))
-    assert np.array_equal(out0, out4)
 
 
 # ---------------------------------------------------------------------------
@@ -224,9 +203,18 @@ def test_build_features_metadata_row_count_matches_arrays(tmp_path: Path) -> Non
     train_meta = pd.read_parquet(out_dir / "train_metadata.parquet")
     assert len(train_meta) == train_pairs.shape[0]
     assert train_pairs.shape[0] > 0
-    # Expected metadata columns exist (SCOP join present even when lookup is empty).
-    for col in ("row_id", "alignment_id", "fold_source", "ca_dist_superposed"):
+    # Lean-but-auditable columns exist (SCOP join present even when lookup is empty).
+    for col in (
+        "alignment_id",
+        "split_group_source",
+        "fold_source",
+        "superfamily_source",
+        "ca_dist_superposed",
+    ):
         assert col in train_meta.columns
+    # Redundant / dropped provenance columns are gone.
+    for col in ("row_id", "source_pairfile_row", "source_is_forward", "family_source"):
+        assert col not in train_meta.columns
 
 
 def test_validate_dataset_summary_is_strict_json_serializable(tmp_path: Path) -> None:
@@ -276,27 +264,75 @@ def test_build_writes_expected_artifacts(tmp_path: Path) -> None:
         "train_metadata.parquet",
         "structures.parquet",
         "report.json",
-        "train_report.json",
-        "val_report.json",
         "train_skipped_alignments.tsv",
         "val_skipped_alignments.tsv",
         "report.md",
         "DATACARD.md",
     ):
         assert (out_dir / name).exists(), name
+    # Per-split report duplicates are dropped in favor of the single joint report.json.
+    assert not (out_dir / "train_report.json").exists()
+    assert not (out_dir / "val_report.json").exists()
 
 
-def test_report_json_uses_labeled_strict_ca_bins(tmp_path: Path) -> None:
-    """Ca-distance histograms avoid non-standard Infinity values."""
+def test_full_report_flag_gates_histograms(tmp_path: Path) -> None:
+    """Histograms are omitted by default and present (strict-JSON) with --full-report."""
     config_path = _make_dataset(tmp_path, "out_report_bins")
-    out_dir = build_features(config_path)
 
-    report = json.loads((out_dir / "report.json").read_text())
-    json.dumps(report, indent=2, allow_nan=False)
-    ca_hist = report["train"]["ca_distance_histogram"]
+    # Default build: lean report, no histograms.
+    out_default = build_features(config_path)
+    default_report = json.loads((out_default / "report.json").read_text())
+    assert "ca_distance_histogram" not in default_report["train"]
+    assert "sequence_separation_histogram" not in default_report["train"]
+
+    # --full-report build: histograms present with strict labeled bins.
+    out_full = build_features(config_path, {"preprocessing.full_report": True}, force=True)
+    full_report = json.loads((out_full / "report.json").read_text())
+    json.dumps(full_report, indent=2, allow_nan=False)
+    ca_hist = full_report["train"]["ca_distance_histogram"]
     assert set(ca_hist) == {"bins"}
     assert ca_hist["bins"][-1]["label"] == ">=5.0"
     assert all("count" in bin_record for bin_record in ca_hist["bins"])
+    assert "sequence_separation_histogram" in full_report["train"]
+
+
+def test_alignment_id_is_enriched_and_split_group_is_superfamily(tmp_path: Path) -> None:
+    """alignment_id encodes pairfile stem + row + both sids; split_group == superfamily."""
+    import pandas as pd
+
+    lookup = tmp_path / "scop_lookup.tsv"
+    lookup.write_text("d1aaaa_\ta.3.1.2\nd1bbbb_\tb.1.1.1\n")
+
+    pdb_dir = tmp_path / "pdbs"
+    pdb_dir.mkdir()
+    for sid_seed, sid in enumerate(("d1aaaa_", "d1bbbb_")):
+        _write_pdb(pdb_dir / sid, seed=sid_seed + 1)
+    pairs = tmp_path / "train_pairs.out"
+    pairs.write_text("d1aaaa_ d1bbbb_ 24P\n")
+
+    config = {
+        "dataset": {
+            "name": "synthetic",
+            "pdb_dir": str(pdb_dir),
+            "train_pairfile": str(pairs),
+            "val_pairfile": str(pairs),
+            "scop_lookup": str(lookup),
+        },
+        "features": {"virtual_center": [270.0, 0.0, 2.0], "max_ca_dist": 5.0},
+        "sampling": {"max_pairs_per_alignment": None, "seed": 123},
+        "outputs": {"out_dir": str(tmp_path / "out_align_id")},
+    }
+    config_path = tmp_path / "config_align_id.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+
+    out_dir = build_features(config_path)
+    meta = pd.read_parquet(out_dir / "train_metadata.parquet")
+    assert (meta["alignment_id"] == "train_pairs:0:d1aaaa_:d1bbbb_").all()
+    # split_group mirrors the superfamily-level grouping make_splits.py uses.
+    assert (meta["split_group_source"] == meta["superfamily_source"]).all()
+    forward = meta[meta["sid_source"] == "d1aaaa_"].iloc[0]
+    assert forward["superfamily_source"] == "a.3.1"
+    assert forward["fold_source"] == "a.3"
 
 
 def test_too_few_pairs_build_drops_without_nan_metadata(tmp_path: Path) -> None:

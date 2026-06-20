@@ -26,6 +26,7 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
             tuple(args.virtual_center) if args.virtual_center is not None else None
         ),
         "preprocessing.fail_on_skipped_alignments": args.fail_on_skipped,
+        "preprocessing.full_report": args.full_report,
     }
 
 
@@ -48,6 +49,13 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         default=None,
         help="Override preprocessing.fail_on_skipped_alignments to True.",
+    )
+    parser.add_argument(
+        "--full-report",
+        dest="full_report",
+        action="store_true",
+        default=None,
+        help="Include the seq-separation and Ca-distance histograms in the report.",
     )
 
 
