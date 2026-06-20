@@ -7,11 +7,13 @@ to generate robust VQ-VAE training data.
 
 import hashlib
 import os
+import warnings
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 
 import numpy as np
 import torch
+from scipy.spatial.transform import Rotation
 from torch.utils.data import Dataset, Sampler
 
 from . import features, util
@@ -146,6 +148,21 @@ def filter_valid_pairs(
     return idx_1[valid_mask], idx_2[valid_mask]
 
 
+def _superposed_ca_distances(ca_fixed: np.ndarray, ca_moving: np.ndarray) -> np.ndarray:
+    """Return distances after rigidly superposing ca_moving onto ca_fixed."""
+    fixed_center = ca_fixed.mean(axis=0)
+    moving_center = ca_moving.mean(axis=0)
+    fixed0 = ca_fixed - fixed_center
+    moving0 = ca_moving - moving_center
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        rot = Rotation.align_vectors(fixed0, moving0)[0]
+
+    moving_aligned = rot.apply(moving0) + fixed_center
+    return np.linalg.norm(ca_fixed - moving_aligned, axis=1).astype(np.float32)
+
+
 def filter_ca_distance(
     idx_1: np.ndarray,
     idx_2: np.ndarray,
@@ -155,9 +172,9 @@ def filter_ca_distance(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, str | None]:
     """Filter residue pairs by Ca-Ca distance after superposition.
 
-    Uses Kabsch algorithm (SVD) to superpose coords2 onto coords1 using the matched pairs,
-    then filters out pairs whose distance exceeds max_ca_dist. Returns the aligned indices,
-    distances, and any degeneracy error classification (or None if successful).
+    Superposes coords2 onto coords1 using the matched pairs, then filters out pairs
+    whose distance exceeds max_ca_dist. Returns the aligned indices, distances, and
+    any degeneracy error classification (or None if successful).
     """
     if len(idx_1) < 3:
         return idx_1, idx_2, None, "too_few_pairs"
@@ -191,30 +208,10 @@ def filter_ca_distance(
     except np.linalg.LinAlgError:
         return idx_1[:0], idx_2[:0], np.array([], dtype=np.float32), "svd_failed"
 
-    # Covariance matrix
-    H = q.T @ p
-
-    # SVD
     try:
-        U, _S, Vt = np.linalg.svd(H)
-    except np.linalg.LinAlgError:
+        dist = _superposed_ca_distances(P, Q)
+    except (ValueError, np.linalg.LinAlgError, UserWarning):
         return idx_1[:0], idx_2[:0], np.array([], dtype=np.float32), "svd_failed"
-
-    R = Vt.T @ U.T
-
-    # Ensure a proper rotation (det(R) == 1)
-    if np.linalg.det(R) < 0:
-        Vt[-1, :] *= -1
-        R = Vt.T @ U.T
-
-    # Translation vector
-    t = centroid_P - (R @ centroid_Q.T).T
-
-    # Apply transformation to Q
-    Q_rotated = (R @ Q.T).T + t
-
-    # Calculate distances
-    dist = np.linalg.norm(P - Q_rotated, axis=1)
 
     if max_ca_dist is not None:
         mask = dist <= max_ca_dist
@@ -405,7 +402,7 @@ class PairDataset(Dataset):
         std: np.ndarray | None = None,
         descriptor_jitter_std: float = 0.0,
         seed: int = 42,
-        fit_scaler: bool = False,
+        fit_scaler: bool = True,
     ) -> None:
         """Initialize the PairDataset.
 
