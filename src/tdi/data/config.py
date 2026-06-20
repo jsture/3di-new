@@ -54,6 +54,7 @@ class PreprocessingConfig:
 
     fail_on_skipped_alignments: bool = False
     max_skipped_fraction: float = 0.01
+    validate_cigars: bool = True
 
 
 @dataclass
