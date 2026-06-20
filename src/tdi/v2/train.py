@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import yaml
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.loggers import CSVLogger
 from torch.utils.data import DataLoader
 
 from tdi.v2.model import TdiV2Model
@@ -186,18 +187,26 @@ def train_model(cfg: TrainConfig) -> None:
         gradient_mode=cfg.quantizer.gradient_mode,
     )
 
+    out_dir = Path(cfg.outputs.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     # Setup saving callbacks and EarlyStopping
     checkpoint_callback = ModelCheckpoint(
         monitor="val_score",
         mode="max",
         save_top_k=1,
         filename="best-checkpoint-{epoch:02d}-{val_score:.2f}",
-        dirpath=cfg.outputs.out_dir,
+        dirpath=str(out_dir),
     )
     early_stopping = EarlyStopping(
         monitor="val_score",
         mode="max",
         patience=10,
+    )
+
+    logger = CSVLogger(
+        save_dir=str(out_dir),
+        name="logs",
     )
 
     # Configure Lightning Trainer
@@ -207,9 +216,11 @@ def train_model(cfg: TrainConfig) -> None:
         devices="auto",
         precision=cfg.training.precision,
         accumulate_grad_batches=cfg.training.accumulate_grad_batches,
+        logger=logger,
         callbacks=[checkpoint_callback, early_stopping],
         gradient_clip_val=cfg.optimizer.gradient_clip_val,
         gradient_clip_algorithm="norm",
+        default_root_dir=str(out_dir),
     )
 
     # Run fitting
@@ -224,17 +235,14 @@ def train_model(cfg: TrainConfig) -> None:
         print("No checkpoint saved, exporting current model.")
         best_model = model
 
-    out_path = Path(cfg.outputs.out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
     # Save best model to export files
-    best_model.export_model(out_path, mean=mean, std=std)
+    best_model.export_model(out_dir, mean=mean, std=std)
 
     # Save training_config.yaml in the output directory
-    with open(out_path / "training_config.yaml", "w") as f:
+    with open(out_dir / "training_config.yaml", "w") as f:
         yaml.safe_dump(cfg.to_dict(), f, default_flow_style=False)
 
-    print(f"Exported model artifacts and config to {out_path}")
+    print(f"Exported model artifacts and config to {out_dir}")
 
 
 def main() -> None:
