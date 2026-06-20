@@ -91,6 +91,7 @@ class AlphabetModel(nn.Module):
         commitment_cost: float = 0.25,
         l2_normalize: bool = True,
         min_count: float = 1.0,
+        replacement_warmup_steps: int = 500,
         letters: str = LETTERS,
         invalid_state: str = "X",
     ) -> None:
@@ -109,6 +110,7 @@ class AlphabetModel(nn.Module):
             commitment_cost: Commitment penalty multiplier (VQ).
             l2_normalize: Cosine codebook lookup (VQ).
             min_count: Dead-code replacement threshold (VQ).
+            replacement_warmup_steps: Steps before dead-code replacement begins (VQ).
             letters: The structural alphabet; recorded in the export config.
             invalid_state: Character emitted for residues with invalid coordinates.
         """
@@ -148,6 +150,7 @@ class AlphabetModel(nn.Module):
             commitment_cost=commitment_cost,
             l2_normalize=l2_normalize,
             min_count=min_count,
+            replacement_warmup_steps=replacement_warmup_steps,
         )
 
         # Standardization buffers for standalone scaled inference.
@@ -384,7 +387,7 @@ class AlphabetModel(nn.Module):
                     f"Centroids dimension ({centroids.shape[1]}) does not match z_dim ({z_dim})."
                 )
             if isinstance(model.quantizer, EMAVectorQuantizer):
-                model.quantizer.embedding.data = torch.tensor(centroids)
+                model.quantizer.embedding.copy_(torch.tensor(centroids))
 
         model.eval()
         return model, mean_arr, std_arr

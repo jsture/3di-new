@@ -86,7 +86,10 @@ def build_report(
     def _level_counts(column: str) -> dict[str, int]:
         if column not in metadata or metadata.empty:
             return {}
-        return {str(k): int(v) for k, v in metadata[column].value_counts().items()}
+        # dropna=False so rows with a missing SCOP classification are visible as "UNKNOWN"
+        # rather than silently omitted from the audit counts.
+        counts = metadata[column].fillna("UNKNOWN").value_counts(dropna=False)
+        return {str(k): int(v) for k, v in counts.items()}
 
     def _alignment_quantiles() -> dict[str, float]:
         if "alignment_id" not in metadata or metadata.empty:

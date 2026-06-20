@@ -259,8 +259,10 @@ def align_features(
     # Sub-sample before bidirectional mapping if max_pairs is set
     cap_seed = None
     if max_pairs is not None and len(idx_1) > max_pairs // 2:
-        alignment_id = f"{sid1}-{sid2}"
-        hasher = hashlib.sha256(f"{alignment_id}:{seed}".encode())
+        # Include a CIGAR hash so repeated (sid1, sid2) rows with different alignments get
+        # distinct sub-sampling seeds rather than sharing one.
+        cigar_hash = hashlib.sha256(cigar_string.encode()).hexdigest()
+        hasher = hashlib.sha256(f"{sid1}:{sid2}:{cigar_hash}:{seed}".encode())
         cap_seed = int(hasher.hexdigest(), 16) % (2**32)
 
         rng = np.random.default_rng(cap_seed)

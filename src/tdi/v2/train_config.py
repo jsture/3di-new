@@ -26,6 +26,7 @@ class ModelConfig:
     decay: float = 0.99
     min_count: float = 1.0
     l2_normalize: bool = True
+    replacement_warmup_steps: int = 500  # VQ: steps before dead-code replacement begins
 
 
 @dataclass
@@ -49,7 +50,7 @@ class LoopConfig:
 class DataConfig:
     """Where the preprocessed arrays live."""
 
-    processed_dir: str = "data/processed/scop_ca5_v1"
+    processed_dir: str = "data/processed/scop_ca5_r1"
 
 
 @dataclass
