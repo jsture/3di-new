@@ -2,7 +2,7 @@
 
 Produces an immutable, versioned processed-dataset directory: feature arrays,
 scaler, per-pair metadata (with SCOP joins), structure QC, a preprocessing report,
-a data card, and a manifest of input/output hashes proving determinism.
+a data card, and a manifest recording input/output hashes for reproducibility.
 """
 
 import datetime
@@ -20,6 +20,29 @@ from tdi.data.hashing import array_record, git_commit, sha256_file
 from tdi.data.scop import classify, load_scop_lookup
 from tdi.data.structures import build_structures_table
 from tdi.v2.training_data import align_features, fit_standardizer
+
+# Column order for per-pair metadata; also used to give an empty split a typed,
+# column-bearing DataFrame (so downstream report/parquet code never sees a column-less frame).
+_METADATA_COLUMNS = [
+    "row_id",
+    "sid_source",
+    "sid_target",
+    "idx_source",
+    "idx_target",
+    "alignment_id",
+    "source_pairfile_row",
+    "ca_dist_superposed",
+    "ca_dist_raw",
+    "source_is_forward",
+    "scop_source",
+    "scop_target",
+    "fold_source",
+    "fold_target",
+    "superfamily_source",
+    "superfamily_target",
+    "family_source",
+    "family_target",
+]
 
 
 def _read_pairfile(path: str | Path) -> list[tuple[int, str, str, str]]:
@@ -100,7 +123,10 @@ def _process_split(
     sids: set[str] = set()
     counts = {
         "n_alignments_read": len(alignments),
-        "n_alignments_skipped": 0,
+        # Errored = true parse/extraction failures (also written to the skipped TSV).
+        # Empty = alignments that legitimately filtered down to zero pairs.
+        "n_alignments_errored": 0,
+        "n_alignments_empty": 0,
         "n_pairs_before_filters": 0,
         "n_pairs_after_descriptor_validity": 0,
         "n_pairs_after_ca_filter": 0,
@@ -109,6 +135,9 @@ def _process_split(
     }
 
     for source_row, sid1, sid2, cigar in alignments:
+        # Record every referenced structure up front (even if its alignment errors or yields
+        # no pairs) so the QC table can explain domains that produced no features.
+        sids.update([sid1, sid2])
         try:
             x, y, meta = align_features(
                 cfg.dataset.pdb_dir,
@@ -121,7 +150,7 @@ def _process_split(
                 seed=cfg.sampling.seed,
             )
         except Exception as exc:
-            counts["n_alignments_skipped"] += 1
+            counts["n_alignments_errored"] += 1
             skipped_records.append(
                 {
                     "source_row": source_row,
@@ -142,34 +171,39 @@ def _process_split(
         counts["n_pairs_after_max_pairs"] += meta.get("n_pairs_after_max_pairs", 0)
 
         if len(x) == 0:
-            counts["n_alignments_skipped"] += 1
+            counts["n_alignments_empty"] += 1
             continue
 
         x_list.append(x)
         y_list.append(y)
         meta_records.extend(_split_metadata(meta, sid1, sid2, source_row, scop_lookup))
-        sids.update([sid1, sid2])
 
     x_feat = np.vstack(x_list) if x_list else np.zeros((0, 10), dtype=np.float32)
     y_feat = np.vstack(y_list) if y_list else np.zeros((0, 10), dtype=np.float32)
     counts["n_final_examples"] = int(x_feat.shape[0])
-    metadata = pd.DataFrame.from_records(meta_records)
+    metadata = (
+        pd.DataFrame.from_records(meta_records)
+        if meta_records
+        else pd.DataFrame(columns=_METADATA_COLUMNS)
+    )
 
-    # Perform skipped alignment checks
+    # Fail policy is keyed on errored alignments (true failures), not on alignments that
+    # legitimately filter down to zero pairs. The fraction threshold is the lenient guard;
+    # fail_on_skipped_alignments is the strict "any failure aborts" switch.
     total_alignments = len(alignments)
     if total_alignments > 0:
-        skipped_fraction = counts["n_alignments_skipped"] / total_alignments
-        if cfg.preprocessing.fail_on_skipped_alignments and counts["n_alignments_skipped"] > 0:
-            raise RuntimeError(
-                "Failed on skipped alignments: "
-                f"{counts['n_alignments_skipped']} alignments skipped."
-            )
-        if skipped_fraction > cfg.preprocessing.max_skipped_fraction:
-            if cfg.preprocessing.fail_on_skipped_alignments:
+        errored = counts["n_alignments_errored"]
+        error_fraction = errored / total_alignments
+        if cfg.preprocessing.fail_on_skipped_alignments:
+            if errored > 0:
                 raise RuntimeError(
-                    f"Skipped fraction {skipped_fraction:.3f} exceeds "
-                    f"max_skipped_fraction {cfg.preprocessing.max_skipped_fraction:.3f}."
+                    f"fail_on_skipped_alignments is set and {errored} alignment(s) errored."
                 )
+        elif error_fraction > cfg.preprocessing.max_skipped_fraction:
+            raise RuntimeError(
+                f"Errored fraction {error_fraction:.3f} exceeds "
+                f"max_skipped_fraction {cfg.preprocessing.max_skipped_fraction:.3f}."
+            )
 
     return x_feat, y_feat, metadata, counts, sids, skipped_records
 
