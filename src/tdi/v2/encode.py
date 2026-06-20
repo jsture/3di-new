@@ -17,6 +17,20 @@ from .model import TdiV2Model
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWYZabcdefghijklmnopqrstuvwyz"
 
 
+def _model_device(model: nn.Module) -> torch.device:
+    """Resolve the device a model lives on, defaulting to CPU.
+
+    Inputs are moved here before the forward pass so encoding runs on the GPU when the model
+    is on one, while staying on CPU by default (the CLI must run without a GPU).
+    """
+    if isinstance(model, TdiV2Model):
+        return model.device
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
 def predict(
     model: nn.Module,
     x: np.ndarray,
@@ -43,7 +57,9 @@ def predict(
 
     try:
         with torch.no_grad():
-            x_tensor = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32))
+            x_tensor = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).to(
+                _model_device(model)
+            )
             # Access encoder depending on model type
             if isinstance(model, TdiV2Model):
                 encoder = model.encoder
@@ -79,7 +95,7 @@ def discretize(
     if isinstance(model, TdiV2Model):
         if mean is not None and std is not None:
             x = training_data.transform(x, mean, std)
-        x_tensor = torch.tensor(x, dtype=torch.float32)
+        x_tensor = torch.tensor(x, dtype=torch.float32).to(_model_device(model))
         return model.encode_states(x_tensor).cpu().numpy()
 
     # Fallback to manual prediction and lookup
