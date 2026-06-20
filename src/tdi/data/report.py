@@ -73,6 +73,26 @@ def build_report(
             return {}
         return {str(k): int(v) for k, v in metadata[column].value_counts().items()}
 
+    def _alignment_quantiles() -> dict[str, float]:
+        if "alignment_id" not in metadata or metadata.empty:
+            return {}
+        counts = metadata["alignment_id"].value_counts().to_numpy()
+        if len(counts) == 0:
+            return {}
+        return {
+            "min": float(counts.min()),
+            "p25": float(np.percentile(counts, 25)),
+            "median": float(np.percentile(counts, 50)),
+            "p75": float(np.percentile(counts, 75)),
+            "p90": float(np.percentile(counts, 90)),
+            "p95": float(np.percentile(counts, 95)),
+            "p99": float(np.percentile(counts, 99)),
+            "max": float(counts.max()),
+            "mean": float(counts.mean()),
+            "std": float(counts.std()),
+            "count": len(counts),
+        }
+
     feat_stats = {
         "mean": features.mean(axis=0).tolist() if features.size else [],
         "std": features.std(axis=0).tolist() if features.size else [],
@@ -90,7 +110,7 @@ def build_report(
         },
         "examples_per_fold": _level_counts("fold_source"),
         "examples_per_superfamily": _level_counts("superfamily_source"),
-        "examples_per_alignment": _level_counts("alignment_id"),
+        "examples_per_alignment": _alignment_quantiles(),
     }
 
 

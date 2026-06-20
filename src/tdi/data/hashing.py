@@ -59,3 +59,18 @@ def git_commit() -> str | None:
         return out.stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
+
+
+def git_dirty() -> bool:
+    """Return True if the git working directory has uncommitted changes."""
+    try:
+        out = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return bool(out.stdout.strip())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+

@@ -317,5 +317,45 @@ def test_build_features_fail_on_skipped_alignments(tmp_path: Path) -> None:
     with open(config_path, "w") as f:
         yaml.safe_dump(config, f)
 
-    with pytest.raises(RuntimeError, match="Failed on skipped alignments"):
+    with pytest.raises(RuntimeError, match="fail_on_skipped_alignments is set"):
         build_features(config_path)
+
+
+def test_parse_pairfile_line_resilience() -> None:
+    """Verify that parse_pairfile_line correctly parses both 3-column and multi-column lines."""
+    from tdi.v2.util import parse_pairfile_line
+
+    # 3-column format
+    res3 = parse_pairfile_line("d1aaaa_ d1bbbb_ 24P\n")
+    assert res3 == ("d1aaaa_", "d1bbbb_", "24P")
+
+    # Multi-column format (e.g. 10 columns)
+    res10 = parse_pairfile_line("d12asa_ d1b8aa2 0.73 0.75 0.73 3.0 327 335 285 23I1M2P\n")
+    assert res10 == ("d12asa_", "d1b8aa2", "23I1M2P")
+
+    # Short line
+    assert parse_pairfile_line("d1aaaa_ d1bbbb_") is None
+
+
+def test_resolve_pdb_path_fallbacks(tmp_path: Path) -> None:
+    """Verify resolve_pdb_path prioritizes no-extension then .pdb fallback."""
+    from tdi.v2.util import resolve_pdb_path
+
+    # Create dummy files
+    dir_path = tmp_path / "structures"
+    dir_path.mkdir()
+
+    file_no_ext = dir_path / "d1aaaa_"
+    file_no_ext.touch()
+
+    file_with_ext = dir_path / "d1bbbb_.pdb"
+    file_with_ext.touch()
+
+    # Priority 1: no-extension exists
+    assert resolve_pdb_path(dir_path, "d1aaaa_") == file_no_ext
+
+    # Priority 2: no-extension missing, .pdb exists
+    assert resolve_pdb_path(dir_path, "d1bbbb_") == file_with_ext
+
+    # Missing case: returns path1 default (no extension)
+    assert resolve_pdb_path(dir_path, "d1cccc_") == dir_path / "d1cccc_"
