@@ -100,7 +100,6 @@ def process_pdb(
     pdb_dir: str,
     virt: tuple[float, float, float],
     invalid_state: str,
-    exclude_feat: int | None = None,
     mean: np.ndarray | None = None,
     std: np.ndarray | None = None,
 ) -> tuple[str, str]:
@@ -113,7 +112,6 @@ def process_pdb(
         pdb_dir: Directory containing PDB files.
         virt: Virtual CB center parameter tuple (alpha, beta, d).
         invalid_state: Character symbol used to represent invalid residues.
-        exclude_feat: One-based index of feature to exclude, or None.
         mean: Scaling mean array.
         std: Scaling standard deviation array.
 
@@ -122,11 +120,6 @@ def process_pdb(
     """
     pdb_path = str(Path(pdb_dir) / fn)
     feat, mask = training_data.encoder_features(pdb_path, virt)
-
-    if exclude_feat is not None:
-        fmask = np.ones(feat.shape[1], dtype=bool)
-        fmask[exclude_feat - 1] = False
-        feat = feat[:, fmask]
 
     # Map descriptors to discrete states
     valid_states = discretize(encoder, centroids, feat[mask], mean, std)
