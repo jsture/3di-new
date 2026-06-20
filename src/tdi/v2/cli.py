@@ -82,10 +82,11 @@ def run_evaluate(args: argparse.Namespace) -> None:
     if n_failed > 0:
         print(f"Failed sample IDs: {failed_sids_sample}", file=sys.stderr)
 
-    if failure_rate > args.max_failure_rate:
+    max_failure_rate = getattr(args, "max_failure_rate", 1.0)
+    if failure_rate > max_failure_rate:
         raise RuntimeError(
             f"Encoding failure rate {failure_rate:.1%} exceeds maximum allowed "
-            f"threshold {args.max_failure_rate:.1%} (failed: {n_failed}/{n_requested}). "
+            f"threshold {max_failure_rate:.1%} (failed: {n_failed}/{n_requested}). "
             f"Failed sample: {failed_sids_sample}"
         )
 

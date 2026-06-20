@@ -18,12 +18,31 @@ from tdi.v2 import (
     TdiV2Model,
 )
 from tdi.v2.training_data import (
+    _superposed_ca_distances,
     filter_ca_distance,
     filter_valid_pairs,
     make_bidirectional_pairs,
     parse_alignment,
 )
 from tdi.v2.util import parse_cigar
+
+
+def _manual_superposed_ca_distances(ca_fixed: np.ndarray, ca_moving: np.ndarray) -> np.ndarray:
+    """Reference implementation matching the previous handwritten SVD path."""
+    fixed_center = ca_fixed.mean(axis=0)
+    moving_center = ca_moving.mean(axis=0)
+    fixed0 = ca_fixed - fixed_center
+    moving0 = ca_moving - moving_center
+
+    h = moving0.T @ fixed0
+    u, _s, vt = np.linalg.svd(h)
+    rot = vt.T @ u.T
+    if np.linalg.det(rot) < 0:
+        vt[-1, :] *= -1
+        rot = vt.T @ u.T
+
+    moving_aligned = (rot @ ca_moving.T).T + fixed_center - (rot @ moving_center.T).T
+    return np.linalg.norm(ca_fixed - moving_aligned, axis=1).astype(np.float32)
 
 
 def test_residual_mlp_shapes() -> None:
@@ -114,10 +133,13 @@ def test_encode_states_does_not_change_mode() -> None:
 
 
 def test_ca_filter_requires_superposition() -> None:
-    """Verify Ca filtering superposes correctly using Kabsch SVD."""
-    # Create two identical sets of coordinates but translated and rotated
-    coords1 = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-    coords2 = coords1 + np.array([100.0, 50.0, -20.0])
+    """Verify Ca filtering superposes translated and rotated coordinates."""
+    coords1 = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float64,
+    )
+    rot_z = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    coords2 = coords1 @ rot_z.T + np.array([100.0, 50.0, -20.0])
 
     idx_1 = np.array([0, 1, 2])
     idx_2 = np.array([0, 1, 2])
@@ -128,6 +150,63 @@ def test_ca_filter_requires_superposition() -> None:
     assert np.array_equal(v2, idx_2)
     assert dists is not None
     assert np.all(dists < 1e-5)
+
+
+def test_superposed_distances_match_manual_svd_reference() -> None:
+    """Verify SciPy rotation matches the previous handwritten SVD implementation."""
+    rng = np.random.default_rng(123)
+    coords1 = rng.normal(size=(8, 3))
+    rot_z = np.array(
+        [
+            [0.5, -np.sqrt(3) / 2, 0.0],
+            [np.sqrt(3) / 2, 0.5, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    coords2 = coords1 @ rot_z.T + np.array([3.0, -7.0, 2.0])
+
+    actual = _superposed_ca_distances(coords1, coords2)
+    expected = _manual_superposed_ca_distances(coords1, coords2)
+
+    assert np.allclose(actual, expected, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "coords",
+    [
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
+        np.array([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]),
+    ],
+)
+def test_ca_filter_rejects_rank_deficient_coordinates(coords: np.ndarray) -> None:
+    """Verify degenerate superposition inputs retain the existing error label."""
+    idx = np.array([0, 1, 2])
+
+    v1, v2, dists, error = filter_ca_distance(idx, idx, coords, coords)
+
+    assert error == "rank_deficient_coordinates"
+    assert len(v1) == 0
+    assert len(v2) == 0
+    assert dists is not None
+    assert len(dists) == 0
+
+
+def test_ca_filter_max_distance_uses_superposed_distances() -> None:
+    """Verify max_ca_dist is applied after superposition, not on raw distances."""
+    coords1 = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float64,
+    )
+    coords2 = coords1 + np.array([100.0, 50.0, -20.0])
+    idx = np.array([0, 1, 2])
+
+    v1, v2, dists, error = filter_ca_distance(idx, idx, coords1, coords2, max_ca_dist=0.1)
+
+    assert error is None
+    assert np.array_equal(v1, idx)
+    assert np.array_equal(v2, idx)
+    assert dists is not None
+    assert np.all(dists <= 0.1)
 
 
 def test_parse_cigar_empty_shape() -> None:
