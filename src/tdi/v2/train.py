@@ -1,335 +1,280 @@
+"""Plain (no-Lightning) training loop for the single-path v2 alphabet model.
+
+One quantizer per run, fixed LR by default (optional cosine), grad-clip + early-stop on
+``val_loss``. Writes the self-describing export plus ``run_config.resolved.json`` and
+``train_log.csv`` into the run directory.
+"""
+
 import argparse
+import copy
+import csv
 import json
-import os
 from pathlib import Path
 
-import lightning as L
 import numpy as np
 import torch
-import yaml
-from lightning.pytorch.callbacks import Callback, EarlyStopping, ModelCheckpoint
-from lightning.pytorch.loggers import CSVLogger
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from tdi.v2.model import TdiV2Model
+from tdi.v2.model import AlphabetModel
 from tdi.v2.train_config import TrainConfig, load_train_config
-from tdi.v2.training_data import AlignmentBatchSampler, PairDataset
+from tdi.v2.training_data import PairDataset
 
 
-class _EpochSeedingCallback(Callback):
-    """Propagate the epoch into the dataset and batch sampler each train epoch.
+def _load_arrays(processed_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load train/val raw descriptor arrays, supporting both layouts.
 
-    Without this, ``PairDataset``/``AlignmentBatchSampler`` keep ``epoch == 0`` for the
-    whole run, so per-epoch descriptor jitter and batch composition never vary.
+    Prefers the explicit ``{train,val}_{x,y}_raw.npy`` layout; falls back to a stacked
+    ``data.npy`` (train) plus a distinct ``val/data.npy`` (never aliasing the train set).
     """
-
-    def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
-        epoch = trainer.current_epoch
-        loader = trainer.train_dataloader
-        if loader is None:
-            return
-        for obj in (getattr(loader, "dataset", None), getattr(loader, "batch_sampler", None)):
-            set_epoch = getattr(obj, "set_epoch", None)
-            if callable(set_epoch):
-                set_epoch(epoch)
-
-
-def _load_alignment_ids(data_dir: str | Path, n_rows: int) -> np.ndarray | None:
-    """Load per-row alignment ids from a metadata parquet if present and row-aligned.
-
-    Args:
-        data_dir: Directory containing processed data files.
-        n_rows: Number of rows expected in metadata.
-
-    Returns:
-        Array of alignment IDs or None if metadata is not found or mismatch.
-    """
-    import pandas as pd
-
-    data_path = Path(data_dir)
-    for name in ("train_metadata.parquet", "metadata.parquet"):
-        path = data_path / name
-        if path.exists():
-            df = pd.read_parquet(path)
-            if "alignment_id" in df.columns and len(df) == n_rows:
-                return df["alignment_id"].to_numpy()
-    return None
-
-
-def train_model(cfg: TrainConfig) -> None:
-    """Execute the full model training loop using the provided TrainConfig.
-
-    Args:
-        cfg: The training configuration object.
-    """
-    # Seed all sources of randomness
-    L.seed_everything(cfg.training.seed)
-    torch.manual_seed(cfg.training.seed)
-
-    processed_dir = Path(cfg.data.processed_dir)
-
-    # Load preprocessed arrays. Try new raw name layout first, then fallback to old data.
     train_x_path = processed_dir / "train_x_raw.npy"
     if train_x_path.exists():
-        x_train_raw = np.load(processed_dir / "train_x_raw.npy")
-        y_train_raw = np.load(processed_dir / "train_y_raw.npy")
-        x_val_raw = np.load(processed_dir / "val_x_raw.npy")
-        y_val_raw = np.load(processed_dir / "val_y_raw.npy")
-    else:
-        # Fallback to single stacked data.npy if raw layout is not present
-        train_data_path = processed_dir / "data.npy"
-        if train_data_path.exists():
-            train_data_raw = np.load(train_data_path)
-            x_train_raw = train_data_raw[:, :, 0]
-            y_train_raw = train_data_raw[:, :, 1]
+        return (
+            np.load(processed_dir / "train_x_raw.npy"),
+            np.load(processed_dir / "train_y_raw.npy"),
+            np.load(processed_dir / "val_x_raw.npy"),
+            np.load(processed_dir / "val_y_raw.npy"),
+        )
 
-            # Validation data must be a distinct file; never silently alias the train set.
-            val_data_path = processed_dir / "val" / "data.npy"
-            if not val_data_path.exists():
-                raise FileNotFoundError(
-                    f"Training data found at {train_data_path} but no validation data at "
-                    f"{val_data_path}. Provide a separate validation split rather than "
-                    "reusing the training data."
-                )
-            val_data_raw = np.load(val_data_path)
-            x_val_raw = val_data_raw[:, :, 0]
-            y_val_raw = val_data_raw[:, :, 1]
-        else:
-            raise FileNotFoundError(f"No training data files found in {processed_dir}")
+    train_data_path = processed_dir / "data.npy"
+    if not train_data_path.exists():
+        raise FileNotFoundError(f"No training data files found in {processed_dir}")
+    train_data = np.load(train_data_path)
 
-    # Load scaler statistics if saved during preprocessing
+    val_data_path = processed_dir / "val" / "data.npy"
+    if not val_data_path.exists():
+        raise FileNotFoundError(
+            f"Training data found at {train_data_path} but no validation data at "
+            f"{val_data_path}. Provide a separate validation split rather than reusing train."
+        )
+    val_data = np.load(val_data_path)
+    return train_data[:, :, 0], train_data[:, :, 1], val_data[:, :, 0], val_data[:, :, 1]
+
+
+def _read_provenance(processed_dir: Path) -> tuple[list[float] | None, float | None]:
+    """Read (virtual_center, max_ca_dist) from a data report if present."""
+    for name in ("report.json", "training_data_report.json"):
+        path = processed_dir / name
+        if path.exists():
+            with open(path) as f:
+                report = json.load(f)
+            return report.get("virtual_center"), report.get("max_ca_dist")
+    return None, None
+
+
+def _reconstruction_loss(loss_name: str, y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Partner-prediction reconstruction loss."""
+    if loss_name == "mse":
+        return F.mse_loss(y_hat, y)
+    return F.smooth_l1_loss(y_hat, y)
+
+
+def _run_validation(
+    model: AlphabetModel, loader: DataLoader, loss_name: str, n_states: int
+) -> dict[str, float]:
+    """Compute val_loss plus state diagnostics over the whole validation set."""
+    model.eval()
+    total_loss = 0.0
+    n_batches = 0
+    perplexities: list[float] = []
+    margins: list[float] = []
+    counts = torch.zeros(n_states, dtype=torch.long)
+    with torch.no_grad():
+        for x, y in loader:
+            out = model(x)
+            total_loss += float(_reconstruction_loss(loss_name, out["y_hat"], y))
+            n_batches += 1
+            metrics = out["metrics"]
+            perplexities.append(float(metrics["perplexity"]))
+            if "margin" in metrics:
+                margins.append(float(metrics["margin"]))
+            counts += torch.bincount(out["indices"].cpu(), minlength=n_states)
+
+    val_loss = total_loss / max(1, n_batches)
+    dead_state_count = int((counts == 0).sum())
+    diag = {
+        "val_loss": val_loss,
+        "perplexity": float(np.mean(perplexities)) if perplexities else 0.0,
+        "dead_states": dead_state_count,
+    }
+    if margins:
+        diag["margin"] = float(np.mean(margins))
+    return diag
+
+
+def train_model(cfg: TrainConfig) -> AlphabetModel:
+    """Run the full training loop and write the export + logs.
+
+    Args:
+        cfg: The resolved training configuration.
+
+    Returns:
+        The best (lowest val_loss) model, reloaded and exported.
+    """
+    torch.manual_seed(cfg.train.seed)
+    np.random.seed(cfg.train.seed)
+
+    processed_dir = Path(cfg.data.processed_dir)
+    x_train_raw, y_train_raw, x_val_raw, y_val_raw = _load_arrays(processed_dir)
+
+    # Train-only scaler: fit on train, reuse for val (no leakage).
     scaler_path = processed_dir / "scaler.npz"
     if scaler_path.exists():
         scaler = np.load(scaler_path)
-        mean = scaler["mean"]
-        std = scaler["std"]
-        print(f"Loaded standardizer scaler from {scaler_path}")
+        mean, std = scaler["mean"], scaler["std"]
+        train_dataset = PairDataset(x_train_raw, y_train_raw, mean=mean, std=std)
     else:
-        mean = None
-        std = None
-        print(
-            "No scaler.npz found in processed data directory; "
-            "fitting standardizer from training data."
-        )
+        train_dataset = PairDataset(x_train_raw, y_train_raw, fit_scaler=True)
+    mean, std = train_dataset.mean, train_dataset.std
+    val_dataset = PairDataset(x_val_raw, y_val_raw, mean=mean, std=std)
 
-    # Create PairDataset for train split (supports descriptor jittering)
-    train_dataset = PairDataset(
-        x_train_raw,
-        y_train_raw,
-        mean=mean,
-        std=std,
-        descriptor_jitter_std=cfg.data.descriptor_jitter_std,
-        seed=cfg.training.seed,
-        fit_scaler=True,
+    train_loader = DataLoader(
+        train_dataset, batch_size=cfg.train.batch_size, shuffle=True, drop_last=True
     )
-    # Obtain standardized metrics (fitted or loaded)
-    mean = train_dataset.mean
-    std = train_dataset.std
+    val_loader = DataLoader(val_dataset, batch_size=cfg.train.batch_size, shuffle=False)
 
-    # Create PairDataset for validation split (no jitter)
-    val_dataset = PairDataset(
-        x_val_raw,
-        y_val_raw,
-        mean=mean,
-        std=std,
-        descriptor_jitter_std=0.0,
-        seed=cfg.training.seed,
-        fit_scaler=False,
-    )
-
-    # Resolve loader batch sampler
-    sampler = None
-    if cfg.data.sampler == "alignment_balanced" and cfg.data.alignments_per_batch:
-        alignment_ids = _load_alignment_ids(processed_dir, len(x_train_raw))
-        if alignment_ids is not None:
-            sampler = AlignmentBatchSampler(
-                alignment_ids,
-                batch_size=cfg.training.batch_size,
-                alignments_per_batch=cfg.data.alignments_per_batch,
-                seed=cfg.training.seed,
-            )
-            print("Using AlignmentBatchSampler for training.")
-        else:
-            print(
-                "Alignment-aware batching requested but alignment metadata "
-                "not found/mismatched; using random sampler."
-            )
-
-    # Determine if workers should persist (only valid when num_workers > 0)
-    persistent = cfg.data.num_workers > 0
-
-    if sampler is not None:
-        train_loader = DataLoader(
-            train_dataset,
-            batch_sampler=sampler,
-            num_workers=cfg.data.num_workers,
-            persistent_workers=persistent,
-        )
-    else:
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=cfg.training.batch_size,
-            shuffle=True,
-            num_workers=cfg.data.num_workers,
-            persistent_workers=persistent,
-        )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg.training.batch_size,
-        shuffle=False,
-        num_workers=cfg.data.num_workers,
-        persistent_workers=persistent,
-    )
-
-    # Initialize TdiV2Model
     input_dim = x_train_raw.shape[1]
-
-    # Map model quantizer settings to model properties
-    quantizer_param = cfg.model.quantizer_type
-    quantizer_type = "vq" if quantizer_param in ("vq", "ema_vq") else quantizer_param
-
-    model = TdiV2Model(
+    model = AlphabetModel(
         input_dim=input_dim,
         hidden_dim=cfg.model.hidden_dim,
         z_dim=cfg.model.z_dim,
         n_states=cfg.model.n_states,
-        quantizer_type=quantizer_type,
-        fsq_levels=cfg.model.fsq_levels,
-        decay=cfg.quantizer.decay,
-        eps=cfg.quantizer.eps,
-        commitment_cost=cfg.quantizer.commitment_cost,
-        l2_normalize=cfg.quantizer.l2_normalize,
-        min_count=cfg.quantizer.min_count,
-        replacement_warmup_steps=cfg.quantizer.replacement_warmup_steps,
-        lambda_usage=cfg.loss.lambda_usage,
-        lambda_contrast=cfg.loss.lambda_contrast,
-        lambda_self=cfg.loss.lambda_self,
-        temperature=cfg.loss.temperature,
-        lr=cfg.optimizer.lr,
-        weight_decay=cfg.optimizer.weight_decay,
-        warmup_ratio=cfg.optimizer.warmup_ratio,
-        quantizer_warmup_epochs=cfg.training.quantizer_warmup_epochs,
-        aux_ramp_epochs=cfg.training.aux_ramp_epochs,
-        loss_type=cfg.model.loss_type,
-        kmeans_init=cfg.quantizer.kmeans_init,
-        kmeans_init_batches=cfg.quantizer.kmeans_init_batches,
-        kmeans_seed=cfg.quantizer.kmeans_seed,
-        kmeans_max_samples=cfg.quantizer.kmeans_init_samples,
-        gradient_mode=cfg.quantizer.gradient_mode,
+        quantizer=cfg.model.quantizer,
+        levels=cfg.model.levels,
+        loss=cfg.model.loss,
+        decay=cfg.model.decay,
+        commitment_cost=cfg.model.commitment_cost,
+        min_count=cfg.model.min_count,
+        l2_normalize=cfg.model.l2_normalize,
+    )
+
+    # One-shot k-means codebook init on the VQ path (no-op for FSQ).
+    if cfg.model.quantizer in ("vq", "ema_vq") and cfg.train.kmeans_init:
+        model.init_codebook_from_loader(
+            train_loader,
+            n_batches=cfg.train.kmeans_init_batches,
+            seed=cfg.train.kmeans_seed,
+        )
+
+    # AdamW with no weight decay on biases / LayerNorm gains.
+    decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
+    no_decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay_params, "weight_decay": cfg.train.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=cfg.train.lr,
+    )
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.max_epochs)
+        if cfg.train.scheduler == "cosine"
+        else None
     )
 
     out_dir = Path(cfg.outputs.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Setup saving callbacks and EarlyStopping
-    checkpoint_callback = ModelCheckpoint(
-        monitor="val_score",
-        mode="max",
-        save_top_k=1,
-        filename="best-checkpoint-{epoch:02d}-{val_score:.2f}",
-        dirpath=str(out_dir),
-    )
-    early_stopping = EarlyStopping(
-        monitor="val_score",
-        mode="max",
-        patience=10,
-    )
+    best_val = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    patience_left = cfg.train.patience
+    log_rows: list[dict[str, float]] = []
 
-    logger = CSVLogger(
-        save_dir=str(out_dir),
-        name="logs",
-    )
+    for epoch in range(cfg.train.max_epochs):
+        model.train()
+        epoch_loss = 0.0
+        n_batches = 0
+        for x, y in train_loader:
+            optimizer.zero_grad()
+            out = model(x)
+            loss = _reconstruction_loss(cfg.model.loss, out["y_hat"], y) + out["q_loss"]
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.clip_grad_norm)
+            optimizer.step()
+            epoch_loss += float(loss.detach())
+            n_batches += 1
+        if scheduler is not None:
+            scheduler.step()
 
-    min_epochs = cfg.training.quantizer_warmup_epochs + 1
-    # Configure Lightning Trainer
-    trainer = L.Trainer(
-        max_epochs=cfg.training.max_epochs,
-        min_epochs=min_epochs,
-        accelerator="auto",
-        devices="auto",
-        precision=cfg.training.precision,
-        accumulate_grad_batches=cfg.training.accumulate_grad_batches,
-        logger=logger,
-        callbacks=[checkpoint_callback, early_stopping, _EpochSeedingCallback()],
-        gradient_clip_val=cfg.optimizer.gradient_clip_val,
-        gradient_clip_algorithm="norm",
-        default_root_dir=str(out_dir),
-    )
+        train_loss = epoch_loss / max(1, n_batches)
+        diag = _run_validation(model, val_loader, cfg.model.loss, model.n_states)
+        log_rows.append({"epoch": epoch, "train_loss": train_loss, **diag})
+        print(
+            f"epoch {epoch}: train_loss={train_loss:.4f} val_loss={diag['val_loss']:.4f} "
+            f"perplexity={diag['perplexity']:.2f} dead_states={diag['dead_states']}"
+        )
 
-    # Run fitting
-    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        if diag["val_loss"] < best_val:
+            best_val = diag["val_loss"]
+            best_state = copy.deepcopy(model.state_dict())
+            patience_left = cfg.train.patience
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                print(f"Early stopping at epoch {epoch} (no val_loss improvement).")
+                break
 
-    # Load and save the best checkpoint
-    best_path = checkpoint_callback.best_model_path
-    if best_path and os.path.exists(best_path):
-        print(f"Loading best checkpoint from {best_path}")
-        best_model = TdiV2Model.load_from_checkpoint(best_path)
-    else:
-        print("No checkpoint saved, exporting current model.")
-        best_model = model
+    # Restore the best weights before exporting.
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
-    # Read feature-build provenance (virtual center / Ca filter) from the data report if
-    # present, so the exported config records what was actually used rather than guessing.
-    virtual_center = None
-    max_ca_dist = None
-    report_path = processed_dir / "training_data_report.json"
-    if report_path.exists():
-        with open(report_path) as f:
-            data_report = json.load(f)
-        virtual_center = data_report.get("virtual_center")
-        max_ca_dist = data_report.get("max_ca_dist")
+    virtual_center, max_ca_dist = _read_provenance(processed_dir)
+    model.save(out_dir, mean=mean, std=std, virtual_center=virtual_center, max_ca_dist=max_ca_dist)
 
-    # Save best model to export files
-    best_model.export_model(
-        out_dir,
-        mean=mean,
-        std=std,
-        virtual_center=virtual_center,
-        max_ca_dist=max_ca_dist,
-    )
+    with open(out_dir / "run_config.resolved.json", "w") as f:
+        json.dump(cfg.to_dict(), f, indent=2)
 
-    # Save training_config.yaml in the output directory
-    with open(out_dir / "training_config.yaml", "w") as f:
-        yaml.safe_dump(cfg.to_dict(), f, default_flow_style=False)
+    if log_rows:
+        fieldnames = list(log_rows[-1].keys())
+        with open(out_dir / "train_log.csv", "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in log_rows:
+                writer.writerow(row)
 
-    print(f"Exported model artifacts and config to {out_dir}")
+    print(f"Exported model artifacts and logs to {out_dir}")
+    return model
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train modernized VQ-VAE (v2) model.")
-    parser.add_argument(
-        "--config",
-        type=str,
-        required=True,
-        help="Path to YAML training configuration file.",
-    )
-    args, unknown = parser.parse_known_args()
+def _parse_overrides(unknown: list[str]) -> dict[str, object]:
+    """Parse ``--section.key value`` overrides, value-typed via YAML."""
+    import yaml
 
-    # Parse dotted section.key overrides from unknown arguments
-    overrides = {}
+    overrides: dict[str, object] = {}
     i = 0
     while i < len(unknown):
         arg = unknown[i]
-        if arg.startswith("--"):
-            dotted = arg[2:]
-            if i + 1 < len(unknown):
-                val_str = unknown[i + 1]
-                # Parse with YAML so ints/floats/bools/null/lists (e.g. "[8,5,5,5]") are
-                # handled uniformly; fall back to the raw string on a parse error.
-                try:
-                    val = yaml.safe_load(val_str)
-                except yaml.YAMLError:
-                    val = val_str
-                overrides[dotted] = val
-                i += 2
-            else:
-                overrides[dotted] = True
-                i += 1
+        if arg.startswith("--") and i + 1 < len(unknown):
+            try:
+                value: object = yaml.safe_load(unknown[i + 1])
+            except yaml.YAMLError:
+                value = unknown[i + 1]
+            overrides[arg[2:]] = value
+            i += 2
+        elif arg.startswith("--"):
+            overrides[arg[2:]] = True
+            i += 1
         else:
             i += 1
+    return overrides
 
-    # Load configuration file
+
+def main() -> None:
+    """CLI entrypoint: ``python -m tdi.v2 train --config ... [--section.key value ...]``."""
+    parser = argparse.ArgumentParser(description="Train the single-path v2 alphabet model.")
+    parser.add_argument("--config", type=str, required=True, help="Path to a YAML config file.")
+    parser.add_argument(
+        "--quantizer", type=str, choices=["vq", "fsq"], help="Convenience for model.quantizer."
+    )
+    parser.add_argument("--out", type=str, help="Convenience for outputs.out_dir.")
+    args, unknown = parser.parse_known_args()
+
+    overrides = _parse_overrides(unknown)
+    if args.quantizer is not None:
+        overrides["model.quantizer"] = args.quantizer
+    if args.out is not None:
+        overrides["outputs.out_dir"] = args.out
+
     cfg = load_train_config(args.config, overrides)
     train_model(cfg)
 
