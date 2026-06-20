@@ -72,7 +72,7 @@ def validate_dataset(
             f"{len(errors)} CIGAR validation error(s); first {min(10, len(errors))}:\n{preview}"
         )
 
-    bad_structures = int((structures["parse_status"] != "ok").sum())
+    bad_structures = (structures["parse_status"] != "ok").sum()
     return {
         "n_structures": len(structures),
         "n_structures_not_ok": bad_structures,
