@@ -133,6 +133,15 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
     )
     val_loader = DataLoader(val_dataset, batch_size=cfg.train.batch_size, shuffle=False)
 
+    # drop_last=True yields zero batches (and a barely-initialized export) when the training
+    # set is smaller than one batch; fail loudly instead.
+    if len(train_loader) == 0:
+        raise ValueError(
+            f"Training set has {len(train_dataset)} examples and batch_size="
+            f"{cfg.train.batch_size} with drop_last=True, producing zero batches. "
+            "Lower batch_size or provide more training data."
+        )
+
     input_dim = x_train_raw.shape[1]
     model = AlphabetModel(
         input_dim=input_dim,
@@ -146,6 +155,7 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
         commitment_cost=cfg.model.commitment_cost,
         min_count=cfg.model.min_count,
         l2_normalize=cfg.model.l2_normalize,
+        replacement_warmup_steps=cfg.model.replacement_warmup_steps,
     )
 
     # One-shot k-means codebook init on the VQ path (no-op for FSQ).

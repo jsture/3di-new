@@ -183,25 +183,30 @@ def main() -> None:
     # Subcommand evaluate
     eval_parser = subparsers.add_parser("evaluate", help="Evaluate trained model on alignments.")
     eval_parser.add_argument(
-        "--model_dir", type=str, required=True, help="Path to exported model folder."
+        "--model-dir", "--model_dir", type=str, required=True, help="Path to exported model folder."
     )
     eval_parser.add_argument(
-        "--pdb_dir", type=str, required=True, help="Directory containing PDB files."
+        "--pdb-dir", "--pdb_dir", type=str, required=True, help="Directory containing PDB files."
     )
     eval_parser.add_argument(
         "--pairfile", type=str, required=True, help="Path to structural alignment pairfile."
     )
     eval_parser.add_argument(
-        "--out_dir", type=str, required=True, help="Output directory to save evaluation results."
+        "--out-dir",
+        "--out_dir",
+        type=str,
+        required=True,
+        help="Output directory to save evaluation results.",
     )
     eval_parser.add_argument(
         "--virt",
         type=float,
         nargs=3,
-        required=True,
-        help="Virtual center parameters (alpha, beta, d).",
+        default=None,
+        help="Virtual center (alpha, beta, d). Optional: defaults to the model config's value.",
     )
     eval_parser.add_argument(
+        "--invalid-state",
         "--invalid_state",
         type=str,
         default=None,

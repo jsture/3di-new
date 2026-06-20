@@ -37,7 +37,7 @@ def predict(
     Optional feature standardization statistics can be provided.
 
     Args:
-        model: Trained encoder neural network or LightningModule.
+        model: Trained encoder network or ``AlphabetModel``.
         x: Input feature array (shape: (N, 10)).
         mean: Scaling mean array.
         std: Scaling standard deviation array.
@@ -77,7 +77,7 @@ def discretize(
     """Discretize continuous coordinates to indices of the nearest centroid or level.
 
     Args:
-        model: Trained encoder model or LightningModule.
+        model: Trained encoder model or ``AlphabetModel``.
         centroids: Embedding centroid vectors (shape: (K, Z)) or None for FSQ.
         x: Input features (shape: (N, 10)).
         mean: Scaling mean array.

@@ -172,6 +172,9 @@ class EMAVectorQuantizer(nn.Module):
         if self.training:
             self.step_counter += 1
             counts = encodings.sum(dim=0)
+            # Intentional: accumulate raw (unnormalized) latents. The codebook is re-projected
+            # to the unit sphere below (when l2_normalize), and the commitment loss anchors
+            # ||z|| ~= 1, so raw magnitudes only lightly weight the centroid direction.
             sums = encodings.t() @ z.float().detach()
 
             # Update moving averages
@@ -208,8 +211,12 @@ class EMAVectorQuantizer(nn.Module):
         perplexity = torch.exp(-(usage * (usage + 1e-10).log()).sum())
 
         # Cheap VQ margin diagnostic: gap between the nearest and second-nearest code.
-        d_sorted, _ = distances.sort(dim=-1)
-        margin = (d_sorted[:, 1] - d_sorted[:, 0]).mean()
+        # Needs at least two codes to have a second-nearest.
+        if self.n_states >= 2:
+            d_sorted, _ = distances.sort(dim=-1)
+            margin = (d_sorted[:, 1] - d_sorted[:, 0]).mean()
+        else:
+            margin = torch.zeros((), device=z.device)
 
         # Commitment loss regularizes the encoder toward the (detached) codebook.
         q_loss = self.commitment_cost * F.mse_loss(z, z_q.detach())
@@ -241,6 +248,8 @@ class FSQQuantizer(nn.Module):
             levels: Integer quantization steps per dimension (e.g. [5, 4] for 20 states).
         """
         super().__init__()
+        if not levels or any((not isinstance(level, int)) or level < 2 for level in levels):
+            raise ValueError(f"FSQ levels must be integers >= 2, got {levels!r}")
         self.levels = levels
         self.n_states = int(np.prod(levels))
         self.z_dim = len(levels)
@@ -323,6 +332,7 @@ def make_quantizer(
     commitment_cost: float = 0.25,
     l2_normalize: bool = True,
     min_count: float = 1.0,
+    replacement_warmup_steps: int = 500,
 ) -> EMAVectorQuantizer | FSQQuantizer:
     """Build the selected quantizer behind the shared interface.
 
@@ -336,6 +346,7 @@ def make_quantizer(
         commitment_cost: Commitment penalty multiplier (VQ).
         l2_normalize: Cosine lookup (VQ).
         min_count: Dead-code replacement threshold (VQ).
+        replacement_warmup_steps: Steps before dead-code replacement begins (VQ).
 
     Returns:
         An ``EMAVectorQuantizer`` or ``FSQQuantizer``.
@@ -351,5 +362,6 @@ def make_quantizer(
             commitment_cost=commitment_cost,
             l2_normalize=l2_normalize,
             min_count=min_count,
+            replacement_warmup_steps=replacement_warmup_steps,
         )
     raise ValueError(f"Unknown quantizer: {quantizer!r}")

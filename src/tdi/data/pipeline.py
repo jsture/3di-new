@@ -240,15 +240,16 @@ def build_features(
         The output directory path.
 
     Raises:
-        FileExistsError: If out_dir already contains a manifest and ``force`` is False.
+        FileExistsError: If out_dir is non-empty and ``force`` is False.
     """
     print(f"Loading config from {config_path}...")
     cfg = load_config(config_path, overrides)
     out_dir = Path(cfg.outputs.out_dir)
-    if (out_dir / "manifest.json").exists() and not force:
+    # Refuse any non-empty out_dir, not just one with a manifest: a crashed/partial build
+    # leaves arrays without a manifest, and the next run would silently mix/overwrite them.
+    if out_dir.exists() and any(out_dir.iterdir()) and not force:
         raise FileExistsError(
-            f"{out_dir} already contains a manifest.json; refusing to overwrite "
-            "(pass force=True to override)."
+            f"{out_dir} is not empty; refusing to overwrite (pass force=True to override)."
         )
     out_dir.mkdir(parents=True, exist_ok=True)
 
