@@ -137,7 +137,15 @@ def _process_split(
         "n_final_examples": 0,
     }
 
-    for source_row, sid1, sid2, cigar in alignments:
+    total = len(alignments)
+    print(f"  Processing {total} alignments from {pairfile}...")
+    for idx, (source_row, sid1, sid2, cigar) in enumerate(alignments):
+        if (idx + 1) % 1000 == 0 or idx + 1 == total:
+            print(
+                f"    Progress: {idx + 1}/{total} alignments processed "
+                f"({counts['n_alignments_errored']} errored, "
+                f"{counts['n_alignments_empty']} empty)..."
+            )
         # Record every referenced structure up front (even if its alignment errors or yields
         # no pairs) so the QC table can explain domains that produced no features.
         sids.update([sid1, sid2])
@@ -229,6 +237,7 @@ def build_features(
     Raises:
         FileExistsError: If out_dir already contains a manifest and ``force`` is False.
     """
+    print(f"Loading config from {config_path}...")
     cfg = load_config(config_path, overrides)
     out_dir = Path(cfg.outputs.out_dir)
     if (out_dir / "manifest.json").exists() and not force:
@@ -238,9 +247,11 @@ def build_features(
         )
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    print("Loading SCOP lookup table...")
     scop_lookup = load_scop_lookup(cfg.dataset.scop_lookup)
 
     # 1. Collect all referenced SIDs from the split pairfiles.
+    print("Collecting referenced structure IDs from pairfiles...")
     train_alignments = _read_pairfile(cfg.dataset.train_pairfile)
     val_alignments = _read_pairfile(cfg.dataset.val_pairfile)
     referenced = set()
@@ -249,15 +260,26 @@ def build_features(
     all_sids = sorted(referenced)
 
     # 2. Build the structures table exactly once.
+    print(f"Building structure QC table for {len(all_sids)} unique domains (with cache checks)...")
     structures = build_structures_table(all_sids, cfg.dataset.pdb_dir)
+    bad_structures = (structures["parse_status"] != "ok").sum()
+    # Log progress for structure QC table building phase.
+    print(
+        f"Structure QC table built: {len(structures)} domains checked "
+        f"({bad_structures} failed/missing)."
+    )
 
     # 3. Early CIGAR validation if configured.
     if cfg.preprocessing.validate_cigars:
+        print("Performing early CIGAR validation check...")
         validate_dataset(config_path, overrides=overrides, prebuilt_structures=structures)
+        print("CIGAR validation check passed successfully.")
 
+    print("Processing train split alignments...")
     x_train, y_train, train_meta, train_counts, _train_sids, train_skipped = _process_split(
         cfg, cfg.dataset.train_pairfile, scop_lookup
     )
+    print("Processing validation split alignments...")
     x_val, y_val, val_meta, val_counts, _val_sids, val_skipped = _process_split(
         cfg, cfg.dataset.val_pairfile, scop_lookup
     )
@@ -269,6 +291,7 @@ def build_features(
     y_val = y_val.astype(np.float32, copy=False)
 
     # Standardizer fit on train features only.
+    print("Fitting feature standardizer scaler on train features...")
     mean, std = (
         fit_standardizer(x_train)
         if x_train.size
@@ -283,6 +306,7 @@ def build_features(
     std = std.astype(np.float32, copy=False)
 
     # Write arrays + scaler.
+    print(f"Writing processed feature arrays and scaler to {out_dir}...")
     arrays = {
         "train_x_raw": x_train,
         "train_y_raw": y_train,
@@ -294,6 +318,7 @@ def build_features(
     np.savez(out_dir / "scaler.npz", mean=mean, std=std)
 
     # Pair metadata (one row per final example).
+    print("Writing metadata parquets and skipped alignment lists...")
     train_meta.to_parquet(out_dir / "train_metadata.parquet", index=False)
     val_meta.to_parquet(out_dir / "val_metadata.parquet", index=False)
 
@@ -309,6 +334,7 @@ def build_features(
     structures.to_parquet(out_dir / "structures.parquet", index=False)
 
     # Report (train + validation splits are compiled).
+    print("Compiling reports, datacard, and writing manifest...")
     train_report = report.build_report(train_counts, x_train, train_meta)
     val_report = report.build_report(val_counts, x_val, val_meta)
     report_dict = {
@@ -334,6 +360,7 @@ def build_features(
     with open(out_dir / "DATACARD.md", "w") as f:
         f.write(datacard.render_datacard(manifest, report_dict))
 
+    print("Preprocessing build completed successfully.")
     return out_dir
 
 
