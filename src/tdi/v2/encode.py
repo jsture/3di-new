@@ -36,18 +36,24 @@ def predict(
     Returns:
         Continuous latent representations (shape: (N, Z)).
     """
+    was_training = model.training
     model.eval()
     if mean is not None and std is not None:
         x = training_data.transform(x, mean, std)
 
-    with torch.no_grad():
-        x_tensor = torch.tensor(x, dtype=torch.float32)
-        # Access encoder depending on model type
-        if isinstance(model, TdiV2Model):
-            encoder = model.encoder
-        else:
-            encoder = model
-        return encoder.forward(x_tensor).detach().cpu().numpy()
+    try:
+        with torch.no_grad():
+            x_tensor = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32))
+            # Access encoder depending on model type
+            if isinstance(model, TdiV2Model):
+                encoder = model.encoder
+            else:
+                encoder = model
+            return encoder.forward(x_tensor).detach().cpu().numpy()
+    finally:
+        # Restore prior mode so this library helper has no lasting side effect.
+        if was_training:
+            model.train()
 
 
 def discretize(

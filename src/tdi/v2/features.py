@@ -86,10 +86,8 @@ def get_atom_coordinates(
         # Find or approximate Beta carbon coordinate
         cb_atoms = [atom for atom in res if atom.name == "CB"]
         if res.resname != "GLY" and cb_atoms:
-            if len(cb_atoms) == 1:
-                coords[i, 3:6] = cb_atoms[0].coord
-            if verbose:
-                print(f"No CB found [{i}]")
+            # Use the first CB (handles alternate-location duplicates instead of dropping).
+            coords[i, 3:6] = cb_atoms[0].coord
         else:
             # Approximate CB for Glycine or missing CB residues
             n_atoms = [atom for atom in res if atom.name == "N"]
@@ -265,7 +263,9 @@ def calc_angles_forloop(
     n_res = coords.shape[0]
     out = np.full((n_res, 9), np.nan, dtype=np.float32)
 
-    # Exclude boundary residues which lack sequence neighbors for directions
+    # Exclude boundary residues which lack sequence neighbors for directions.
+    # Note: find_nearest_residues forces the first/last columns to inf, so the partner
+    # j is always in [1, n_res - 2]; this keeps j-1 / j+1 below in bounds.
     for i in range(1, n_res - 1):
         if valid_mask[i - 1] and valid_mask[i] and valid_mask[i + 1]:
             j = partner_idx[i]
@@ -332,7 +332,9 @@ def move_CB(
         a = cb - ca
         b = n_atm - ca
         cross_prod = np.cross(a, b)
-        k = cross_prod / np.linalg.norm(cross_prod, axis=1, keepdims=True)
+        # Floor the norm to avoid divide-by-zero on degenerate (collinear) geometry.
+        cross_norm = np.maximum(np.linalg.norm(cross_prod, axis=1, keepdims=True), 1e-8)
+        k = cross_prod / cross_norm
 
         v = (
             v * np.cos(alpha)
