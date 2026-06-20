@@ -195,7 +195,7 @@ def train_model(cfg: TrainConfig) -> None:
         quantizer_type=quantizer_type,
         fsq_levels=cfg.model.fsq_levels,
         decay=cfg.quantizer.decay,
-        eps=1e-5,  # smooth epsilon
+        eps=cfg.quantizer.eps,
         commitment_cost=cfg.quantizer.commitment_cost,
         l2_normalize=cfg.quantizer.l2_normalize,
         min_count=cfg.quantizer.min_count,
@@ -311,20 +311,12 @@ def main() -> None:
             dotted = arg[2:]
             if i + 1 < len(unknown):
                 val_str = unknown[i + 1]
-                if val_str.lower() == "true":
-                    val = True
-                elif val_str.lower() == "false":
-                    val = False
-                elif val_str.lower() in ("null", "none"):
-                    val = None
-                else:
-                    try:
-                        if "." in val_str:
-                            val = float(val_str)
-                        else:
-                            val = int(val_str)
-                    except ValueError:
-                        val = val_str
+                # Parse with YAML so ints/floats/bools/null/lists (e.g. "[8,5,5,5]") are
+                # handled uniformly; fall back to the raw string on a parse error.
+                try:
+                    val = yaml.safe_load(val_str)
+                except yaml.YAMLError:
+                    val = val_str
                 overrides[dotted] = val
                 i += 2
             else:
