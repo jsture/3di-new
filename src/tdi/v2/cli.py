@@ -7,8 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .encode import LETTERS, process_pdb
-from .model import TdiV2Model
+from .encode import process_pdb
+from .model import AlphabetModel
 from .submat import accumulate_counts, calc_alphabet_mi, write_mat
 from .util import parse_pairfile_line, resolve_pdb_path
 
@@ -20,20 +20,25 @@ def run_evaluate(args: argparse.Namespace) -> None:
 
     # 1. Load exported model and feature standardizer scaler
     print(f"Loading exported model from {args.model_dir}...")
-    model, mean, std = TdiV2Model.load_from_export(args.model_dir)
+    model, mean, std = AlphabetModel.load(args.model_dir)
 
-    if model.n_states > len(LETTERS):
+    if model.n_states > len(model.letters):
         raise ValueError(
-            f"Model has {model.n_states} states, but only {len(LETTERS)} letters are available "
-            f"in the letters alphabet definition."
+            f"Model has {model.n_states} states, but only {len(model.letters)} letters are "
+            f"available in the alphabet definition."
         )
 
     # Resolve virtual center from args or config
     if args.virt is not None:
-        virt_cb = (args.virt[0], args.virt[1], args.virt[2])
+        virt_cb: tuple[float, float, float] = (
+            float(args.virt[0]),
+            float(args.virt[1]),
+            float(args.virt[2]),
+        )
     elif getattr(model, "virtual_center", None) is not None:
-        assert model.virtual_center is not None
-        virt_cb = tuple(model.virtual_center)
+        vc = model.virtual_center
+        assert vc is not None
+        virt_cb = (float(vc[0]), float(vc[1]), float(vc[2]))
     else:
         raise ValueError("Virtual center not found in model config, and --virt was not provided.")
 
@@ -99,7 +104,7 @@ def run_evaluate(args: argparse.Namespace) -> None:
 
     # 5. Accumulate transition count matrices
     n_states = model.n_states
-    alphabet = LETTERS[:n_states]
+    alphabet = model.letters[:n_states]
     letter2idx = {char: i for i, char in enumerate(alphabet)}
 
     print("Accumulating transition counts from alignments...")
@@ -199,8 +204,8 @@ def main() -> None:
     eval_parser.add_argument(
         "--invalid_state",
         type=str,
-        default="X",
-        help="State used to represent invalid coordinates.",
+        default=None,
+        help="State for invalid coordinates (defaults to the model config's invalid_state).",
     )
 
     args = parser.parse_args()

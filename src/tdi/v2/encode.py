@@ -11,10 +11,7 @@ import torch
 import torch.nn as nn
 
 from . import features, training_data
-from .model import TdiV2Model
-
-# 50 unique letters defining the structural alphabet states (excluding X/x)
-LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWYZabcdefghijklmnopqrstuvwyz"
+from .model import LETTERS, AlphabetModel
 
 
 def _model_device(model: nn.Module) -> torch.device:
@@ -23,8 +20,6 @@ def _model_device(model: nn.Module) -> torch.device:
     Inputs are moved here before the forward pass so encoding runs on the GPU when the model
     is on one, while staying on CPU by default (the CLI must run without a GPU).
     """
-    if isinstance(model, TdiV2Model):
-        return model.device
     try:
         return next(model.parameters()).device
     except StopIteration:
@@ -61,7 +56,7 @@ def predict(
                 _model_device(model)
             )
             # Access encoder depending on model type
-            if isinstance(model, TdiV2Model):
+            if isinstance(model, AlphabetModel):
                 encoder = model.encoder
             else:
                 encoder = model
@@ -91,8 +86,8 @@ def discretize(
     Returns:
         Indices of the closest states/centroids for each residue (shape: (N,)).
     """
-    # If the model has encode_states method (TdiV2Model), use it directly
-    if isinstance(model, TdiV2Model):
+    # If the model has encode_states method (AlphabetModel), use it directly
+    if isinstance(model, AlphabetModel):
         if mean is not None and std is not None:
             x = training_data.transform(x, mean, std)
         x_tensor = torch.tensor(x, dtype=torch.float32).to(_model_device(model))
@@ -115,40 +110,49 @@ def process_pdb(
     centroids: np.ndarray | None,
     pdb_dir: str,
     virt: tuple[float, float, float],
-    invalid_state: str,
+    invalid_state: str | None = None,
     mean: np.ndarray | None = None,
     std: np.ndarray | None = None,
 ) -> tuple[str, str]:
     """Extract, discretize and convert PDB structure coordinates to sequence.
 
+    The alphabet (``letters``) and ``invalid_state`` are read from the model when it is an
+    ``AlphabetModel`` (so they come from the export's self-describing config), falling back to
+    the module default for a bare encoder.
+
     Args:
         fn: Filename of the PDB domain.
-        encoder: Loaded encoder network or TdiV2Model.
+        encoder: Loaded encoder network or AlphabetModel.
         centroids: Discretization centroid coordinates (None for FSQ).
         pdb_dir: Directory containing PDB files.
         virt: Virtual CB center parameter tuple (alpha, beta, d).
-        invalid_state: Character symbol used to represent invalid residues.
+        invalid_state: Override for the invalid-residue character (else taken from the model).
         mean: Scaling mean array.
         std: Scaling standard deviation array.
 
     Returns:
         A tuple of (basename of PDB, sequence of 3Di states).
     """
+    letters: str = getattr(encoder, "letters", LETTERS)
+    invalid: str = (
+        invalid_state if invalid_state is not None else getattr(encoder, "invalid_state", "X")
+    )
+
     pdb_path = str(Path(pdb_dir) / fn)
     feat, mask = training_data.encoder_features(pdb_path, virt)
 
     # Map descriptors to discrete states
     valid_states = discretize(encoder, centroids, feat[mask], mean, std)
 
-    if len(valid_states) > 0 and np.max(valid_states) >= len(LETTERS):
+    if len(valid_states) > 0 and np.max(valid_states) >= len(letters):
         raise ValueError(
             f"State index {np.max(valid_states)} exceeds available alphabet letters "
-            f"(len={len(LETTERS)})."
+            f"(len={len(letters)})."
         )
 
     states = np.full(len(mask), -1)
     states[mask] = valid_states
 
     # Convert numeric state IDs to alphabet letters
-    seq = "".join(LETTERS[state] if state != -1 else invalid_state for state in states)
+    seq = "".join(letters[state] if state != -1 else invalid for state in states)
     return Path(fn).name, seq
