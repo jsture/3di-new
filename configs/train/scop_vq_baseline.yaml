@@ -39,5 +39,6 @@ data:
   descriptor_jitter_std: 0.0
   sampler: random
   alignments_per_batch: null
+  num_workers: 4
 outputs:
   out_dir: outputs/models/scop_vq_baseline_seed42

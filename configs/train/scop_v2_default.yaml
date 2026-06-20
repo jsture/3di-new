@@ -39,5 +39,6 @@ data:
   descriptor_jitter_std: 0.0
   sampler: alignment_balanced
   alignments_per_batch: 64
+  num_workers: 4
 outputs:
   out_dir: outputs/models/scop_v2_default_seed1

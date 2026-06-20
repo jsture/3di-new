@@ -87,6 +87,7 @@ class DataSplitConfig:
     descriptor_jitter_std: float = 0.0
     sampler: str = "alignment_balanced"
     alignments_per_batch: int | None = 64
+    num_workers: int = 0
 
 
 @dataclass
