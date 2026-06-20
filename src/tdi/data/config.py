@@ -55,6 +55,9 @@ class PreprocessingConfig:
     fail_on_skipped_alignments: bool = False
     max_skipped_fraction: float = 0.01
     validate_cigars: bool = True
+    # Off by default: the seq-separation and Ca-distance histograms are the only optional,
+    # heavier report sections; enable with --full-report when the extra diagnostics are wanted.
+    full_report: bool = False
 
 
 @dataclass
