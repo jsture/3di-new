@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+from typing import Any
 
 import lightning as L
 import numpy as np
@@ -17,7 +18,7 @@ from tdi.v2.train_config import TrainConfig, load_train_config
 from tdi.v2.training_data import AlignmentBatchSampler, PairDataset
 
 
-def _load_alignment_ids(data_dir: str | Path, n_rows: int) -> np.ndarray | None:
+def _load_alignment_ids(data_dir: str | Path, n_rows: int) -> np.ndarray[tuple[int], Any] | None:
     """Load per-row alignment ids from a metadata parquet if present and row-aligned.
 
     Args:
@@ -132,11 +133,15 @@ def train_model(cfg: TrainConfig) -> None:
                 "not found/mismatched; using random sampler."
             )
 
+    # Determine if workers should persist (only valid when num_workers > 0)
+    persistent = cfg.data.num_workers > 0
+
     if sampler is not None:
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=sampler,
             num_workers=cfg.data.num_workers,
+            persistent_workers=persistent,
         )
     else:
         train_loader = DataLoader(
@@ -144,6 +149,7 @@ def train_model(cfg: TrainConfig) -> None:
             batch_size=cfg.training.batch_size,
             shuffle=True,
             num_workers=cfg.data.num_workers,
+            persistent_workers=persistent,
         )
 
     val_loader = DataLoader(
@@ -151,6 +157,7 @@ def train_model(cfg: TrainConfig) -> None:
         batch_size=cfg.training.batch_size,
         shuffle=False,
         num_workers=cfg.data.num_workers,
+        persistent_workers=persistent,
     )
 
     # Initialize TdiV2Model
