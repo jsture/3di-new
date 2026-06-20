@@ -95,6 +95,33 @@ def _kmeans(x: torch.Tensor, n_clusters: int, seed: int = 0) -> torch.Tensor:
     return centers
 
 
+def _quantizer_distances(
+    z: torch.Tensor, codebook: torch.Tensor, l2_normalize: bool
+) -> torch.Tensor:
+    """Squared (cosine when ``l2_normalize``) distances between latents and codebook.
+
+    Always computed in fp32 with autocast disabled so the deterministic inference path
+    (``encode_states``) and the validation margin match the fp32 math used during EMA
+    training, even under bf16 autocast.
+
+    Args:
+        z: Latent tensor of shape (N, z_dim).
+        codebook: Codebook tensor of shape (K, z_dim).
+        l2_normalize: If True, normalize both sides (cosine distance).
+
+    Returns:
+        Distance matrix of shape (N, K), in fp32.
+    """
+    with torch.autocast(device_type=z.device.type, enabled=False):
+        z32 = z.float()
+        cb = codebook.float()
+        if l2_normalize:
+            z32 = F.normalize(z32, dim=-1)
+            cb = F.normalize(cb, dim=-1)
+        # Distance computation: d = x^2 + y^2 - 2xy
+        return z32.pow(2).sum(dim=-1, keepdim=True) + cb.pow(2).sum(dim=-1) - 2.0 * z32 @ cb.t()
+
+
 class EMAVectorQuantizer(nn.Module):
     """Vector Quantizer using Exponential Moving Average (EMA) codebook updates.
 
@@ -153,7 +180,7 @@ class EMAVectorQuantizer(nn.Module):
         self.register_buffer("initialized", torch.tensor(False))
 
     @torch.no_grad()
-    def init_codebook(self, z: torch.Tensor) -> None:
+    def init_codebook(self, z: torch.Tensor, seed: int = 0) -> None:
         """Seed the codebook from k-means of real encoder outputs.
 
         Replaces random init so early code usage is non-arbitrary. Runs k-means in the
@@ -161,11 +188,12 @@ class EMAVectorQuantizer(nn.Module):
 
         Args:
             z: Encoder outputs of shape (N, z_dim).
+            seed: Fixed seed for reproducible k-means centroid initialization.
         """
         features = F.normalize(z, dim=-1) if self.l2_normalize else z
         features = features.detach().to(self.embedding.dtype)
 
-        centers = _kmeans(features, self.n_states, seed=0)
+        centers = _kmeans(features, self.n_states, seed=seed)
 
         self.embedding.copy_(centers)
         self.ema_sum.copy_(centers)
@@ -186,19 +214,7 @@ class EMAVectorQuantizer(nn.Module):
         # Distance lookup, one-hot, and EMA updates must stay fp32 (codebook math).
         with torch.autocast(device_type=z.device.type, enabled=False):
             z32 = z.float()
-            if self.l2_normalize:
-                z_lookup = F.normalize(z32, dim=-1)
-                codebook = F.normalize(self.embedding, dim=-1)
-            else:
-                z_lookup = z32
-                codebook = self.embedding
-
-            # Distance computation: d = x^2 + y^2 - 2xy
-            distances = (
-                z_lookup.pow(2).sum(dim=-1, keepdim=True)
-                + codebook.pow(2).sum(dim=-1)
-                - 2.0 * z_lookup @ codebook.t()
-            )
+            distances = _quantizer_distances(z32, self.embedding, self.l2_normalize)
             indices = distances.argmin(dim=-1)
 
             # Encodings matrix
@@ -450,6 +466,9 @@ class TdiV2Model(L.LightningModule):
         aux_ramp_epochs: int = 1,
         loss_type: str = "smooth_l1",
         kmeans_init: bool = True,
+        kmeans_init_batches: int = 8,
+        kmeans_seed: int = 0,
+        kmeans_max_samples: int | None = None,
         gradient_mode: str = "rotation_trick",
     ) -> None:
         """Initialize the TdiV2Model.
@@ -480,6 +499,9 @@ class TdiV2Model(L.LightningModule):
                 quantization begins.
             loss_type: "smooth_l1" or "gaussian_nll".
             kmeans_init: Whether to run k-means initialization of codebook.
+            kmeans_init_batches: Number of dataloader batches accumulated for k-means init.
+            kmeans_seed: Fixed seed for reproducible k-means centroids.
+            kmeans_max_samples: Optional cap on latents fed to k-means (subsampled if exceeded).
             gradient_mode: Gradient mode ("ste" or "rotation_trick").
         """
         super().__init__()
@@ -509,6 +531,9 @@ class TdiV2Model(L.LightningModule):
         self.aux_ramp_epochs = aux_ramp_epochs
         self.loss_type = loss_type
         self.kmeans_init = kmeans_init
+        self.kmeans_init_batches = kmeans_init_batches
+        self.kmeans_seed = kmeans_seed
+        self.kmeans_max_samples = kmeans_max_samples
         self.gradient_mode = gradient_mode
 
         # Initialize core encoder and decoder blocks
@@ -571,22 +596,12 @@ class TdiV2Model(L.LightningModule):
             Tensor of indices of shape (N,).
         """
         z = self.encoder(x)
-        if isinstance(self.quantizer, EMAVectorQuantizer):
-            if self.quantizer.l2_normalize:
-                z_lookup = F.normalize(z, dim=-1)
-                codebook = F.normalize(self.quantizer.embedding, dim=-1)
-            else:
-                z_lookup = z
-                codebook = self.quantizer.embedding
-        else:
+        if not isinstance(self.quantizer, EMAVectorQuantizer):
             _, indices = self.quantizer.quantize(z)
             return indices
 
-        distances = (
-            z_lookup.pow(2).sum(dim=-1, keepdim=True)
-            + codebook.pow(2).sum(dim=-1)
-            - 2.0 * z_lookup @ codebook.t()
-        )
+        # fp32 lookup (shared helper) so this deterministic path matches EMA training.
+        distances = _quantizer_distances(z, self.quantizer.embedding, self.quantizer.l2_normalize)
         return distances.argmin(dim=-1)
 
     @torch.no_grad()
@@ -605,7 +620,7 @@ class TdiV2Model(L.LightningModule):
     def init_codebook_from_data(
         self,
         loader: torch.utils.data.DataLoader[tuple[torch.Tensor, torch.Tensor]],
-        n_batches: int = 8,
+        n_batches: int | None = None,
     ) -> None:
         """Seed the EMA-VQ codebook from k-means of real encoder outputs.
 
@@ -615,10 +630,13 @@ class TdiV2Model(L.LightningModule):
 
         Args:
             loader: DataLoader yielding (x, y) pairs of scaled features.
-            n_batches: Number of batches to accumulate for k-means.
+            n_batches: Number of batches to accumulate (defaults to ``kmeans_init_batches``).
         """
         if not isinstance(self.quantizer, EMAVectorQuantizer):
             return
+
+        if n_batches is None:
+            n_batches = self.kmeans_init_batches
 
         was_training = self.training
         self.eval()
@@ -633,7 +651,17 @@ class TdiV2Model(L.LightningModule):
 
         if not zs:
             return
-        self.quantizer.init_codebook(torch.cat(zs, dim=0))
+        z = torch.cat(zs, dim=0)
+
+        # Optionally cap the number of latents fed to k-means (reproducible subsample).
+        if self.kmeans_max_samples is not None and z.shape[0] > self.kmeans_max_samples:
+            gen = torch.Generator(device=z.device).manual_seed(self.kmeans_seed)
+            idx = torch.randperm(z.shape[0], generator=gen, device=z.device)[
+                : self.kmeans_max_samples
+            ]
+            z = z[idx]
+
+        self.quantizer.init_codebook(z, seed=self.kmeans_seed)
 
     def on_train_epoch_start(self) -> None:
         """Seed the codebook from warmed-up latents exactly at the warmup boundary.
@@ -653,13 +681,23 @@ class TdiV2Model(L.LightningModule):
             self.init_codebook_from_data(loader)
 
     def _aux_ramp(self) -> float:
-        """Auxiliary-loss ramp factor: 0 during warmup, rising to 1 over aux_ramp_epochs."""
+        """Auxiliary-loss ramp factor: 0 during warmup, rising to 1 over aux_ramp_epochs.
+
+        Note: at the first quantized epoch the ramp is still 0, so commitment/usage/contrast
+        contribute nothing that epoch while the EMA codebook already updates inside the
+        quantizer (gated by ``self.training``, not by the ramp). This is intentional.
+        """
         if self.current_epoch < self.quantizer_warmup_epochs:
             return 0.0
         progress = (self.current_epoch - self.quantizer_warmup_epochs) / max(
             1, self.aux_ramp_epochs
         )
         return min(1.0, max(0.0, progress))
+
+    @property
+    def _can_log(self) -> bool:
+        """True when attached to a trainer with an active results collection (safe to log)."""
+        return self._trainer is not None and getattr(self._trainer, "_results", None) is not None
 
     def forward(self, x: torch.Tensor, quantize: bool = True) -> dict[str, torch.Tensor]:
         """Standard model pass returning latent projections and losses.
@@ -770,7 +808,7 @@ class TdiV2Model(L.LightningModule):
 
         # Log every objective term + per-feature-group reconstruction (catches the model
         # fitting the easy sequence dims while ignoring angular geometry).
-        if self._trainer is not None and getattr(self._trainer, "_results", None) is not None:
+        if self._can_log:
             with torch.no_grad():
                 recon_angles = F.smooth_l1_loss(
                     mu_partner[:, 0:7].contiguous(), y[:, 0:7].contiguous()
@@ -828,16 +866,8 @@ class TdiV2Model(L.LightningModule):
 
         # Margin calculation
         if isinstance(self.quantizer, EMAVectorQuantizer):
-            codebook = self.quantizer.embedding
-            if self.quantizer.l2_normalize:
-                z_lookup = F.normalize(z, dim=-1)
-                codebook = F.normalize(codebook, dim=-1)
-            else:
-                z_lookup = z
-            distances = (
-                z_lookup.pow(2).sum(dim=-1, keepdim=True)
-                + codebook.pow(2).sum(dim=-1)
-                - 2.0 * z_lookup @ codebook.t()
+            distances = _quantizer_distances(
+                z, self.quantizer.embedding, self.quantizer.l2_normalize
             )
             d_sorted, _ = distances.sort(dim=-1)
             margin = d_sorted[:, 1] - d_sorted[:, 0]
@@ -920,7 +950,7 @@ class TdiV2Model(L.LightningModule):
         val_score = -mean_loss.item() + 0.05 * normalized_entropy - 0.10 * dead_state_fraction
 
         # Log pooled statistics
-        if self._trainer is not None and getattr(self._trainer, "_results", None) is not None:
+        if self._can_log:
             self.log("val_partner_loss", mean_loss, prog_bar=True)
             self.log("val_perplexity", mean_perp, prog_bar=True)
             self.log("val_stability", mean_stab)
@@ -966,13 +996,23 @@ class TdiV2Model(L.LightningModule):
             "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
         }
 
-    def export_model(self, out_dir: Path | str, mean: np.ndarray, std: np.ndarray) -> None:
+    def export_model(
+        self,
+        out_dir: Path | str,
+        mean: np.ndarray,
+        std: np.ndarray,
+        virtual_center: tuple[float, float, float] | list[float] | None = None,
+        max_ca_dist: float | None = None,
+    ) -> None:
         """Export state dict, scaler configuration, and centroids to storage.
 
         Args:
             out_dir: Output directory path.
             mean: Feature scaler mean statistics.
             std: Feature scaler standard deviation statistics.
+            virtual_center: The (alpha, beta, d) used when building the features, for
+                provenance. Written as ``null`` when unknown rather than fabricated.
+            max_ca_dist: The Ca-Ca distance filter used at build time, if known.
         """
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
@@ -980,7 +1020,8 @@ class TdiV2Model(L.LightningModule):
         # Save encoder parameters
         torch.save(self.encoder.state_dict(), out_path / "encoder_state_dict.pt")
 
-        # Save config params
+        # Save config params. Provenance fields are recorded only when known so the
+        # exported config never claims a virtual center / filter that was not used.
         config = {
             "input_dim": self.input_dim,
             "hidden_dim": self.hidden_dim,
@@ -992,7 +1033,8 @@ class TdiV2Model(L.LightningModule):
             "l2_normalize": getattr(self.quantizer, "l2_normalize", False),
             "gradient_mode": getattr(self.quantizer, "gradient_mode", "rotation_trick"),
             "feature_convention": "seq_delta_j_minus_i",
-            "virtual_center": [270.0, 0.0, 2.0],
+            "virtual_center": list(virtual_center) if virtual_center is not None else None,
+            "max_ca_dist": max_ca_dist,
         }
         with open(out_path / "model_config.json", "w") as f:
             json.dump(config, f, indent=2)
@@ -1067,38 +1109,3 @@ class TdiV2Model(L.LightningModule):
 
         model.eval()
         return model, mean_arr, std_arr
-
-
-def create_vqvae(
-    seed: int,
-    input_dim: int,
-    hidden_dim: int,
-    z_dim: int,
-    n_states: int,
-    quantizer_type: str = "vq",
-    loss_type: str = "smooth_l1",
-) -> TdiV2Model:
-    """Instantiate and initialize TdiV2Model with a fixed random seed.
-
-    Args:
-        seed: Random seed.
-        input_dim: Feature width.
-        hidden_dim: Projection MLP width.
-        z_dim: Continuous latent space width.
-        n_states: Discrete states count.
-        quantizer_type: "vq" or "fsq".
-        loss_type: "smooth_l1" or "gaussian_nll".
-
-    Returns:
-        Configured TdiV2Model.
-    """
-    torch.manual_seed(seed)
-    L.seed_everything(seed)
-    return TdiV2Model(
-        input_dim=input_dim,
-        hidden_dim=hidden_dim,
-        z_dim=z_dim,
-        n_states=n_states,
-        quantizer_type=quantizer_type,
-        loss_type=loss_type,
-    )

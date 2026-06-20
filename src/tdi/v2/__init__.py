@@ -16,7 +16,6 @@ from .model import (
     FSQQuantizer,
     ResidualMLP,
     TdiV2Model,
-    create_vqvae,
 )
 from .training_data import (
     AlignmentBatchSampler,
@@ -38,7 +37,6 @@ __all__ = [
     "approx_c_beta_position",
     "calc_angles",
     "calc_angles_forloop",
-    "create_vqvae",
     "discretize",
     "distance_matrix",
     "encoder_features",
