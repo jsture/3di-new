@@ -71,6 +71,10 @@ def rotation_trick(
 
     # Householder vector for rotating z_norm toward zq_norm.
     # v = z_norm + zq_norm defines the bisector reflection plane (detached basis).
+    # Near-antipodal case: when z_q ~= -z, z_norm + zq_norm -> 0, so v is ill-conditioned.
+    # eps keeps normalize from producing NaN, but the resulting reflection direction is then
+    # arbitrary. This is rare in practice (codebook vectors near-opposite an encoding) and is
+    # left as-is; switch to the straight-through path here if it ever becomes a problem.
     v = F.normalize(z_norm + zq_norm, dim=-1, eps=eps)
 
     # Householder reflection: R(z) = 2 v (v^T z) - z, with v constant. This is linear in
