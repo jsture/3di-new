@@ -1,44 +1,29 @@
+# Random-init "floor": kmeans_init off so the codebook starts random (the comparison baseline).
 model:
+  quantizer: vq
   input_dim: 10
   hidden_dim: 64
   z_dim: 4
   n_states: 20
-  quantizer_type: ema_vq
-  loss_type: smooth_l1
-quantizer:
-  l2_normalize: true
-  decay: 0.99
+  levels: null
+  loss: smooth_l1
   commitment_cost: 0.25
+  decay: 0.99
   min_count: 1.0
-  replacement_warmup_steps: 500
-  gradient_mode: ste
-  kmeans_init: true
-  kmeans_seed: 0
-  kmeans_init_batches: 16
-  kmeans_init_samples: 50000
-loss:
-  lambda_self: 0.0
-  lambda_usage: 0.0
-  lambda_contrast: 0.0
-  temperature: 0.1
-training:
-  batch_size: 512
-  max_epochs: 20
-  quantizer_warmup_epochs: 0
-  aux_ramp_epochs: 1
-  precision: 32-true
-  seed: 42
-  accumulate_grad_batches: 1
-optimizer:
+  l2_normalize: true
+train:
   lr: 0.001
   weight_decay: 0.0001
-  warmup_ratio: 0.03
-  gradient_clip_val: 1.0
+  batch_size: 512
+  max_epochs: 20
+  patience: 5
+  scheduler: none
+  clip_grad_norm: 1.0
+  seed: 42
+  kmeans_init: false
+  kmeans_seed: 0
+  kmeans_init_batches: 8
 data:
   processed_dir: data/processed/scop_ca5_v1
-  descriptor_jitter_std: 0.0
-  sampler: random
-  alignments_per_batch: null
-  num_workers: 4
 outputs:
   out_dir: outputs/models/scop_vq_baseline_seed42
