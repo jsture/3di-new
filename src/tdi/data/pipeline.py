@@ -210,6 +210,12 @@ def build_features(
         cfg, cfg.dataset.val_pairfile, scop_lookup
     )
 
+    # Cast features to float32 to reduce memory footprint and avoid float64 overhead in training
+    x_train = x_train.astype(np.float32, copy=False)
+    y_train = y_train.astype(np.float32, copy=False)
+    x_val = x_val.astype(np.float32, copy=False)
+    y_val = y_val.astype(np.float32, copy=False)
+
     # Standardizer fit on train features only.
     mean, std = (
         fit_standardizer(x_train)
@@ -219,6 +225,10 @@ def build_features(
             np.ones(10, dtype=np.float32),
         )
     )
+
+    # Ensure mean and std are float32
+    mean = mean.astype(np.float32, copy=False)
+    std = std.astype(np.float32, copy=False)
 
     # Write arrays + scaler.
     arrays = {

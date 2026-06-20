@@ -86,7 +86,7 @@ def _kmeans(x: torch.Tensor, n_clusters: int, seed: int = 0) -> torch.Tensor:
     # KMeans requires n_clusters <= n_samples; cap then pad the degenerate case below.
     k = min(n_clusters, points.shape[0])
     kmeans = KMeans(n_clusters=k, random_state=seed, n_init="auto").fit(points)
-    centers = torch.from_numpy(kmeans.cluster_centers_).to(device=x.device, dtype=x.dtype)
+    centers = torch.tensor(kmeans.cluster_centers_, device=x.device, dtype=x.dtype)
 
     # Pad with random points if fewer samples than clusters (degenerate batch).
     if k < n_clusters:
@@ -293,7 +293,7 @@ class FSQQuantizer(nn.Module):
         self.eps = eps
 
         # Coordinate basis coefficients
-        basis = []
+        basis: list[int] = []
         current = 1
         for level in reversed(levels):
             basis.append(current)
@@ -302,7 +302,7 @@ class FSQQuantizer(nn.Module):
         self.register_buffer("implicit_codebook", self._make_implicit_codebook())
 
     def _make_implicit_codebook(self) -> torch.Tensor:
-        grids = []
+        grids: list[torch.Tensor] = []
         for level in self.levels:
             if level % 2 == 1:
                 grid = torch.linspace(-1.0, 1.0, level)
@@ -317,7 +317,7 @@ class FSQQuantizer(nn.Module):
         # Scale to range [-1, 1]
         z_bounded = torch.tanh(z)
 
-        z_q_list = []
+        z_q_list: list[torch.Tensor] = []
         indices = torch.zeros(z.shape[0], dtype=torch.long, device=z.device)
 
         for i, level in enumerate(self.levels):
@@ -384,6 +384,8 @@ class Decoder(nn.Module):
         self.mu_partner = nn.Linear(hidden_dim, input_dim)
         self.mu_self = nn.Linear(hidden_dim, input_dim)
 
+        self.var_partner: nn.Linear | None
+        self.var_self: nn.Linear | None
         if loss_type == "gaussian_nll":
             self.var_partner = nn.Linear(hidden_dim, input_dim)
             self.var_self = nn.Linear(hidden_dim, input_dim)
@@ -556,7 +558,7 @@ class TdiV2Model(L.LightningModule):
         self.register_buffer("feature_std", torch.ones(input_dim))
 
         # Validation outputs collection
-        self.validation_step_outputs = []
+        self.validation_step_outputs: list[dict[str, torch.Tensor]] = []
 
     @torch.no_grad()
     def encode_states(self, x: torch.Tensor) -> torch.Tensor:
@@ -601,7 +603,9 @@ class TdiV2Model(L.LightningModule):
         return self.encode_states(x)
 
     def init_codebook_from_data(
-        self, loader: torch.utils.data.DataLoader, n_batches: int = 8
+        self,
+        loader: torch.utils.data.DataLoader[tuple[torch.Tensor, torch.Tensor]],
+        n_batches: int = 8,
     ) -> None:
         """Seed the EMA-VQ codebook from k-means of real encoder outputs.
 
@@ -618,7 +622,7 @@ class TdiV2Model(L.LightningModule):
 
         was_training = self.training
         self.eval()
-        zs = []
+        zs: list[torch.Tensor] = []
         with torch.no_grad():
             for i, (x, _y) in enumerate(loader):
                 if i >= n_batches:
@@ -655,7 +659,7 @@ class TdiV2Model(L.LightningModule):
         progress = (self.current_epoch - self.quantizer_warmup_epochs) / max(
             1, self.aux_ramp_epochs
         )
-        return float(min(1.0, max(0.0, progress)))
+        return min(1.0, max(0.0, progress))
 
     def forward(self, x: torch.Tensor, quantize: bool = True) -> dict[str, torch.Tensor]:
         """Standard model pass returning latent projections and losses.
@@ -795,7 +799,9 @@ class TdiV2Model(L.LightningModule):
 
         return total_loss
 
-    def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> dict:
+    def validation_step(
+        self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int
+    ) -> dict[str, torch.Tensor]:
         """Execute validation step metrics.
 
         Args:
@@ -837,7 +843,7 @@ class TdiV2Model(L.LightningModule):
             margin = d_sorted[:, 1] - d_sorted[:, 0]
         else:
             z_bounded = torch.tanh(z)
-            margins = []
+            margins: list[torch.Tensor] = []
             for i, level in enumerate(self.quantizer.levels):
                 scale = (level - 1) / 2 if level % 2 == 1 else level / 2
                 if scale > 0:
@@ -1048,15 +1054,16 @@ class TdiV2Model(L.LightningModule):
         mean_arr = np.array(scaler["mean"], dtype=np.float32)
         std_arr = np.array(scaler["std"], dtype=np.float32)
 
-        model.register_buffer("feature_mean", torch.from_numpy(mean_arr))
-        model.register_buffer("feature_std", torch.from_numpy(std_arr))
+        model.register_buffer("feature_mean", torch.tensor(mean_arr))
+        model.register_buffer("feature_std", torch.tensor(std_arr))
 
         if (
             config["quantizer_type"] in ("vq", "ema_vq")
             and (export_path / "centroids.npy").exists()
+            and isinstance(model.quantizer, EMAVectorQuantizer)
         ):
             centroids = np.load(export_path / "centroids.npy")
-            model.quantizer.embedding.data = torch.from_numpy(centroids)
+            model.quantizer.embedding.data = torch.tensor(centroids)
 
         model.eval()
         return model, mean_arr, std_arr

@@ -132,20 +132,24 @@ def train_model(cfg: TrainConfig) -> None:
             )
 
     if sampler is not None:
-        train_loader = DataLoader(train_dataset, batch_sampler=sampler, num_workers=0)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=sampler,
+            num_workers=cfg.data.num_workers,
+        )
     else:
         train_loader = DataLoader(
             train_dataset,
             batch_size=cfg.training.batch_size,
             shuffle=True,
-            num_workers=0,
+            num_workers=cfg.data.num_workers,
         )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.training.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=cfg.data.num_workers,
     )
 
     # Initialize TdiV2Model
