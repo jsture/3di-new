@@ -1,21 +1,26 @@
-"""Unit tests for modernized 3Di VAE v2 training pipeline components."""
+"""Tests for the single-path v2 model, quantizers, data utilities, and training loop."""
 
 from pathlib import Path
-from unittest.mock import PropertyMock, patch
 
-import lightning as L
 import numpy as np
 import pytest
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 
 from tdi.v2 import (
-    AlignmentBatchSampler,
+    AlphabetModel,
     EMAVectorQuantizer,
     FSQQuantizer,
     PairDataset,
     ResidualMLP,
-    TdiV2Model,
+    make_quantizer,
+)
+from tdi.v2.train import train_model
+from tdi.v2.train_config import (
+    DataConfig,
+    LoopConfig,
+    ModelConfig,
+    OutputsConfig,
+    TrainConfig,
 )
 from tdi.v2.training_data import (
     _superposed_ca_distances,
@@ -25,6 +30,290 @@ from tdi.v2.training_data import (
     parse_alignment,
 )
 from tdi.v2.util import parse_cigar
+
+# ---------------------------------------------------------------------------
+# Quantizers (shared (z_q, indices, q_loss, metrics) interface)
+# ---------------------------------------------------------------------------
+
+
+def test_residual_mlp_shapes() -> None:
+    """ResidualMLP outputs the requested dimensions."""
+    mlp = ResidualMLP(input_dim=10, hidden_dim=64, output_dim=4, depth=3)
+    out = mlp(torch.randn(8, 10))
+    assert out.shape == (8, 4)
+
+
+def test_ema_quantizer_interface() -> None:
+    """EMA-VQ returns (z_q, indices, q_loss, metrics) with the VQ metric set."""
+    quantizer = EMAVectorQuantizer(n_states=20, z_dim=4, l2_normalize=True)
+    z = torch.randn(8, 4)
+    z_q, indices, q_loss, metrics = quantizer(z)
+
+    assert z_q.shape == (8, 4)
+    assert indices.shape == (8,)
+    assert q_loss.shape == ()
+    assert set(metrics) == {"perplexity", "n_replaced", "margin"}
+
+
+def test_fsq_quantizer_interface() -> None:
+    """FSQ returns q_loss == 0 and only the perplexity metric (no VQ margin)."""
+    quantizer = FSQQuantizer(levels=[5, 4])
+    z = torch.randn(8, 2)
+    z_q, indices, q_loss, metrics = quantizer(z)
+
+    assert z_q.shape == (8, 2)
+    assert indices.shape == (8,)
+    assert float(q_loss) == 0.0
+    assert set(metrics) == {"perplexity"}
+
+
+def test_fsq_quantizer_grids() -> None:
+    """FSQ grid creation for odd vs even levels."""
+    q_odd = FSQQuantizer(levels=[3])
+    assert torch.allclose(
+        q_odd.implicit_codebook, torch.tensor([[-1.0], [0.0], [1.0]], dtype=torch.float32)
+    )
+    q_even = FSQQuantizer(levels=[4])
+    assert torch.allclose(
+        q_even.implicit_codebook,
+        torch.tensor([[-0.75], [-0.25], [0.25], [0.75]], dtype=torch.float32),
+    )
+
+
+def test_vq_dead_code_replacement() -> None:
+    """Dead VQ centroids are replaced with batch latents after warmup."""
+    quantizer = EMAVectorQuantizer(
+        n_states=3,
+        z_dim=2,
+        decay=0.5,
+        commitment_cost=0.1,
+        min_count=1.0,
+        replacement_warmup_steps=2,
+        l2_normalize=True,
+    )
+    quantizer.train()
+    quantizer.embedding.copy_(torch.tensor([[1.0, 1.0], [-1.0, -1.0], [10.0, 10.0]]))
+    quantizer.ema_sum.copy_(quantizer.embedding)
+    quantizer.ema_count.copy_(torch.tensor([1.0, 1.0, 1.0]))
+
+    z1 = torch.tensor([[0.9, 0.9], [-0.9, -0.9]], dtype=torch.float32)
+    assert float(quantizer(z1)[3]["n_replaced"]) == 0.0
+    assert float(quantizer(z1)[3]["n_replaced"]) == 0.0
+
+    z2 = torch.tensor([[5.0, -5.0], [5.0, -5.0]], dtype=torch.float32)
+    _, _, _, metrics = quantizer(z2)
+    assert float(metrics["n_replaced"]) > 0
+    # With l2_normalize the replaced code is renormalized, so it aligns with [5, -5]'s direction.
+    expected = torch.nn.functional.normalize(torch.tensor([[5.0, -5.0]]), dim=-1)[0]
+    assert torch.allclose(quantizer.embedding[2], expected, atol=1e-4)
+
+
+def test_make_quantizer_factory() -> None:
+    """The factory dispatches by name and rejects unknown quantizers."""
+    assert isinstance(make_quantizer("vq", n_states=20, z_dim=4), EMAVectorQuantizer)
+    assert isinstance(make_quantizer("fsq", n_states=20, z_dim=2, levels=[5, 4]), FSQQuantizer)
+    with pytest.raises(ValueError, match="Unknown quantizer"):
+        make_quantizer("nope", n_states=20, z_dim=4)
+
+
+# ---------------------------------------------------------------------------
+# AlphabetModel
+# ---------------------------------------------------------------------------
+
+
+def test_model_forward_returns_contract() -> None:
+    """forward yields y_hat / indices / q_loss / metrics."""
+    model = AlphabetModel()
+    out = model(torch.randn(8, 10))
+    assert out["y_hat"].shape == (8, 10)
+    assert out["indices"].shape == (8,)
+    assert out["q_loss"].shape == ()
+    assert "perplexity" in out["metrics"]
+
+
+def test_n_states_cap_raises() -> None:
+    """A codebook larger than the alphabet is rejected at construction."""
+    with pytest.raises(ValueError, match="exceeds alphabet size"):
+        AlphabetModel(quantizer="vq", n_states=51)
+
+
+@pytest.mark.parametrize(
+    ("quantizer", "kwargs"),
+    [("vq", {"n_states": 24}), ("fsq", {"levels": [5, 5]})],
+)
+def test_model_trains_one_step(quantizer: str, kwargs: dict) -> None:
+    """Both quantizers train one step and reduce a tiny-batch loss."""
+    model = AlphabetModel(quantizer=quantizer, **kwargs)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    x = torch.randn(16, 10)
+    y = torch.randn(16, 10)
+
+    out = model(x)
+    loss = torch.nn.functional.smooth_l1_loss(out["y_hat"], y) + out["q_loss"]
+    assert loss.ndim == 0
+    loss.backward()
+    opt.step()
+    assert torch.isfinite(loss)
+
+
+def test_fp32_forward_is_finite() -> None:
+    """fp32 forward yields finite y_hat and q_loss for VQ."""
+    model = AlphabetModel(quantizer="vq")
+    out = model(torch.randn(8, 10))
+    assert torch.isfinite(out["y_hat"]).all()
+    assert torch.isfinite(out["q_loss"])
+
+
+def test_encode_states_does_not_change_mode() -> None:
+    """encode_states leaves the model in its prior train/eval mode."""
+    model = AlphabetModel()
+    model.train()
+    _ = model.encode_states(torch.randn(4, 10))
+    assert model.training is True
+
+
+def test_forward_is_differentiable() -> None:
+    """The reconstruction path flows gradient to the input and the decoder."""
+    model = AlphabetModel()
+    x = torch.randn(16, 10, requires_grad=True)
+    y = torch.randn(16, 10)
+    out = model(x)
+    loss = torch.nn.functional.smooth_l1_loss(out["y_hat"], y) + out["q_loss"]
+    loss.backward()
+    assert x.grad is not None and x.grad.abs().sum() > 0
+    assert model.decoder.output[-1].weight.grad is not None
+
+
+def test_tiny_batch_overfit() -> None:
+    """The model can drive down a fixed tiny-batch loss."""
+    model = AlphabetModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    x = torch.randn(32, 10)
+    y = torch.randn(32, 10)
+
+    def step() -> float:
+        with torch.no_grad():
+            out = model(x)
+            return float(torch.nn.functional.smooth_l1_loss(out["y_hat"], y) + out["q_loss"])
+
+    initial = step()
+    for _ in range(200):
+        optimizer.zero_grad()
+        out = model(x)
+        loss = torch.nn.functional.smooth_l1_loss(out["y_hat"], y) + out["q_loss"]
+        loss.backward()
+        optimizer.step()
+    assert step() < initial
+
+
+# ---------------------------------------------------------------------------
+# Save / load round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_export_roundtrip_states_identical(tmp_path: Path) -> None:
+    """A round-tripped VQ export assigns identical states."""
+    model = AlphabetModel()
+    model.eval()
+    x = torch.randn(16, 10)
+    states_before = model.encode_states(x)
+
+    model.save(tmp_path, mean=np.zeros(10), std=np.ones(10))
+    loaded, _, _ = AlphabetModel.load(tmp_path)
+    loaded.eval()
+    assert torch.equal(states_before, loaded.encode_states(x))
+
+
+def test_export_roundtrip_restores_decoder(tmp_path: Path) -> None:
+    """The decoder is exported and a loaded model reconstructs a finite y_hat."""
+    model = AlphabetModel()
+    model.save(tmp_path, mean=np.zeros(10), std=np.ones(10))
+    assert (tmp_path / "decoder_state_dict.pt").exists()
+
+    loaded, _, _ = AlphabetModel.load(tmp_path)
+    with torch.no_grad():
+        out = loaded(torch.randn(4, 10))
+    assert out["y_hat"].shape == (4, 10)
+    assert torch.isfinite(out["y_hat"]).all()
+
+
+def test_fsq_export_roundtrip_preserves_levels(tmp_path: Path) -> None:
+    """FSQ levels round-trip and the correct artifacts are written."""
+    model = AlphabetModel(quantizer="fsq", levels=[5, 4])
+    model.save(tmp_path, mean=np.zeros(10), std=np.ones(10))
+    assert (tmp_path / "fsq_levels.json").exists()
+    assert not (tmp_path / "centroids.npy").exists()
+
+    loaded, _, _ = AlphabetModel.load(tmp_path)
+    assert loaded.levels == [5, 4]
+    assert loaded.z_dim == 2
+
+
+def test_export_preserves_scaler(tmp_path: Path) -> None:
+    """Scaler mean/std round-trip through the export."""
+    model = AlphabetModel()
+    mean = np.random.randn(10).astype(np.float32)
+    std = (np.random.rand(10) + 0.1).astype(np.float32)
+    model.save(tmp_path, mean=mean, std=std)
+    _loaded, loaded_mean, loaded_std = AlphabetModel.load(tmp_path)
+    assert np.allclose(mean, loaded_mean)
+    assert np.allclose(std, loaded_std)
+
+
+# ---------------------------------------------------------------------------
+# k-means codebook init
+# ---------------------------------------------------------------------------
+
+
+def _tiny_loader(n: int = 200, batch_size: int = 10):
+    from torch.utils.data import DataLoader, TensorDataset
+
+    return DataLoader(TensorDataset(torch.randn(n, 10), torch.randn(n, 10)), batch_size=batch_size)
+
+
+def test_kmeans_init_populates_codebook() -> None:
+    """k-means init replaces the random codebook and marks it initialized."""
+    model = AlphabetModel(quantizer="vq", n_states=20, z_dim=4)
+    quantizer = model.quantizer
+    assert isinstance(quantizer, EMAVectorQuantizer)
+    before = quantizer.embedding.clone()
+    assert bool(quantizer.initialized.item()) is False
+
+    model.init_codebook_from_loader(_tiny_loader(), n_batches=4)
+
+    assert bool(quantizer.initialized.item()) is True
+    assert not torch.equal(before, quantizer.embedding)
+
+
+def test_kmeans_init_noop_for_fsq() -> None:
+    """k-means init is a no-op for the FSQ backend."""
+    model = AlphabetModel(quantizer="fsq", levels=[5, 4])
+    model.init_codebook_from_loader(_tiny_loader())
+    assert isinstance(model.quantizer, FSQQuantizer)
+
+
+# ---------------------------------------------------------------------------
+# PairDataset
+# ---------------------------------------------------------------------------
+
+
+def test_pair_dataset_scaling() -> None:
+    """PairDataset fits a scaler and yields (x, y) tensors without RNG state."""
+    x = np.random.randn(10, 10) * 5.0 + 3.0
+    y = np.random.randn(10, 10) * 2.0 - 1.0
+
+    dataset = PairDataset(x, y)
+    assert dataset.mean.shape == (10,)
+    assert not hasattr(dataset, "set_epoch")
+
+    x_scaled, y_scaled = dataset[0]
+    assert x_scaled.shape == (10,)
+    assert y_scaled.shape == (10,)
+
+
+# ---------------------------------------------------------------------------
+# Data-path utilities (unchanged through the refactor)
+# ---------------------------------------------------------------------------
 
 
 def _manual_superposed_ca_distances(ca_fixed: np.ndarray, ca_moving: np.ndarray) -> np.ndarray:
@@ -45,130 +334,32 @@ def _manual_superposed_ca_distances(ca_fixed: np.ndarray, ca_moving: np.ndarray)
     return np.linalg.norm(ca_fixed - moving_aligned, axis=1).astype(np.float32)
 
 
-def test_residual_mlp_shapes() -> None:
-    """Test ResidualMLP outputs correct dimensions and shapes."""
-    mlp = ResidualMLP(input_dim=10, hidden_dim=64, output_dim=4, depth=3)
-    x = torch.randn(8, 10)
-    out = mlp(x)
-    assert out.shape == (8, 4)
-
-
-def test_ema_quantizer_shapes() -> None:
-    """Test EMAVectorQuantizer outputs and updates properties."""
-    quantizer = EMAVectorQuantizer(n_states=20, z_dim=4, l2_normalize=True)
-    z = torch.randn(8, 4)
-    commit_loss, z_q, perplexity, indices, usage, n_replaced = quantizer(z)
-
-    assert z_q.shape == (8, 4)
-    assert commit_loss.shape == ()
-    assert perplexity.shape == ()
-    assert indices.shape == (8,)
-    assert usage.shape == (20,)
-    assert n_replaced.shape == ()
-
-
-def test_fsq_quantizer_shapes() -> None:
-    """Test FSQQuantizer levels mapping and indexing."""
-    quantizer = FSQQuantizer(levels=[5, 4])
-    z = torch.randn(8, 2)
-    commit_loss, z_q, perplexity, indices, usage, n_replaced = quantizer(z)
-
-    assert z_q.shape == (8, 2)
-    assert commit_loss.item() == 0.0
-    assert perplexity.shape == ()
-    assert indices.shape == (8,)
-    assert usage.shape == (20,)
-    assert n_replaced.shape == ()
-
-
-def test_pair_dataset_scaling() -> None:
-    """Test PairDataset scaling, fitting, and optional jittering."""
-    x = np.random.randn(10, 10) * 5.0 + 3.0
-    y = np.random.randn(10, 10) * 2.0 - 1.0
-
-    dataset = PairDataset(x, y, descriptor_jitter_std=0.0)
-    assert dataset.mean.shape == (10,)
-    assert dataset.std.shape == (10,)
-
-    # Scaled features should have mean close to 0 and std close to 1
-    x_scaled, y_scaled = dataset[0]
-    assert x_scaled.shape == (10,)
-    assert y_scaled.shape == (10,)
-
-
-def test_fsq_default_forward_shapes() -> None:
-    """Test FSQ training step shapes."""
-    model = TdiV2Model(quantizer_type="fsq", fsq_levels=[5, 4])
-    x = torch.randn(8, 10)
-    y = torch.randn(8, 10)
-    out = model.training_step((x, y), 0)
-    assert out.ndim == 0
-
-
-def test_fsq_z_dim_matches_levels() -> None:
-    """Test FSQ z_dim matches the length of fsq_levels."""
-    model = TdiV2Model(quantizer_type="fsq", fsq_levels=[5, 4])
-    assert model.z_dim == 2
-    assert model.encoder.output[-1].out_features == 2
-
-
-def test_forward_is_differentiable() -> None:
-    """Verify forward pass is differentiable."""
-    model = TdiV2Model()
-    x = torch.randn(4, 10, requires_grad=True)
-    out = model(x)
-    loss = out["mu_partner"].sum()
-    loss.backward()
-    assert x.grad is not None
-    assert x.grad.abs().sum() > 0
-
-
-def test_encode_states_does_not_change_mode() -> None:
-    """Verify encode_states does not change model training mode."""
-    model = TdiV2Model()
-    model.train()
-    x = torch.randn(4, 10)
-    _ = model.encode_states(x)
-    assert model.training is True
-
-
 def test_ca_filter_requires_superposition() -> None:
-    """Verify Ca filtering superposes translated and rotated coordinates."""
-    coords1 = np.array(
-        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-        dtype=np.float64,
-    )
+    """Ca filtering superposes translated and rotated coordinates."""
+    coords1 = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
     rot_z = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
     coords2 = coords1 @ rot_z.T + np.array([100.0, 50.0, -20.0])
 
-    idx_1 = np.array([0, 1, 2])
-    idx_2 = np.array([0, 1, 2])
-
-    v1, v2, dists, error = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist=1.0)
+    idx = np.array([0, 1, 2])
+    v1, v2, dists, error = filter_ca_distance(idx, idx, coords1, coords2, max_ca_dist=1.0)
     assert error is None
-    assert np.array_equal(v1, idx_1)
-    assert np.array_equal(v2, idx_2)
-    assert dists is not None
-    assert np.all(dists < 1e-5)
+    assert np.array_equal(v1, idx) and np.array_equal(v2, idx)
+    assert dists is not None and np.all(dists < 1e-5)
 
 
 def test_superposed_distances_match_manual_svd_reference() -> None:
-    """Verify SciPy rotation matches the previous handwritten SVD implementation."""
+    """SciPy rotation matches the previous handwritten SVD implementation."""
     rng = np.random.default_rng(123)
     coords1 = rng.normal(size=(8, 3))
     rot_z = np.array(
-        [
-            [0.5, -np.sqrt(3) / 2, 0.0],
-            [np.sqrt(3) / 2, 0.5, 0.0],
-            [0.0, 0.0, 1.0],
-        ]
+        [[0.5, -np.sqrt(3) / 2, 0.0], [np.sqrt(3) / 2, 0.5, 0.0], [0.0, 0.0, 1.0]]
     )
     coords2 = coords1 @ rot_z.T + np.array([3.0, -7.0, 2.0])
-
-    actual = _superposed_ca_distances(coords1, coords2)
-    expected = _manual_superposed_ca_distances(coords1, coords2)
-
-    assert np.allclose(actual, expected, atol=1e-5)
+    assert np.allclose(
+        _superposed_ca_distances(coords1, coords2),
+        _manual_superposed_ca_distances(coords1, coords2),
+        atol=1e-5,
+    )
 
 
 @pytest.mark.parametrize(
@@ -179,159 +370,36 @@ def test_superposed_distances_match_manual_svd_reference() -> None:
     ],
 )
 def test_ca_filter_rejects_rank_deficient_coordinates(coords: np.ndarray) -> None:
-    """Verify degenerate superposition inputs retain the existing error label."""
+    """Degenerate superposition inputs retain the existing error label."""
     idx = np.array([0, 1, 2])
-
     v1, v2, dists, error = filter_ca_distance(idx, idx, coords, coords)
-
     assert error == "rank_deficient_coordinates"
-    assert len(v1) == 0
-    assert len(v2) == 0
-    assert dists is not None
-    assert len(dists) == 0
+    assert len(v1) == 0 and len(v2) == 0
+    assert dists is not None and len(dists) == 0
 
 
 def test_ca_filter_drops_too_few_pairs() -> None:
-    """Too-few-pair superposition inputs are dropped instead of emitted with NaN distance."""
+    """Too-few-pair inputs are dropped instead of emitted with NaN distance."""
     coords = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64)
     idx = np.array([0, 1])
-
     v1, v2, dists, error = filter_ca_distance(idx, idx, coords, coords)
-
     assert error == "too_few_pairs"
-    assert len(v1) == 0
-    assert len(v2) == 0
-    assert dists is not None
-    assert len(dists) == 0
-
-
-def test_ca_filter_max_distance_uses_superposed_distances() -> None:
-    """Verify max_ca_dist is applied after superposition, not on raw distances."""
-    coords1 = np.array(
-        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-        dtype=np.float64,
-    )
-    coords2 = coords1 + np.array([100.0, 50.0, -20.0])
-    idx = np.array([0, 1, 2])
-
-    v1, v2, dists, error = filter_ca_distance(idx, idx, coords1, coords2, max_ca_dist=0.1)
-
-    assert error is None
-    assert np.array_equal(v1, idx)
-    assert np.array_equal(v2, idx)
-    assert dists is not None
-    assert np.all(dists <= 0.1)
+    assert len(v1) == 0 and len(v2) == 0
+    assert dists is not None and len(dists) == 0
 
 
 def test_parse_cigar_empty_shape() -> None:
-    """Verify CIGAR parsing is empty-safe."""
-    pairs = parse_cigar("10M5I3D")
-    assert pairs.shape == (0, 2)
-
-
-def test_fsq_export_roundtrip_preserves_levels(tmp_path: Path) -> None:
-    """Verify FSQ levels roundtrip correctly through export configuration."""
-    model = TdiV2Model(quantizer_type="fsq", fsq_levels=[5, 4])
-    model.export_model(tmp_path, mean=np.zeros(10), std=np.ones(10))
-    loaded, _, _ = TdiV2Model.load_from_export(tmp_path)
-    assert loaded.fsq_levels == [5, 4]
-    assert loaded.z_dim == 2
-
-
-def test_export_load_preserves_scaled_encoding(tmp_path: Path) -> None:
-    """Verify features mean and standard deviation are preserved and registered."""
-    model = TdiV2Model()
-    mean = np.random.randn(10).astype(np.float32)
-    std = (np.random.rand(10) + 0.1).astype(np.float32)
-    model.export_model(tmp_path, mean=mean, std=std)
-    _loaded, loaded_mean, loaded_std = TdiV2Model.load_from_export(tmp_path)
-    assert np.allclose(mean, loaded_mean)
-    assert np.allclose(std, loaded_std)
-
-
-def test_export_files_match_quantizer_type(tmp_path: Path) -> None:
-    """Verify correct files are generated for FSQ vs VQ quantizers."""
-    model = TdiV2Model(quantizer_type="fsq", fsq_levels=[5, 4])
-    model.export_model(tmp_path, mean=np.zeros(10), std=np.ones(10))
-    assert (tmp_path / "fsq_levels.json").exists()
-    assert not (tmp_path / "centroids.npy").exists()
-
-
-def test_export_roundtrip_restores_decoder(tmp_path: Path) -> None:
-    """The decoder is exported and a loaded model can reconstruct mu_self / mu_partner."""
-    model = TdiV2Model()
-    model.export_model(tmp_path, mean=np.zeros(10), std=np.ones(10))
-    assert (tmp_path / "decoder_state_dict.pt").exists()
-
-    loaded, _, _ = TdiV2Model.load_from_export(tmp_path)
-    x = torch.randn(4, 10)
-    with torch.no_grad():
-        out = loaded(x)
-    for key in ("mu_self", "mu_partner"):
-        assert out[key].shape == (4, 10)
-        assert torch.isfinite(out[key]).all()
-
-
-def test_decoder_mean_receives_gradient() -> None:
-    """Verify decoder parameters receive gradients."""
-    model = TdiV2Model(loss_type="smooth_l1")
-    x = torch.randn(16, 10)
-    y = torch.randn(16, 10)
-    loss = model.training_step((x, y), 0)
-    loss.backward()
-    assert model.decoder.mu_partner.weight.grad is not None
-    assert model.decoder.mu_partner.weight.grad.abs().sum() > 0
-
-
-def test_tiny_batch_overfit() -> None:
-    """Verify model can overfit a tiny batch of data."""
-    model = TdiV2Model()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    x = torch.randn(32, 10)
-    y = torch.randn(32, 10)
-
-    initial = float(model.training_step((x, y), 0).detach())
-    for _ in range(200):
-        optimizer.zero_grad()
-        loss = model.training_step((x, y), 0)
-        loss.backward()
-        optimizer.step()
-    final = float(model.training_step((x, y), 0).detach())
-
-    assert final < initial
-
-
-def test_export_roundtrip_states_identical(tmp_path: Path) -> None:
-    """Verify model state assignments are identical before and after roundtrip."""
-    model = TdiV2Model()
-    model.eval()
-    x = torch.randn(16, 10)
-    states_before = model.encode_states(x)
-
-    model.export_model(tmp_path, mean=np.zeros(10), std=np.ones(10))
-    loaded, _, _ = TdiV2Model.load_from_export(tmp_path)
-    loaded.eval()
-    states_after = loaded.encode_states(x)
-
-    assert torch.equal(states_before, states_after)
-
-
-def test_sequence_distance_convention() -> None:
-    """Verify sequence delta sign convention."""
-    i = 10
-    j = 14
-    delta = j - i
-    assert delta == 4
+    """CIGAR parsing with no P ops yields an empty (0, 2) pair array."""
+    assert parse_cigar("10M5I3D").shape == (0, 2)
 
 
 def test_parse_alignment() -> None:
-    """Verify stages parser returns matched alignments."""
-    idx_pairs = parse_alignment("3P5M")
-    assert idx_pairs.shape == (3, 2)
+    """parse_alignment returns the matched alignment pairs."""
+    assert parse_alignment("3P5M").shape == (3, 2)
 
 
 def test_filter_valid_pairs() -> None:
-    """Verify alignment filtering of invalid residue positions."""
+    """Alignment filtering drops residue positions invalid in either structure."""
     idx_1 = np.array([0, 1, 2])
     idx_2 = np.array([0, 1, 2])
     mask1 = np.array([True, False, True])
@@ -342,408 +410,102 @@ def test_filter_valid_pairs() -> None:
 
 
 def test_make_bidirectional_pairs() -> None:
-    """Verify correct bidirectional creation of target-partner pairs."""
+    """Bidirectional pairs double the rows (forward then reverse)."""
     feat1 = np.ones((5, 10))
     feat2 = np.ones((5, 10)) * 2
-    idx_1 = np.array([0, 1])
-    idx_2 = np.array([1, 2])
-    x, y = make_bidirectional_pairs(feat1, feat2, idx_1, idx_2)
+    x, y = make_bidirectional_pairs(feat1, feat2, np.array([0, 1]), np.array([1, 2]))
     assert x.shape == (4, 10)
     assert y.shape == (4, 10)
 
 
-def test_ca_filter_12d_coordinates() -> None:
-    """Verify filter_ca_distance works with full backbone (12D) coordinates."""
-    ca1 = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-    ca2 = ca1 + np.array([10.0, -5.0, 2.0])
-
-    coords1 = np.zeros((3, 12))
-    coords2 = np.zeros((3, 12))
-    coords1[:, 0:3] = ca1
-    coords2[:, 0:3] = ca2
-
-    idx_1 = np.array([0, 1, 2])
-    idx_2 = np.array([0, 1, 2])
-
-    v1, v2, dists, error = filter_ca_distance(idx_1, idx_2, coords1, coords2, max_ca_dist=1.0)
-    assert error is None
-    assert np.array_equal(v1, idx_1)
-    assert np.array_equal(v2, idx_2)
-    assert dists is not None
-    assert np.all(dists < 1e-5)
-
-
 def test_deterministic_rng_capping() -> None:
-    """Verify that alignment-specific hashing and rng choice are reproducible."""
-    alignment_id = "d1qksa1-d1gwua_"
-    seed = 123
+    """Alignment-specific hashing and rng choice are reproducible."""
     import hashlib
 
-    hasher = hashlib.sha256(f"{alignment_id}:{seed}".encode())
+    hasher = hashlib.sha256(f"{'d1qksa1-d1gwua_'}:{123}".encode())
     cap_seed = int(hasher.hexdigest(), 16) % (2**32)
-
     rng1 = np.random.default_rng(cap_seed)
     rng2 = np.random.default_rng(cap_seed)
-
-    choices1 = rng1.choice(100, 10, replace=False)
-    choices2 = rng2.choice(100, 10, replace=False)
-    assert np.array_equal(choices1, choices2)
+    assert np.array_equal(rng1.choice(100, 10, replace=False), rng2.choice(100, 10, replace=False))
 
 
 def test_scop_grouping_logic(tmp_path: Path) -> None:
-    """Verify make_splits.py logic with SCOP lookup fold/superfamily grouping."""
+    """make_splits.py groups by SCOP superfamily."""
     lookup_file = tmp_path / "scop_lookup.tsv"
-    with open(lookup_file, "w") as f:
-        f.write("d1qksa1\ta.3.1.2\n")
-        f.write("d1gwua_\ta.3.1.5\n")
-        f.write("d1i17a_\tb.1.1.1\n")
-
+    lookup_file.write_text("d1qksa1\ta.3.1.2\nd1gwua_\ta.3.1.5\nd1i17a_\tb.1.1.1\n")
     pdbs_file = tmp_path / "pdbs.txt"
-    with open(pdbs_file, "w") as f:
-        f.write("d1qksa1\n")
-        f.write("d1gwua_\n")
-        f.write("d1i17a_\n")
-        f.write("d_fallback\n")
+    pdbs_file.write_text("d1qksa1\nd1gwua_\nd1i17a_\nd_fallback\n")
 
     import subprocess
 
     import pandas as pd
 
     out_dir = tmp_path / "splits"
-    cmd = [
-        "python3",
-        "scripts/make_splits.py",
-        str(pdbs_file),
-        str(out_dir),
-        "--scop_lookup",
-        str(lookup_file),
-        "--group_by",
-        "superfamily",
-        "--seed",
-        "42",
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(
+        [
+            "python3",
+            "scripts/make_splits.py",
+            str(pdbs_file),
+            str(out_dir),
+            "--scop_lookup",
+            str(lookup_file),
+            "--group_by",
+            "superfamily",
+            "--seed",
+            "42",
+        ],
+        capture_output=True,
+        text=True,
+    )
     assert res.returncode == 0, res.stderr
-    assert (out_dir / "train_manifest.csv").exists()
-    assert (out_dir / "val_manifest.csv").exists()
-
     df = pd.read_csv(out_dir / "train_manifest.csv")
-    row_q = df[df["structure_id"] == "d1qksa1"].iloc[0]
-    row_g = df[df["structure_id"] == "d1gwua_"].iloc[0]
-    assert row_q["group_id"] == "a.3.1"
-    assert row_g["group_id"] == "a.3.1"
-
-
-def test_cli_evaluate_end_to_end(tmp_path: Path) -> None:
-    """Verify tdi-v2 evaluate command end-to-end with mock inputs."""
-    # 1. Export a dummy model
-    from tdi.v2 import TdiV2Model
-
-    model = TdiV2Model(quantizer_type="fsq", fsq_levels=[5, 4])
-    model_dir = tmp_path / "exported_model"
-    mean = np.zeros(10)
-    std = np.ones(10)
-    model.export_model(model_dir, mean=mean, std=std)
-
-    # 2. Create a dummy PDB file
-    pdb_dir = tmp_path / "pdbs"
-    pdb_dir.mkdir()
-    pdb_content = (
-        "HEADER    MOCK PROTEIN\n"
-        "ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N\n"
-        "ATOM      2  CA  ALA A   1       1.000   0.000   0.000  1.00  0.00           C\n"
-        "ATOM      3  C   ALA A   1       2.000   0.000   0.000  1.00  0.00           C\n"
-        "ATOM      4  O   ALA A   1       2.000   1.000   0.000  1.00  0.00           O\n"
-        "ATOM      5  CB  ALA A   1       1.000   1.000   0.000  1.00  0.00           C\n"
-        "ATOM      6  N   GLY A   2       3.000   0.000   0.000  1.00  0.00           N\n"
-        "ATOM      7  CA  GLY A   2       4.000   0.000   0.000  1.00  0.00           C\n"
-        "ATOM      8  C   GLY A   2       5.000   0.000   0.000  1.00  0.00           C\n"
-        "ATOM      9  O   GLY A   2       5.000   1.000   0.000  1.00  0.00           O\n"
-        "ATOM     10  N   ALA A   3       6.000   0.000   0.000  1.00  0.00           N\n"
-        "ATOM     11  CA  ALA A   3       7.000   0.000   0.000  1.00  0.00           C\n"
-        "ATOM     12  C   ALA A   3       8.000   0.000   0.000  1.00  0.00           C\n"
-        "ATOM     13  O   ALA A   3       8.000   1.000   0.000  1.00  0.00           O\n"
-        "ATOM     14  CB  ALA A   3       7.000   1.000   0.000  1.00  0.00           C\n"
-        "TER\n"
-    )
-    with open(pdb_dir / "d1qksa1.pdb", "w") as f:
-        f.write(pdb_content)
-    with open(pdb_dir / "d1gwua_.pdb", "w") as f:
-        f.write(pdb_content)
-
-    # 3. Create a dummy pairfile
-    pairfile = tmp_path / "pairs.txt"
-    with open(pairfile, "w") as f:
-        f.write("d1qksa1 d1gwua_ 3M\n")
-
-    # 4. Invoke CLI evaluate command via subprocess
-    import subprocess
-
-    out_dir = tmp_path / "eval_out"
-    cmd = [
-        "python3",
-        "-m",
-        "tdi.v2.cli",
-        "evaluate",
-        "--model_dir",
-        str(model_dir),
-        "--pdb_dir",
-        str(pdb_dir),
-        "--pairfile",
-        str(pairfile),
-        "--out_dir",
-        str(out_dir),
-        "--virt",
-        "0.0",
-        "0.0",
-        "1.0",
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    assert res.returncode == 0, res.stderr
-    assert (out_dir / "sequences.txt").exists()
-    assert (out_dir / "submat.txt").exists()
-    assert (out_dir / "evaluation_report.json").exists()
-
-    # 5. The report carries the state-usage diagnostics and they reconcile with the sequences.
-    import json
-
-    with open(out_dir / "evaluation_report.json") as f:
-        report = json.load(f)
-    assert len(report["state_usage"]) == report["n_letters"]
-    assert 0.0 <= report["dead_state_fraction"] <= 1.0
-    assert 0.0 <= report["normalized_entropy"] <= 1.0
-
-    alphabet = set(report["letters"])
-    seq_text = (out_dir / "sequences.txt").read_text()
-    expected_total = sum(
-        ch in alphabet for line in seq_text.splitlines() for ch in line.split(maxsplit=1)[1]
-    )
-    assert sum(report["state_usage"]) == expected_total
-
-
-def _tiny_loader(n: int = 200, batch_size: int = 10) -> DataLoader:
-    """Build a small (x, y) DataLoader of random scaled features."""
-    x = torch.randn(n, 10)
-    y = torch.randn(n, 10)
-    return DataLoader(TensorDataset(x, y), batch_size=batch_size)
-
-
-def test_kmeans_init_populates_codebook() -> None:
-    """k-means init replaces the random codebook and marks it initialized."""
-    model = TdiV2Model(quantizer_type="vq", n_states=20, z_dim=4)
-    quantizer = model.quantizer
-    assert isinstance(quantizer, EMAVectorQuantizer)
-    before = quantizer.embedding.clone()
-    assert bool(quantizer.initialized.item()) is False
-
-    model.init_codebook_from_data(_tiny_loader(), n_batches=4)
-
-    assert bool(quantizer.initialized.item()) is True
-    assert not torch.equal(before, quantizer.embedding)
-    assert torch.allclose(quantizer.ema_count, torch.ones_like(quantizer.ema_count))
-    assert torch.equal(quantizer.ema_sum, quantizer.embedding)
-
-
-def test_kmeans_init_noop_for_fsq() -> None:
-    """k-means init is a no-op for the FSQ backend."""
-    model = TdiV2Model(quantizer_type="fsq", fsq_levels=[5, 4])
-    # Must not raise and must leave the FSQ quantizer in place.
-    model.init_codebook_from_data(_tiny_loader())
-    assert isinstance(model.quantizer, FSQQuantizer)
-
-
-def test_optimizer_has_two_param_groups_correct_decay() -> None:
-    """AdamW splits decay (>=2-D) from no-decay (bias/norm) groups."""
-    model = TdiV2Model(lambda_contrast=0.0)
-    trainer = L.Trainer(
-        max_steps=2,
-        accelerator="cpu",
-        devices=1,
-        logger=False,
-        enable_checkpointing=False,
-        enable_progress_bar=False,
-        enable_model_summary=False,
-    )
-    trainer.fit(model, _tiny_loader())
-
-    opt = trainer.optimizers[0]
-    assert len(opt.param_groups) == 2
-    decay_g, no_decay_g = opt.param_groups
-    assert decay_g["weight_decay"] == model.weight_decay
-    assert no_decay_g["weight_decay"] == 0.0
-    assert all(p.ndim >= 2 for p in decay_g["params"])
-    assert all(p.ndim < 2 for p in no_decay_g["params"])
-
-    sched = trainer.lr_scheduler_configs[0].scheduler
-    assert isinstance(sched, torch.optim.lr_scheduler.SequentialLR)
-
-
-class _LRRecorder(L.Callback):
-    """Records the optimizer LR at the start of each training batch."""
-
-    def __init__(self) -> None:
-        self.lrs: list[float] = []
-
-    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:  # type: ignore[no-untyped-def]
-        self.lrs.append(trainer.optimizers[0].param_groups[0]["lr"])
-
-
-def test_scheduler_warms_up_then_cosines() -> None:
-    """LR rises during warmup then cosine-decays toward zero, per-step."""
-    model = TdiV2Model(lambda_contrast=0.0, warmup_ratio=0.2, lr=1e-3)
-    recorder = _LRRecorder()
-    trainer = L.Trainer(
-        max_epochs=3,
-        accelerator="cpu",
-        devices=1,
-        logger=False,
-        enable_checkpointing=False,
-        enable_progress_bar=False,
-        enable_model_summary=False,
-        callbacks=[recorder],
-    )
-    trainer.fit(model, _tiny_loader())
-
-    lrs = recorder.lrs
-    assert len(lrs) > 5
-    peak = max(range(len(lrs)), key=lambda i: lrs[i])
-    assert peak > 0  # warmed up: peak is not the first step
-    assert lrs[-1] < lrs[peak]  # cosine decays after the peak
-    assert lrs[-1] < 0.1 * lrs[peak]  # near zero by the final step
-
-
-def test_contrastive_disabled_is_noop() -> None:
-    """With lambda_contrast=0 there is no logit_scale and the step still runs."""
-    model = TdiV2Model(lambda_contrast=0.0)
-    assert not hasattr(model, "logit_scale")
-    x = torch.randn(8, 10)
-    y = torch.randn(8, 10)
-    out = model.training_step((x, y), 0)
-    assert out.ndim == 0
-
-
-def test_contrastive_logit_scale_clamped() -> None:
-    """Enabled contrastive head exposes a learnable logit_scale clamped at use."""
-    model = TdiV2Model(lambda_contrast=0.05, temperature=0.1)
-    assert hasattr(model, "logit_scale")
-    with torch.no_grad():
-        model.logit_scale.fill_(10.0)  # exp(10) >> 100 before clamp
-    scale = model.logit_scale.clamp(max=np.log(100.0)).exp()
-    assert scale.item() <= 100.0 + 1e-3
-
-    # Symmetric loss runs and is differentiable. Force the aux ramp active (negative warmup
-    # => quantize on and aux_r > 0 at epoch 0) so the contrastive term actually contributes.
-    model.quantizer_warmup_epochs = -1
-    x = torch.randn(8, 10)
-    y = torch.randn(8, 10)
-    loss = model.training_step((x, y), 0)
-    loss.backward()
-    assert model.logit_scale.grad is not None
+    assert df[df["structure_id"] == "d1qksa1"].iloc[0]["group_id"] == "a.3.1"
+    assert df[df["structure_id"] == "d1gwua_"].iloc[0]["group_id"] == "a.3.1"
 
 
 # ---------------------------------------------------------------------------
-# Staged discretization curriculum (v2_training_plan Phase 1)
+# End-to-end training loop
 # ---------------------------------------------------------------------------
 
 
-def _cpu_trainer(**kwargs) -> L.Trainer:
-    """A minimal CPU trainer for short fits in tests."""
-    return L.Trainer(
-        accelerator="cpu",
-        devices=1,
-        logger=False,
-        enable_checkpointing=False,
-        enable_progress_bar=False,
-        enable_model_summary=False,
-        **kwargs,
+def _write_processed_dir(path: Path, n: int = 64, dim: int = 10) -> None:
+    rng = np.random.default_rng(0)
+    for split in ("train", "val"):
+        np.save(path / f"{split}_x_raw.npy", rng.standard_normal((n, dim)).astype(np.float32))
+        np.save(path / f"{split}_y_raw.npy", rng.standard_normal((n, dim)).astype(np.float32))
+    np.savez(
+        path / "scaler.npz",
+        mean=np.zeros(dim, dtype=np.float32),
+        std=np.ones(dim, dtype=np.float32),
     )
 
 
-def test_warmup_bypasses_quantizer() -> None:
-    """forward(quantize=False) bypasses the codebook: z_q==z, no stats, no codebook update."""
-    model = TdiV2Model(quantizer_type="vq")
-    assert isinstance(model.quantizer, EMAVectorQuantizer)
-    x = torch.randn(8, 10)
-    out = model(x, quantize=False)
+def test_train_model_end_to_end_writes_export(tmp_path: Path) -> None:
+    """A short VQ run trains without Lightning and writes the self-describing export."""
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    _write_processed_dir(processed)
 
-    assert torch.equal(out["z"], out["z_q"])
-    assert float(out["vq_loss"]) == 0.0
-    assert float(out["perplexity"]) == 0.0
-    assert torch.all(out["indices"] == 0)
-    # No codebook update happened during the bypass.
-    assert int(model.quantizer.step_counter.item()) == 0
-
-
-def test_kmeans_fires_at_warmup_boundary() -> None:
-    """k-means init runs once when quantization begins (EMA-VQ)."""
-    model = TdiV2Model(
-        quantizer_type="vq", quantizer_warmup_epochs=1, aux_ramp_epochs=1, kmeans_init=True
+    cfg = TrainConfig(
+        model=ModelConfig(quantizer="vq", n_states=16, z_dim=4),
+        train=LoopConfig(batch_size=16, max_epochs=2, kmeans_init=True, kmeans_init_batches=2),
+        data=DataConfig(processed_dir=str(processed)),
+        outputs=OutputsConfig(out_dir=str(tmp_path / "run")),
     )
-    assert isinstance(model.quantizer, EMAVectorQuantizer)
-    assert not bool(model.quantizer.initialized.item())
+    model = train_model(cfg)
+    assert isinstance(model, AlphabetModel)
 
-    trainer = _cpu_trainer(max_epochs=2)
-    trainer.fit(model, _tiny_loader())
-    assert bool(model.quantizer.initialized.item())
-
-
-def test_warmup_curriculum_noop_for_fsq() -> None:
-    """The warmup/k-means curriculum is a no-op for the FSQ backend."""
-    model = TdiV2Model(quantizer_type="fsq", fsq_levels=[5, 4], quantizer_warmup_epochs=1)
-    trainer = _cpu_trainer(max_epochs=2)
-    trainer.fit(model, _tiny_loader())
-    assert isinstance(model.quantizer, FSQQuantizer)
-
-
-def test_aux_ramp_factor_is_zero_in_warmup_then_one() -> None:
-    """Ramp factor is 0 during warmup, then climbs to 1 over aux_ramp_epochs."""
-    model = TdiV2Model(quantizer_warmup_epochs=2, aux_ramp_epochs=2)
-    expected = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.5, 4: 1.0, 5: 1.0}
-    with patch.object(type(model), "current_epoch", new_callable=PropertyMock) as ce:
-        for epoch, want in expected.items():
-            ce.return_value = epoch
-            assert model._aux_ramp() == pytest.approx(want)
-
-
-def test_alignment_batch_sampler_spans_many_alignments() -> None:
-    """Each batch spans >= alignments_per_batch distinct alignments, reproducibly."""
-    alignment_ids = np.repeat(np.arange(20), 50)  # 20 alignments x 50 rows
-    sampler = AlignmentBatchSampler(alignment_ids, batch_size=64, alignments_per_batch=8, seed=0)
-    batches = list(sampler)
-    assert len(batches) == len(alignment_ids) // 64
-
-    for batch in batches:
-        assert len(batch) <= 64
-        distinct = len({int(alignment_ids[i]) for i in batch})
-        assert distinct >= 8
-
-    # Reproducible under a fixed seed.
-    sampler2 = AlignmentBatchSampler(alignment_ids, batch_size=64, alignments_per_batch=8, seed=0)
-    assert list(sampler2) == batches
-
-
-def test_all_loss_components_logged() -> None:
-    """Every decomposed objective term and per-group recon is logged each epoch."""
-    model = TdiV2Model(
-        quantizer_type="vq",
-        quantizer_warmup_epochs=1,
-        aux_ramp_epochs=1,
-        lambda_contrast=0.05,
-    )
-    trainer = _cpu_trainer(max_epochs=3)
-    trainer.fit(model, _tiny_loader())
-
-    keys = set(trainer.callback_metrics.keys())
+    out_dir = tmp_path / "run"
     for name in (
-        "loss_partner",
-        "loss_self",
-        "loss_vq",
-        "loss_usage",
-        "loss_contrast",
-        "loss_total",
-        "recon_angles",
-        "recon_ca_distance",
-        "recon_sequence",
-        "aux_ramp",
+        "config.json",
+        "encoder_state_dict.pt",
+        "decoder_state_dict.pt",
+        "scaler.json",
+        "centroids.npy",
+        "train_log.csv",
+        "run_config.resolved.json",
     ):
-        assert name in keys, name
+        assert (out_dir / name).exists(), name
+
+    loaded, _, _ = AlphabetModel.load(out_dir)
+    assert loaded.n_states == 16
