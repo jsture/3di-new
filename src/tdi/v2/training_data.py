@@ -1,20 +1,17 @@
 """Feature extraction and dataset utilities for v2.
 
-This module provides preprocessing configurations, feature standardization,
-local structural consistency filtering, and coordinate augmentation (jittering)
-to generate robust VQ-VAE training data.
+This module provides feature standardization and local structural consistency filtering to
+generate VQ-VAE training data, plus a plain ``PairDataset`` of aligned descriptor pairs.
 """
 
 import hashlib
 import os
 import warnings
-from collections import defaultdict
-from collections.abc import Iterator, Sequence
 
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset
 
 from . import features, util
 
@@ -24,69 +21,34 @@ CacheKey = tuple[str, tuple[float, float, float], str, str]
 FEATURE_CACHE: dict[CacheKey, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
 
-def jitter_coords(
-    coords: np.ndarray,
-    valid_mask: np.ndarray,
-    std: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Add small Gaussian noise to valid coordinates for training augmentation.
-
-    Args:
-        coords: Coordinates array of shape (N, D).
-        valid_mask: Boolean mask indicating valid residues.
-        std: Standard deviation of Gaussian noise.
-        rng: NumPy random generator.
-
-    Returns:
-        Jittered coordinates array.
-    """
-    if std <= 0.0:
-        return coords
-    out = coords.copy()
-    # Add noise only to valid coordinates
-    noise = rng.normal(0.0, std, size=out[valid_mask].shape).astype(out.dtype)
-    out[valid_mask] += noise
-    return out
-
-
 def extract_features(
     pdb_path: str,
     virt_cb: tuple[float, float, float],
-    coordinate_jitter_std: float = 0.0,
-    rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Calculate 3D descriptors and coordinates for each residue of a PDB file.
 
     Args:
         pdb_path: Path to the PDB file.
         virt_cb: Virtual center coordinate offset parameters (alpha, beta, d).
-        coordinate_jitter_std: Std of coordinate-level jittering noise (0.0 to disable).
-        rng: Optional random generator for jittering.
 
     Returns:
         A tuple of (vae_features, valid_mask, coords). ``coords`` are the raw parsed
         coordinates (pre CB-move), so callers never observe a mutated array.
     """
-    # Cache only when jittering is disabled; key includes virt_cb + version/convention tags
-    # so two runs with different virt_cb do not return stale features.
+    # Cache keyed on virt_cb + version/convention tags so two runs with different virt_cb
+    # do not return stale features.
     cache_key: CacheKey = (
         os.path.abspath(pdb_path),
         (float(virt_cb[0]), float(virt_cb[1]), float(virt_cb[2])),
         "features_v2",  # feature-definition version tag
         "seq_delta_j_minus_i",  # convention tag
     )
-    if coordinate_jitter_std == 0.0:
-        cached = FEATURE_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
+    cached = FEATURE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     # Parse coordinates
     coords, valid_mask = features.get_coords_from_pdb(pdb_path, full_backbone=True)
-
-    # Apply coordinate-level training augmentation (jittering)
-    if coordinate_jitter_std > 0.0 and rng is not None:
-        coords = jitter_coords(coords, valid_mask, coordinate_jitter_std, rng)
 
     # move_CB mutates its input, so move a copy and keep raw coords intact for caching.
     coords_moved = features.move_CB(coords.copy(), virt_cb=virt_cb)
@@ -105,8 +67,7 @@ def extract_features(
     vae_features = np.hstack([feat, seq_dist_log])
 
     # Cache the raw parsed coords (CA columns 0:3 used downstream are unaffected by move_CB).
-    if coordinate_jitter_std == 0.0:
-        FEATURE_CACHE[cache_key] = vae_features, valid_mask2, coords
+    FEATURE_CACHE[cache_key] = vae_features, valid_mask2, coords
 
     return vae_features, valid_mask2, coords
 
@@ -114,21 +75,17 @@ def extract_features(
 def encoder_features(
     pdb_path: str,
     virt_cb: tuple[float, float, float],
-    coordinate_jitter_std: float = 0.0,
-    rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Calculate 3D descriptors for each residue of a PDB file.
 
     Args:
         pdb_path: Path to the PDB file.
         virt_cb: Virtual center coordinate offset parameters (alpha, beta, d).
-        coordinate_jitter_std: Std of coordinate-level jittering noise (0.0 to disable).
-        rng: Optional random generator for jittering.
 
     Returns:
         A tuple of (vae_features, valid_mask).
     """
-    feat, mask, _ = extract_features(pdb_path, virt_cb, coordinate_jitter_std, rng)
+    feat, mask, _ = extract_features(pdb_path, virt_cb)
     return feat, mask
 
 
@@ -400,8 +357,6 @@ class PairDataset(Dataset):
         y: np.ndarray,
         mean: np.ndarray | None = None,
         std: np.ndarray | None = None,
-        descriptor_jitter_std: float = 0.0,
-        seed: int = 42,
         fit_scaler: bool = True,
     ) -> None:
         """Initialize the PairDataset.
@@ -411,9 +366,6 @@ class PairDataset(Dataset):
             y: Aligned target descriptors of shape (N, 10).
             mean: Precomputed feature mean. If None, statistics are fit on x.
             std: Precomputed feature std. If None, statistics are fit on x.
-            descriptor_jitter_std: Experimental noise std applied to scaled input descriptors.
-                Distinct from coordinate-level jitter (see ``extract_features``); default 0.0.
-            seed: Base seed for deterministic per-item jitter.
             fit_scaler: If True, fits scaler parameters (mean/std) internally when omitted.
         """
         assert len(x) == len(y), "Features and targets must have matching length."
@@ -443,99 +395,8 @@ class PairDataset(Dataset):
         assert_finite_features(self.x_scaled, "x_scaled")
         assert_finite_features(self.y_scaled, "y_scaled")
 
-        self.descriptor_jitter_std = descriptor_jitter_std
-        self.seed = seed
-        self.epoch = 0
-
-    def set_epoch(self, epoch: int) -> None:
-        """Set the epoch so per-item jitter differs across epochs but stays reproducible."""
-        self.epoch = epoch
-
     def __len__(self) -> int:
         return len(self.x_scaled)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        x_val = self.x_scaled[idx].copy()
-        y_val = self.y_scaled[idx]
-
-        # Deterministic per-item jitter: seed from (base_seed, idx, epoch) so noise is
-        # identical regardless of worker count (no shared stateful RNG to fork).
-        if self.descriptor_jitter_std > 0.0:
-            rng = np.random.default_rng([self.seed, idx, self.epoch])
-            noise = rng.normal(0.0, self.descriptor_jitter_std, size=x_val.shape).astype(np.float32)
-            x_val += noise
-
-        return torch.tensor(x_val), torch.tensor(y_val)
-
-
-class AlignmentBatchSampler(Sampler[list[int]]):
-    """Batch sampler drawing several distinct alignments per batch.
-
-    Flat random sampling fills batches with correlated residues from one structure pair,
-    which weakens in-batch contrastive negatives and biases code-usage statistics. This
-    sampler picks ``alignments_per_batch`` distinct alignments per batch (more if any are
-    small), then draws rows within them, so each batch spans many alignments. Reproducible
-    under a fixed seed; vary with epoch via ``set_epoch``.
-
-    This is stochastic sampling, not a partition: across a single epoch some rows may be
-    drawn more than once and others not at all. Each yielded batch is filled to exactly
-    ``batch_size`` (re-permuting alignments if a batch would otherwise fall short).
-    """
-
-    def __init__(
-        self,
-        alignment_ids: Sequence[object] | np.ndarray,
-        batch_size: int,
-        alignments_per_batch: int,
-        seed: int = 0,
-    ) -> None:
-        """Initialize the sampler.
-
-        Args:
-            alignment_ids: Per-row alignment identifier (length == dataset length).
-            batch_size: Rows per batch.
-            alignments_per_batch: Target number of distinct alignments per batch.
-            seed: Base seed for reproducible draws.
-        """
-        if alignments_per_batch < 1:
-            raise ValueError("alignments_per_batch must be >= 1")
-        self.batch_size = batch_size
-        self.alignments_per_batch = alignments_per_batch
-        self.seed = seed
-        self.epoch = 0
-
-        groups: dict[object, list[int]] = defaultdict(list)
-        for idx, aid in enumerate(alignment_ids):
-            groups[aid].append(idx)
-        self.groups = [np.asarray(v, dtype=np.int64) for v in groups.values()]
-        self.n = len(alignment_ids)
-        self.num_batches = self.n // batch_size
-        # Rows drawn per alignment so that alignments_per_batch of them fill a batch.
-        self.per_alignment = max(1, batch_size // alignments_per_batch)
-
-    def set_epoch(self, epoch: int) -> None:
-        """Set the epoch so batch composition varies per epoch but stays reproducible."""
-        self.epoch = epoch
-
-    def __len__(self) -> int:
-        return self.num_batches
-
-    def __iter__(self) -> Iterator[list[int]]:
-        rng = np.random.default_rng([self.seed, self.epoch])
-        n_groups = len(self.groups)
-        for _ in range(self.num_batches):
-            order = rng.permutation(n_groups)
-            batch: list[int] = []
-            pos = 0
-            # Consume distinct alignments until the batch is full, re-permuting the
-            # alignment order if we run out before reaching batch_size.
-            while len(batch) < self.batch_size:
-                if pos >= n_groups:
-                    order = rng.permutation(n_groups)
-                    pos = 0
-                members = self.groups[order[pos]]
-                pos += 1
-                take = min(self.per_alignment, len(members), self.batch_size - len(batch))
-                sel = rng.choice(len(members), size=take, replace=False)
-                batch.extend(members[sel].tolist())
-            yield batch
+        return torch.tensor(self.x_scaled[idx]), torch.tensor(self.y_scaled[idx])
