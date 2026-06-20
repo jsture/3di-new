@@ -32,6 +32,12 @@ def validate_cigar(cigar_string: str, n_ref: int, n_query: int) -> np.ndarray:
 
     Raises:
         CigarValidationError: On any out-of-range, negative, or count-inconsistent pair.
+
+    Note:
+        Indices are assumed 0-based into the same residue enumeration that produced
+        ``n_ref``/``n_query`` — i.e. ``list(chain.get_residues())`` of the first chain,
+        HETATM rows included (see ``get_atom_coordinates``). If the aligner that emitted the
+        CIGAR numbered residues differently, in-range-but-misaligned pairs pass this check.
     """
     pairs = parse_cigar(cigar_string)
 

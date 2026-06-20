@@ -43,7 +43,12 @@ def array_record(arr: np.ndarray) -> dict[str, object]:
 
 
 def git_commit() -> str | None:
-    """Return the current git commit hash, or None if unavailable."""
+    """Return the current git commit hash, or None if unavailable.
+
+    Caveat: this is HEAD only and does not reflect uncommitted working-tree changes, so a
+    manifest can record a commit while the code that produced it differs. It also resolves
+    HEAD in the process working directory.
+    """
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"],
