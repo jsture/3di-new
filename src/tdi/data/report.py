@@ -26,11 +26,19 @@ def _histogram_from_edges(values: np.ndarray, edges: list[float]) -> list[int]:
     return [int(c) for c in counts]
 
 
-def _seq_sep_histogram(metadata: pd.DataFrame) -> dict[str, int]:
-    """Histogram of |idx_target - idx_source| over the labelled separation bins."""
-    if metadata.empty:
+def _seq_sep_histogram(features: np.ndarray) -> dict[str, int]:
+    """Histogram of within-structure contact sequence separation |partner - source|.
+
+    This is the genuine contact separation, recovered from the descriptor's signed
+    log sequence-distance term (feature column 9 = sign(delta) * log(|delta| + 1)).
+    It is NOT |idx_target - idx_source| from the metadata: those indices live in two
+    different structures, so their difference is a cross-structure alignment offset,
+    not a sequence separation.
+    """
+    if features.size == 0 or features.shape[1] < 10:
         return dict.fromkeys(_SEQ_SEP_LABELS, 0)
-    sep = (metadata["idx_target"] - metadata["idx_source"]).abs().to_numpy()
+    # Invert sign(delta) * log(|delta| + 1) to recover |delta| (the contact separation).
+    sep = np.rint(np.exp(np.abs(features[:, 9])) - 1.0).astype(int)
     # np.digitize with the lower edges maps each value to its bin index.
     bin_idx = np.digitize(sep, _SEQ_SEP_EDGES, right=False) - 1
     bin_idx = np.clip(bin_idx, 0, len(_SEQ_SEP_LABELS) - 1)
@@ -75,7 +83,7 @@ def build_report(
     return {
         "stage_counts": stage_counts,
         "feature_stats": feat_stats,
-        "sequence_separation_histogram": _seq_sep_histogram(metadata),
+        "sequence_separation_histogram": _seq_sep_histogram(features),
         "ca_distance_histogram": {
             "edges": _CA_DIST_EDGES,
             "counts": _histogram_from_edges(ca_dist, _CA_DIST_EDGES),
@@ -87,19 +95,24 @@ def build_report(
 
 
 def reconcile(stage_counts: dict[str, int]) -> bool:
-    """Check stage drops reconcile: rows_read - sum(drops) == n_final pairs (pre-mirror).
+    """Check the stage counts are internally consistent.
 
-    The final bidirectional example count is twice the post-cap pair count, so we
-    reconcile against the pre-mirror pair count.
+    Two independent invariants (the previous telescoping subtraction was a tautology
+    that always returned True):
+      1. Each filter can only remove pairs, so the per-stage counts must be
+         non-increasing: before >= after_validity >= after_ca >= after_cap >= 0.
+      2. Bidirectional mirroring doubles the post-cap pair count into the final example
+         count: n_pairs_after_max_pairs * 2 == n_final_examples.
     """
     read = stage_counts.get("n_pairs_before_filters", 0)
+    after_validity = stage_counts.get("n_pairs_after_descriptor_validity", 0)
+    after_ca = stage_counts.get("n_pairs_after_ca_filter", 0)
     after_cap = stage_counts.get("n_pairs_after_max_pairs", 0)
-    drop_validity = read - stage_counts.get("n_pairs_after_descriptor_validity", 0)
-    drop_ca = stage_counts.get("n_pairs_after_descriptor_validity", 0) - stage_counts.get(
-        "n_pairs_after_ca_filter", 0
-    )
-    drop_cap = stage_counts.get("n_pairs_after_ca_filter", 0) - after_cap
-    return read - (drop_validity + drop_ca + drop_cap) == after_cap
+    final = stage_counts.get("n_final_examples", 0)
+
+    monotonic = read >= after_validity >= after_ca >= after_cap >= 0
+    mirror_ok = after_cap * 2 == final
+    return monotonic and mirror_ok
 
 
 def render_report_md(report_dict: Mapping[str, object], dataset_name: str) -> str:
