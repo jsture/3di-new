@@ -279,17 +279,70 @@ def calc_angles_forloop(
     n_res = coords.shape[0]
     out = np.full((n_res, 9), np.nan, dtype=np.float32)
 
-    # Exclude boundary residues which lack sequence neighbors for directions.
-    # Note: find_nearest_residues forces the first/last columns to inf, so the partner
-    # j is always in [1, n_res - 2]; this keeps j-1 / j+1 below in bounds.
-    for i in range(1, n_res - 1):
-        if valid_mask[i - 1] and valid_mask[i] and valid_mask[i + 1]:
-            j = partner_idx[i]
-            # -1 sentinel from find_nearest_residues: residue had no valid partner.
-            if j < 0:
-                continue
-            if valid_mask[j + 1] and valid_mask[j - 1]:
-                out[i] = calc_angles(coords, i, j)
+    # Vectorized equivalent of the per-residue loop over calc_angles (kept as the scalar
+    # reference). Too few residues for any interior residue with sequence neighbors: all NaN.
+    if n_res < 3:
+        return out, np.asarray(~np.isnan(out).any(axis=1))
+
+    ca = coords[:, 0:3]
+    idx = np.arange(n_res)
+
+    # Gather partner directions. Clamp j into [1, n_res-2] so j-1 / j+1 stay in bounds; rows
+    # with an out-of-range or -1-sentinel partner are discarded by the mask below.
+    j = partner_idx
+    j_clamped = np.clip(j, 1, n_res - 2)
+
+    def _rowdot(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        return (a * b).sum(axis=1)
+
+    # Degenerate rows (coincident CAs) divide by a zero norm and yield NaN; that is fine
+    # because the mask below drops them, so silence the expected warning. The scalar loop
+    # avoided it only by never visiting those rows.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # Per-residue CA step directions as row-wise unit vectors (no eps, matching unit_vec).
+        # step[k] = unit(ca[k+1] - ca[k]); then fwd[i] = step[i], bwd[i] = step[i-1].
+        diff = ca[1:] - ca[:-1]
+        step = diff / np.linalg.norm(diff, axis=1, keepdims=True)
+        fwd = np.full((n_res, 3), np.nan, dtype=ca.dtype)
+        bwd = np.full((n_res, 3), np.nan, dtype=ca.dtype)
+        fwd[:-1] = step  # fwd[i] = unit(ca[i+1] - ca[i])
+        bwd[1:] = step  # bwd[i] = unit(ca[i] - ca[i-1])
+
+        u_1 = bwd  # unit(ca[i] - ca[i-1])
+        u_2 = fwd  # unit(ca[i+1] - ca[i])
+        u_3 = bwd[j_clamped]  # unit(ca[j] - ca[j-1])
+        u_4 = fwd[j_clamped]  # unit(ca[j+1] - ca[j])
+        d5 = ca[j_clamped] - ca
+        u_5 = d5 / np.linalg.norm(d5, axis=1, keepdims=True)  # unit(ca[j] - ca[i])
+
+        features = np.stack(
+            [
+                _rowdot(u_1, u_2),  # cos_phi_12
+                _rowdot(u_3, u_4),  # cos_phi_34
+                _rowdot(u_1, u_5),  # cos_phi_15
+                _rowdot(u_3, u_5),  # cos_phi_35
+                _rowdot(u_1, u_4),  # cos_phi_14
+                _rowdot(u_2, u_3),  # cos_phi_23
+                _rowdot(u_1, u_3),  # cos_phi_13
+                np.linalg.norm(d5, axis=1),  # d
+                np.clip(j_clamped - idx, -4, 4),  # seq_dist
+            ],
+            axis=1,
+        ).astype(np.float32)
+
+    # Reproduce the loop's masking exactly: interior residue with valid sequence neighbors on
+    # both sides of i and of its (non-sentinel) partner j.
+    vm = valid_mask.astype(bool)
+    row_mask = np.zeros(n_res, dtype=bool)
+    row_mask[1 : n_res - 1] = True
+    row_mask &= vm  # valid_mask[i]
+    row_mask &= np.concatenate(([False], vm[:-1]))  # valid_mask[i-1]
+    row_mask &= np.concatenate((vm[1:], [False]))  # valid_mask[i+1]
+    row_mask &= j >= 0  # drop -1 sentinel partners
+    row_mask &= vm[np.clip(j - 1, 0, n_res - 1)]  # valid_mask[j-1]
+    row_mask &= vm[np.clip(j + 1, 0, n_res - 1)]  # valid_mask[j+1]
+
+    out[row_mask] = features[row_mask]
 
     new_valid_mask = np.asarray(~np.isnan(out).any(axis=1))
     return out, new_valid_mask

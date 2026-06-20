@@ -8,10 +8,27 @@ original broadcast formulation.
 import numpy as np
 
 from tdi.v2.features import (
+    calc_angles,
     calc_angles_forloop,
     distance_matrix,
     find_nearest_residues,
 )
+
+
+def _scalar_calc_angles_forloop(
+    coords: np.ndarray, partner_idx: np.ndarray, valid_mask: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reference scalar implementation (the pre-vectorization loop) for parity checks."""
+    n_res = coords.shape[0]
+    out = np.full((n_res, 9), np.nan, dtype=np.float32)
+    for i in range(1, n_res - 1):
+        if valid_mask[i - 1] and valid_mask[i] and valid_mask[i + 1]:
+            j = partner_idx[i]
+            if j < 0:
+                continue
+            if valid_mask[j + 1] and valid_mask[j - 1]:
+                out[i] = calc_angles(coords, i, j)
+    return out, np.asarray(~np.isnan(out).any(axis=1))
 
 
 def _naive_distance_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -59,6 +76,50 @@ def test_find_nearest_residues_degenerate_structure() -> None:
     # calc_angles_forloop must skip the sentinel: no residue ends up valid.
     _, new_valid_mask = calc_angles_forloop(coords, partners, valid_mask)
     assert not new_valid_mask.any()
+
+
+def test_calc_angles_forloop_matches_scalar() -> None:
+    """Vectorized calc_angles_forloop equals the scalar reference on a real structure."""
+    rng = np.random.default_rng(7)
+    n_res = 8
+    coords = np.zeros((n_res, 6), dtype=np.float32)
+    # Spread CA along a jittered backbone so neighbor directions are well-defined.
+    coords[:, 0:3] = np.cumsum(rng.standard_normal((n_res, 3)).astype(np.float32) + 1.0, axis=0)
+    coords[:, 3:6] = coords[:, 0:3] + rng.standard_normal((n_res, 3)).astype(np.float32) * 0.5
+    valid_mask = np.ones(n_res, dtype=bool)
+
+    partner_idx = find_nearest_residues(coords, valid_mask)
+    assert isinstance(partner_idx, np.ndarray)
+
+    feats_vec, mask_vec = calc_angles_forloop(coords, partner_idx, valid_mask)
+    feats_ref, mask_ref = _scalar_calc_angles_forloop(coords, partner_idx, valid_mask)
+
+    assert np.array_equal(mask_vec, mask_ref)
+    assert np.allclose(feats_vec, feats_ref, equal_nan=True, atol=1e-5)
+    # The structure must actually exercise the angle math (some rows valid).
+    assert mask_ref.any()
+
+
+def test_calc_angles_forloop_with_sentinel_partner() -> None:
+    """A -1 sentinel partner is skipped identically by vectorized and scalar paths."""
+    rng = np.random.default_rng(3)
+    n_res = 6
+    coords = np.zeros((n_res, 6), dtype=np.float32)
+    coords[:, 0:3] = np.cumsum(rng.standard_normal((n_res, 3)).astype(np.float32) + 1.0, axis=0)
+    coords[:, 3:6] = coords[:, 0:3]
+    valid_mask = np.ones(n_res, dtype=bool)
+
+    partner_idx = find_nearest_residues(coords, valid_mask)
+    assert isinstance(partner_idx, np.ndarray)
+    partner_idx = partner_idx.copy()
+    partner_idx[2] = -1  # force a sentinel partner
+
+    feats_vec, mask_vec = calc_angles_forloop(coords, partner_idx, valid_mask)
+    feats_ref, mask_ref = _scalar_calc_angles_forloop(coords, partner_idx, valid_mask)
+
+    assert np.array_equal(mask_vec, mask_ref)
+    assert np.allclose(feats_vec, feats_ref, equal_nan=True, atol=1e-5)
+    assert not mask_vec[2]  # sentinel row stays invalid
 
 
 def test_find_nearest_residues_return_dist_sentinel() -> None:
