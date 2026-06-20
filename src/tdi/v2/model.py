@@ -1020,6 +1020,11 @@ class TdiV2Model(L.LightningModule):
         # Save encoder parameters
         torch.save(self.encoder.state_dict(), out_path / "encoder_state_dict.pt")
 
+        # Save decoder parameters too, so an export supports reconstruction-based diagnostics
+        # (round-tripping a state back to mu_self / mu_partner), not just encoding. The decoder
+        # is small, so it is saved unconditionally.
+        torch.save(self.decoder.state_dict(), out_path / "decoder_state_dict.pt")
+
         # Save config params. Provenance fields are recorded only when known so the
         # exported config never claims a virtual center / filter that was not used.
         config = {
@@ -1089,6 +1094,11 @@ class TdiV2Model(L.LightningModule):
         model.encoder.load_state_dict(
             torch.load(export_path / "encoder_state_dict.pt", map_location="cpu")
         )
+
+        # Load decoder weights when present (optional, so older encoder-only exports still load).
+        decoder_path = export_path / "decoder_state_dict.pt"
+        if decoder_path.exists():
+            model.decoder.load_state_dict(torch.load(decoder_path, map_location="cpu"))
 
         # Load scaler metrics and attach/register buffers
         with open(export_path / "feature_scaler.json") as f:
