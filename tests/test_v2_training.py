@@ -163,6 +163,21 @@ def test_export_files_match_quantizer_type(tmp_path: Path) -> None:
     assert not (tmp_path / "centroids.npy").exists()
 
 
+def test_export_roundtrip_restores_decoder(tmp_path: Path) -> None:
+    """The decoder is exported and a loaded model can reconstruct mu_self / mu_partner."""
+    model = TdiV2Model()
+    model.export_model(tmp_path, mean=np.zeros(10), std=np.ones(10))
+    assert (tmp_path / "decoder_state_dict.pt").exists()
+
+    loaded, _, _ = TdiV2Model.load_from_export(tmp_path)
+    x = torch.randn(4, 10)
+    with torch.no_grad():
+        out = loaded(x)
+    for key in ("mu_self", "mu_partner"):
+        assert out[key].shape == (4, 10)
+        assert torch.isfinite(out[key]).all()
+
+
 def test_decoder_mean_receives_gradient() -> None:
     """Verify decoder parameters receive gradients."""
     model = TdiV2Model(loss_type="smooth_l1")
