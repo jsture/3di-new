@@ -5,6 +5,7 @@ mutual information scoring for substitution statistics.
 """
 
 import re
+from pathlib import Path
 
 import numpy as np
 
@@ -64,3 +65,42 @@ def mutual_information(p_ab: np.ndarray) -> float:
         # Log2 scores calculation for MI
         log_scores = np.log2(p_ab / (p_a[:, np.newaxis] * p_b))
         return float(np.sum(p_ab * log_scores, where=np.isfinite(log_scores)))
+
+
+def parse_pairfile_line(line: str) -> tuple[str, str, str] | None:
+    """Parse a pairfile line into (sid1, sid2, cigar_string).
+
+    Assumes the last column is the CIGAR string, supporting both 3-column
+    and multi-column alignments (e.g., tmaln-06.out).
+
+    Args:
+        line: Raw line text from a pairfile.
+
+    Returns:
+        A tuple of (sid1, sid2, cigar_string), or None if the line has fewer than 3 columns.
+    """
+    parts = line.strip().split()
+    if len(parts) >= 3:
+        return parts[0], parts[1], parts[-1]
+    return None
+
+
+def resolve_pdb_path(pdb_dir: str | Path, sid: str) -> Path:
+    """Resolve the path of a PDB file, checking for sid first, then sid.pdb.
+
+    Args:
+        pdb_dir: Base directory containing structure files.
+        sid: Structure identifier (domain name).
+
+    Returns:
+        Resolved Path object.
+    """
+    path1 = Path(pdb_dir) / sid
+    if path1.exists():
+        return path1
+    path2 = Path(pdb_dir) / f"{sid}.pdb"
+    if path2.exists():
+        return path2
+    # Fallback to the first path if neither exists (propagating standard error)
+    return path1
+

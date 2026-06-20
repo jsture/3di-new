@@ -110,10 +110,10 @@ def accumulate_counts(
 
     with open(pairfile_path) as pair_file:
         for line in pair_file:
-            parts = line.rstrip("\n").split()
-            if len(parts) < 3:
+            res = util.parse_pairfile_line(line)
+            if res is None:
                 continue
-            sid1, sid2, cigar_string = parts[0], parts[1], parts[2]
+            sid1, sid2, cigar_string = res
             seq1 = sid2seq.get(sid1)
             seq2 = sid2seq.get(sid2)
 

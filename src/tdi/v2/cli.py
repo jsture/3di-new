@@ -10,6 +10,7 @@ import numpy as np
 from .encode import LETTERS, process_pdb
 from .model import TdiV2Model
 from .submat import accumulate_counts, calc_alphabet_mi, write_mat
+from .util import parse_pairfile_line, resolve_pdb_path
 
 
 def run_evaluate(args: argparse.Namespace) -> None:
@@ -22,45 +23,34 @@ def run_evaluate(args: argparse.Namespace) -> None:
     model, mean, std = TdiV2Model.load_from_export(args.model_dir)
 
     # 2. Extract unique structure identifiers from pairfile.
-    # The CIGAR is the third column, matching submat.accumulate_counts (parts[2]).
     unique_sids = set()
     with open(args.pairfile) as f:
         for line in f:
-            parts = line.rstrip("\n").split()
-            if len(parts) >= 3:
-                unique_sids.add(parts[0])
-                unique_sids.add(parts[1])
+            res = parse_pairfile_line(line)
+            if res is not None:
+                unique_sids.add(res[0])
+                unique_sids.add(res[1])
 
     # 3. Encode PDB files into 3Di sequences
     print(f"Encoding {len(unique_sids)} PDB files using trained encoder...")
     sid2seq = {}
     virt_cb = (args.virt[0], args.virt[1], args.virt[2])
     for sid in sorted(unique_sids):
-        # We try both sid, sid + ".pdb", or look directly under pdb_dir
-        pdb_candidates = [sid, f"{sid}.pdb"]
-        success = False
-        for cand in pdb_candidates:
-            pdb_path = Path(args.pdb_dir) / cand
-            if pdb_path.exists():
-                try:
-                    _, seq = process_pdb(
-                        cand,
-                        model,
-                        None,
-                        args.pdb_dir,
-                        virt_cb,
-                        args.invalid_state,
-                        mean=mean,
-                        std=std,
-                    )
-                    sid2seq[sid] = seq
-                    success = True
-                    break
-                except Exception as e:
-                    print(f"Error encoding {sid}: {e}", file=sys.stderr)
-                    break
-        if not success:
-            print(f"Warning: Could not find/process PDB file for {sid}", file=sys.stderr)
+        try:
+            resolved_path = resolve_pdb_path(args.pdb_dir, sid)
+            _, seq = process_pdb(
+                resolved_path.name,
+                model,
+                None,
+                str(resolved_path.parent),
+                virt_cb,
+                args.invalid_state,
+                mean=mean,
+                std=std,
+            )
+            sid2seq[sid] = seq
+        except Exception as e:
+            print(f"Error encoding {sid}: {e}", file=sys.stderr)
 
     # 4. Save sequences to sequences.txt
     seq_path = out_dir / "sequences.txt"
