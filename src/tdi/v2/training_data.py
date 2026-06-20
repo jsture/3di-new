@@ -5,6 +5,7 @@ local structural consistency filtering, and coordinate augmentation (jittering)
 to generate robust VQ-VAE training data.
 """
 
+import hashlib
 import os
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -215,7 +216,8 @@ def make_bidirectional_pairs(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Construct symmetric pair features for VQ-VAE target/partner training."""
     if len(idx_1) == 0:
-        return np.zeros((0, 10), dtype=np.float32), np.zeros((0, 10), dtype=np.float32)
+        dim = feat1.shape[1] if feat1.ndim == 2 else 10
+        return np.zeros((0, dim), dtype=np.float32), np.zeros((0, dim), dtype=np.float32)
     x = np.vstack([feat1[idx_1], feat2[idx_2]])
     y = np.vstack([feat2[idx_2], feat1[idx_1]])
     return x, y
@@ -280,8 +282,6 @@ def align_features(
     cap_seed = None
     if max_pairs is not None and len(idx_1) > max_pairs // 2:
         alignment_id = f"{sid1}-{sid2}"
-        import hashlib
-
         hasher = hashlib.sha256(f"{alignment_id}:{seed}".encode())
         cap_seed = int(hasher.hexdigest(), 16) % (2**32)
 
@@ -437,6 +437,10 @@ class AlignmentBatchSampler(Sampler[list[int]]):
     sampler picks ``alignments_per_batch`` distinct alignments per batch (more if any are
     small), then draws rows within them, so each batch spans many alignments. Reproducible
     under a fixed seed; vary with epoch via ``set_epoch``.
+
+    This is stochastic sampling, not a partition: across a single epoch some rows may be
+    drawn more than once and others not at all. Each yielded batch is filled to exactly
+    ``batch_size`` (re-permuting alignments if a batch would otherwise fall short).
     """
 
     def __init__(
@@ -484,8 +488,12 @@ class AlignmentBatchSampler(Sampler[list[int]]):
             order = rng.permutation(n_groups)
             batch: list[int] = []
             pos = 0
-            # Consume distinct alignments until the batch is full.
-            while len(batch) < self.batch_size and pos < n_groups:
+            # Consume distinct alignments until the batch is full, re-permuting the
+            # alignment order if we run out before reaching batch_size.
+            while len(batch) < self.batch_size:
+                if pos >= n_groups:
+                    order = rng.permutation(n_groups)
+                    pos = 0
                 members = self.groups[order[pos]]
                 pos += 1
                 take = min(self.per_alignment, len(members), self.batch_size - len(batch))
