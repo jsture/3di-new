@@ -250,11 +250,11 @@ def align_features(
     Returns:
         A tuple of (feat_x, feat_y, meta) where meta is a dictionary containing index arrays.
     """
-    path1 = os.path.join(pdb_dir, sid1)
-    path2 = os.path.join(pdb_dir, sid2)
+    path1 = util.resolve_pdb_path(pdb_dir, sid1)
+    path2 = util.resolve_pdb_path(pdb_dir, sid2)
 
-    feat1, mask1, coords1 = extract_features(path1, virtual_center)
-    feat2, mask2, coords2 = extract_features(path2, virtual_center)
+    feat1, mask1, coords1 = extract_features(str(path1), virtual_center)
+    feat2, mask2, coords2 = extract_features(str(path2), virtual_center)
 
     idx_pairs = parse_alignment(cigar_string)
     n_pairs_before_filters = idx_pairs.shape[0]
