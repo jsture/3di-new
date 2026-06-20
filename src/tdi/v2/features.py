@@ -4,10 +4,13 @@ This module provides geometric functions to calculate angles and distances from 
 to construct 3Di structural alphabet descriptors.
 """
 
+import sys
+
 import numpy as np
 from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.Residue import Residue
 from numpy.linalg import norm
+from scipy.spatial.distance import cdist
 
 # Standard distance between C_alpha and C_beta in Angstroms
 DISTANCE_ALPHA_BETA: float = 1.5336
@@ -124,7 +127,9 @@ def distance_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     Returns:
         Distance matrix of shape (M, N).
     """
-    return np.sqrt(np.sum((a[:, np.newaxis, :] - b[np.newaxis, :, :]) ** 2, axis=-1))
+    # cdist avoids materializing the (M, N, D) broadcast difference, cutting memory and
+    # time on large domains; numerically equivalent to the sqrt-of-squared-sum form.
+    return cdist(a, b)
 
 
 def find_nearest_residues(
@@ -160,6 +165,12 @@ def find_nearest_residues(
     dist[:, -1] = np.inf
     dist[-1, :] = np.inf
 
+    # Residues whose entire distance column is inf after self/invalid/boundary masking have
+    # no valid partner (tiny/degenerate structures); argmin would return a bogus index 0.
+    # Capture this here, before any min_seq_dist offset masking mutates the columns, so a
+    # legitimate fall-back partner is never misread as having no partner.
+    no_partner = np.isinf(dist).all(axis=0)
+
     # Filter by minimum sequence distance separation if required
     if min_seq_dist is not None and min_seq_dist != 1:
         n = dist.shape[0]
@@ -180,6 +191,11 @@ def find_nearest_residues(
             dist[j, np.arange(dist.shape[0])] = np.inf
             current_k -= 1
         j = dist.argmin(axis=0)
+
+    # Mark partnerless residues with a -1 sentinel so calc_angles_forloop drops them
+    # instead of silently pairing to residue 0.
+    j = j.copy()
+    j[no_partner] = -1
 
     if return_dist:
         return j, dist[j, np.arange(dist.shape[0])]
@@ -269,6 +285,9 @@ def calc_angles_forloop(
     for i in range(1, n_res - 1):
         if valid_mask[i - 1] and valid_mask[i] and valid_mask[i + 1]:
             j = partner_idx[i]
+            # -1 sentinel from find_nearest_residues: residue had no valid partner.
+            if j < 0:
+                continue
             if valid_mask[j + 1] and valid_mask[j - 1]:
                 out[i] = calc_angles(coords, i, j)
 
@@ -289,8 +308,20 @@ def get_coords_from_pdb(path: str, full_backbone: bool = False) -> tuple[np.ndar
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("None", path)
     assert structure is not None
-    model = structure[0]
-    chain = next(iter(model.get_chains()))
+
+    # Keep the first-model/first-chain selection, but make silent truncation observable:
+    # multi-chain / multi-model inputs (mmCIF, AlphaFold, NMR ensembles) would otherwise
+    # drop every chain/model past the first without any signal.
+    models = list(structure.get_models())
+    model = models[0]
+    chains = list(model.get_chains())
+    chain = chains[0]
+    if len(models) > 1 or len(chains) > 1:
+        print(
+            f"Warning: {path}: {len(models)} model(s), {len(chains)} chain(s); "
+            f"using model 0 chain {chain.id}",
+            file=sys.stderr,
+        )
 
     coords, valid_mask = get_atom_coordinates(
         list(chain.get_residues()), full_backbone=full_backbone
