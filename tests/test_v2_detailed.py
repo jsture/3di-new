@@ -515,3 +515,21 @@ def test_inference_fallback_discretize() -> None:
     # 3. Discretize fallback raises error if centroids is None
     with pytest.raises(ValueError, match="Centroids must be provided"):
         _ = discretize(encoder, None, x)
+
+
+def test_encode_device_move_is_noop_on_cpu() -> None:
+    """Device-aware encoding produces identical output after a CPU no-op move."""
+    encoder = nn.Linear(10, 4)
+    x = np.random.randn(8, 10).astype(np.float32)
+    centroids = np.random.randn(5, 4).astype(np.float32)
+
+    z_before = predict(encoder, x)
+    idx_before = discretize(encoder, centroids, x)
+
+    encoder.to("cpu")  # explicit no-op; inputs are moved to the model's device internally
+
+    z_after = predict(encoder, x)
+    idx_after = discretize(encoder, centroids, x)
+
+    assert np.array_equal(z_before, z_after)
+    assert np.array_equal(idx_before, idx_after)
