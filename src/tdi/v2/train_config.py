@@ -26,6 +26,7 @@ class QuantizerTrainConfig:
 
     l2_normalize: bool = True
     decay: float = 0.99
+    eps: float = 1e-5  # Laplace smoothing epsilon for EMA codebook counts
     commitment_cost: float = 0.25
     min_count: float = 1.0
     replacement_warmup_steps: int = 500
