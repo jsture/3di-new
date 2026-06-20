@@ -12,13 +12,16 @@ from .features import (
     move_CB,
 )
 from .model import (
+    LETTERS,
+    AlphabetModel,
+    ResidualMLP,
+)
+from .quantizers import (
     EMAVectorQuantizer,
     FSQQuantizer,
-    ResidualMLP,
-    TdiV2Model,
+    make_quantizer,
 )
 from .training_data import (
-    AlignmentBatchSampler,
     PairDataset,
     align_features,
     encoder_features,
@@ -27,12 +30,12 @@ from .training_data import (
 )
 
 __all__ = [
-    "AlignmentBatchSampler",
+    "LETTERS",
+    "AlphabetModel",
     "EMAVectorQuantizer",
     "FSQQuantizer",
     "PairDataset",
     "ResidualMLP",
-    "TdiV2Model",
     "align_features",
     "approx_c_beta_position",
     "calc_angles",
@@ -44,6 +47,7 @@ __all__ = [
     "fit_standardizer",
     "get_atom_coordinates",
     "get_coords_from_pdb",
+    "make_quantizer",
     "move_CB",
     "predict",
     "process_pdb",
