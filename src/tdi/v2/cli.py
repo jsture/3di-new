@@ -204,6 +204,15 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument(
         "--quantizer", type=str, choices=["vq", "fsq"], help="Convenience for model.quantizer."
     )
+    train_parser.add_argument(
+        "--rotation-trick", action="store_true", help="Use rotation-trick gradients for VQ."
+    )
+    train_parser.add_argument(
+        "--optimizer",
+        type=str,
+        choices=["adamw", "schedulefree"],
+        help="Convenience for train.optimizer.",
+    )
     train_parser.add_argument("--out", type=str, help="Convenience for outputs.out_dir.")
 
     # Subcommand evaluate

@@ -1,8 +1,8 @@
 """Plain (no-Lightning) training loop for the single-path v2 alphabet model.
 
-One quantizer per run, fixed LR by default (optional cosine), grad-clip + early-stop on
-``val_loss``. Writes the self-describing export plus ``run_config.resolved.json`` and
-``train_log.csv`` into the run directory.
+One quantizer per run, fixed LR by default (optional cosine, or Schedule-Free AdamW),
+grad-clip + early-stop on ``val_loss``. Writes the self-describing export plus
+``run_config.resolved.json`` and ``train_log.csv`` into the run directory.
 """
 
 import argparse
@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from schedulefree import AdamWScheduleFree
 from torch.utils.data import DataLoader
 
 from tdi.v2.model import AlphabetModel
@@ -79,6 +80,68 @@ def _reconstruction_loss(loss_name: str, y_hat: torch.Tensor, y: torch.Tensor) -
     if loss_name == "smooth_l1":
         return F.smooth_l1_loss(y_hat, y)
     raise ValueError(f"Unknown reconstruction loss: {loss_name!r}")
+
+
+def _build_optimizer(
+    cfg: TrainConfig, model: AlphabetModel
+) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler | None]:
+    """Build the run's optimizer, plus an LR scheduler when one applies.
+
+    Weight decay is applied to matrix-shaped parameters only, never to biases or LayerNorm
+    gains. Schedule-Free returns no scheduler by construction: it folds warmup and the Adam
+    bias correction into its own rate, and the config validator rejects pairing it with one.
+    """
+    decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
+    no_decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
+
+    if cfg.train.optimizer == "schedulefree":
+        # Schedule-Free AdamW (Defazio et al., "The Road Less Scheduled", NeurIPS 2024).
+        # Warmup remains necessary under this method -- Algorithm 1 keeps a linear warmup
+        # term in the rate -- so it stays a real knob rather than being defaulted away.
+        return (
+            AdamWScheduleFree(
+                [
+                    {"params": decay_params, "weight_decay": cfg.train.weight_decay},
+                    {"params": no_decay_params, "weight_decay": 0.0},
+                ],
+                lr=cfg.train.lr,
+                betas=(cfg.train.sf_beta, 0.999),
+                warmup_steps=cfg.train.sf_warmup_steps,
+            ),
+            None,
+        )
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay_params, "weight_decay": cfg.train.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=cfg.train.lr,
+    )
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.max_epochs)
+        if cfg.train.scheduler == "cosine"
+        else None
+    )
+    return optimizer, scheduler
+
+
+def _set_optimizer_mode(optimizer: torch.optim.Optimizer, *, training: bool) -> None:
+    """Point Schedule-Free's live parameters at the right iterate; a no-op for plain AdamW.
+
+    Schedule-Free keeps its base sequence ``z`` in optimizer state and swaps the model's
+    parameters in place between the gradient-evaluation point ``y`` (train mode) and the
+    averaged point ``x`` (eval mode). ``x`` is the iterate the method is defined to return,
+    so validation, best-checkpoint snapshots, and the final export must all be taken in eval
+    mode -- weights read in train mode are ``y`` and are not what the method converges on.
+    Stepping while in eval mode raises, so the two modes must stay balanced.
+    """
+    if not isinstance(optimizer, AdamWScheduleFree):
+        return
+    if training:
+        optimizer.train()
+    else:
+        optimizer.eval()
 
 
 def _run_validation(
@@ -186,6 +249,7 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
         min_count=cfg.model.min_count,
         l2_normalize=cfg.model.l2_normalize,
         replacement_warmup_steps=cfg.model.replacement_warmup_steps,
+        rotation_trick=cfg.model.rotation_trick,
     )
 
     # One-shot k-means codebook init on the VQ path (no-op for FSQ).
@@ -196,21 +260,9 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
             seed=cfg.train.kmeans_seed,
         )
 
-    # AdamW with no weight decay on biases / LayerNorm gains.
-    decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
-    no_decay_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": cfg.train.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
-        lr=cfg.train.lr,
-    )
-    scheduler = (
-        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.max_epochs)
-        if cfg.train.scheduler == "cosine"
-        else None
-    )
+    # Built after k-means init: seeding reads the encoder before any optimizer exists, so the
+    # parameters it sees are the plain initialization rather than a Schedule-Free iterate.
+    optimizer, scheduler = _build_optimizer(cfg, model)
 
     out_dir = Path(cfg.outputs.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -218,6 +270,9 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
     # Print training headers
     print("\nTraining 3Di VAE v2 model:")
     print(f"  * Quantizer: {cfg.model.quantizer} (n_states={model.n_states})")
+    print(
+        f"  * Optimizer: {cfg.train.optimizer} (lr={cfg.train.lr}, scheduler={cfg.train.scheduler})"
+    )
     print(f"  * Dataset: {processed_dir.name} (batch_size={cfg.train.batch_size})")
     print(f"  * Output: {out_dir}\n")
 
@@ -236,6 +291,9 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
 
     for epoch in range(cfg.train.max_epochs):
         model.train()
+        # Schedule-Free steps against y and starts in eval mode, so this must precede the
+        # first optimizer.step() of every epoch (stepping in eval mode raises).
+        _set_optimizer_mode(optimizer, training=True)
         epoch_loss = 0.0
         epoch_recon_loss = 0.0
         epoch_q_loss = 0.0
@@ -276,6 +334,9 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
         train_loss = epoch_loss / max(1, n_batches)
         train_recon_loss = epoch_recon_loss / max(1, n_batches)
         train_q_loss = epoch_q_loss / max(1, n_batches)
+        # Swap to the averaged x iterate before anything reads the weights: both the
+        # validation numbers below and the best_state snapshot must describe x, not y.
+        _set_optimizer_mode(optimizer, training=False)
         diag = _run_validation(model, val_loader, cfg.model.loss, model.n_states)
         log_rows.append(
             {
@@ -313,6 +374,10 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
         if patience_left <= 0:
             print(f"\nEarly stopping at epoch {epoch + 1} (no val_loss improvement).")
             break
+
+    # Belt-and-braces: the loop always exits just after a validation pass, so the optimizer is
+    # already in eval mode, but the export must never depend on that being true.
+    _set_optimizer_mode(optimizer, training=False)
 
     # Restore the best weights before exporting.
     if best_state is not None:
@@ -366,6 +431,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--quantizer", type=str, choices=["vq", "fsq"], help="Convenience for model.quantizer."
     )
+    parser.add_argument(
+        "--rotation-trick", action="store_true", help="Use rotation-trick gradients for VQ."
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        choices=["adamw", "schedulefree"],
+        help="Convenience for train.optimizer.",
+    )
     parser.add_argument("--out", type=str, help="Convenience for outputs.out_dir.")
     args, unknown = parser.parse_known_args(argv)
 
@@ -375,6 +449,10 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(str(exc))
     if args.quantizer is not None:
         overrides["model.quantizer"] = args.quantizer
+    if args.rotation_trick:
+        overrides["model.rotation_trick"] = True
+    if args.optimizer is not None:
+        overrides["train.optimizer"] = args.optimizer
     if args.out is not None:
         overrides["outputs.out_dir"] = args.out
 

@@ -27,6 +27,7 @@ class ModelConfig:
     min_count: float = 1.0
     l2_normalize: bool = True
     replacement_warmup_steps: int = 500  # VQ: steps before dead-code replacement begins
+    rotation_trick: bool = False  # VQ only; standard STE remains the default
 
 
 @dataclass
@@ -39,6 +40,9 @@ class LoopConfig:
     max_epochs: int = 20
     patience: int = 5
     scheduler: str = "none"  # "none" (fixed LR) or "cosine"
+    optimizer: str = "adamw"  # "adamw" or "schedulefree" (Schedule-Free AdamW)
+    sf_warmup_steps: int = 500  # schedule-free: linear LR warmup steps; ignored by adamw
+    sf_beta: float = 0.9  # schedule-free: momentum interpolation beta_1; ignored by adamw
     clip_grad_norm: float = 1.0
     seed: int = 1
     kmeans_init: bool = True  # VQ only; one-shot k-means codebook seeding
@@ -107,9 +111,28 @@ def _validate_train_config(cfg: TrainConfig) -> None:
         raise ValueError("model.commitment_cost and model.min_count must be >= 0")
     if model.replacement_warmup_steps < 0:
         raise ValueError("model.replacement_warmup_steps must be >= 0")
+    if not isinstance(model.rotation_trick, bool):
+        raise ValueError("model.rotation_trick must be true or false")
+    if model.rotation_trick and model.quantizer == "fsq":
+        raise ValueError("model.rotation_trick is only supported by the VQ quantizer")
 
     if loop.scheduler not in {"none", "cosine"}:
         raise ValueError(f"train.scheduler must be 'none' or 'cosine', got {loop.scheduler!r}")
+    if loop.optimizer not in {"adamw", "schedulefree"}:
+        raise ValueError(
+            f"train.optimizer must be 'adamw' or 'schedulefree', got {loop.optimizer!r}"
+        )
+    # Schedule-Free exists to remove the schedule; running one on top of it is a contradiction
+    # rather than a stacking of two good ideas, so reject the combination outright.
+    if loop.optimizer == "schedulefree" and loop.scheduler != "none":
+        raise ValueError(
+            "train.optimizer='schedulefree' cannot be combined with "
+            f"train.scheduler={loop.scheduler!r}; Schedule-Free replaces the LR schedule."
+        )
+    if loop.sf_warmup_steps < 0:
+        raise ValueError(f"train.sf_warmup_steps must be >= 0, got {loop.sf_warmup_steps!r}")
+    if not 0.0 <= loop.sf_beta < 1.0:
+        raise ValueError(f"train.sf_beta must be in [0, 1), got {loop.sf_beta!r}")
     if loop.lr <= 0 or loop.batch_size <= 0 or loop.max_epochs <= 0:
         raise ValueError("train.lr, train.batch_size, and train.max_epochs must be > 0")
     if loop.weight_decay < 0 or loop.patience < 0:

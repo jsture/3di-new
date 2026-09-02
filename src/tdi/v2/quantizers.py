@@ -9,9 +9,9 @@ Two first-class quantizers form the discrete alphabet:
 
 Both return ``(z_q, indices, q_loss, metrics)`` where ``metrics`` is a dict of optional
 diagnostics, so adding or dropping a metric never churns call sites. EMA-VQ uses the standard
-straight-through estimator; FSQ preserves the derivative of its bounding function and applies
-the straight-through estimator only to rounding, following the reference formulation. The
-rotation trick has been removed from the core and lives in git history.
+straight-through estimator by default, with an optional rotation-trick gradient. FSQ preserves
+the derivative of its bounding function and applies the straight-through estimator only to
+rounding, following the reference formulation.
 """
 
 import numpy as np
@@ -24,6 +24,26 @@ from sklearn.cluster import KMeans
 def _round_ste(z: torch.Tensor) -> torch.Tensor:
     """Round in the forward pass while preserving the input gradient."""
     return z + (torch.round(z) - z).detach()
+
+
+def _rotation_trick(z: torch.Tensor, z_q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Return ``z_q`` in the forward pass and rotate its gradient toward ``z``."""
+    original_dtype = z.dtype
+    z_float = z.float()
+    z_q_float = z_q.float()
+
+    direction = F.normalize(
+        F.normalize(z_float, dim=-1, eps=eps) + F.normalize(z_q_float, dim=-1, eps=eps),
+        dim=-1,
+        eps=eps,
+    ).detach()
+    rotated = 2.0 * direction * (z_float * direction).sum(dim=-1, keepdim=True) - z_float
+    scale = (
+        torch.linalg.vector_norm(z_q_float, dim=-1, keepdim=True)
+        / torch.linalg.vector_norm(rotated, dim=-1, keepdim=True).clamp_min(eps)
+    ).detach()
+    rotated = (rotated * scale).to(original_dtype)
+    return rotated + (z_q - rotated).detach()
 
 
 def _kmeans(x: torch.Tensor, n_clusters: int, seed: int = 0) -> torch.Tensor:
@@ -79,7 +99,8 @@ class EMAVectorQuantizer(nn.Module):
     """Vector Quantizer using Exponential Moving Average (EMA) codebook updates.
 
     Performs L2-normalized nearest neighbor search and applies mandatory dead-code
-    replacement to avoid codebook collapse. Gradient flow is the straight-through estimator.
+    replacement to avoid codebook collapse. Gradient flow is straight-through by default,
+    with an optional rotation trick.
     """
 
     embedding: torch.Tensor
@@ -98,6 +119,7 @@ class EMAVectorQuantizer(nn.Module):
         l2_normalize: bool = True,
         min_count: float = 1.0,
         replacement_warmup_steps: int = 500,
+        rotation_trick: bool = False,
     ) -> None:
         """Initialize the EMAVectorQuantizer.
 
@@ -111,6 +133,8 @@ class EMAVectorQuantizer(nn.Module):
             min_count: Minimum EMA usage count threshold for code replacement.
             replacement_warmup_steps: Internal warmup before replacing unused centroids
                 (a fixed default, not a surfaced config knob).
+            rotation_trick: Use the rotation-trick surrogate gradient instead of the standard
+                straight-through estimator.
         """
         super().__init__()
         self.n_states = n_states
@@ -121,6 +145,7 @@ class EMAVectorQuantizer(nn.Module):
         self.l2_normalize = l2_normalize
         self.min_count = min_count
         self.replacement_warmup_steps = replacement_warmup_steps
+        self.rotation_trick = rotation_trick
 
         # Initialize codebook embedding weights
         embedding = torch.randn(n_states, z_dim)
@@ -226,8 +251,11 @@ class EMAVectorQuantizer(nn.Module):
 
         # Commitment loss regularizes the encoder toward the (detached) codebook.
         q_loss = self.commitment_cost * F.mse_loss(z, z_q.detach())
-        # Straight-through estimator: forward value z_q, gradient path z.
-        z_q = z + (z_q - z).detach()
+        if self.rotation_trick:
+            z_q = _rotation_trick(z, z_q)
+        else:
+            # Straight-through estimator: forward value z_q, gradient path z.
+            z_q = z + (z_q - z).detach()
 
         metrics = {
             "perplexity": perplexity.detach(),
@@ -350,6 +378,7 @@ def make_quantizer(
     l2_normalize: bool = True,
     min_count: float = 1.0,
     replacement_warmup_steps: int = 500,
+    rotation_trick: bool = False,
 ) -> EMAVectorQuantizer | FSQQuantizer:
     """Build the selected quantizer behind the shared interface.
 
@@ -364,11 +393,14 @@ def make_quantizer(
         l2_normalize: Cosine lookup (VQ).
         min_count: Dead-code replacement threshold (VQ).
         replacement_warmup_steps: Steps before dead-code replacement begins (VQ).
+        rotation_trick: Use rotation-trick gradients for VQ.
 
     Returns:
         An ``EMAVectorQuantizer`` or ``FSQQuantizer``.
     """
     if quantizer == "fsq":
+        if rotation_trick:
+            raise ValueError("rotation_trick is only supported by the VQ quantizer")
         return FSQQuantizer(levels if levels is not None else [5, 4])
     if quantizer in ("vq", "ema_vq"):
         return EMAVectorQuantizer(
@@ -380,5 +412,6 @@ def make_quantizer(
             l2_normalize=l2_normalize,
             min_count=min_count,
             replacement_warmup_steps=replacement_warmup_steps,
+            rotation_trick=rotation_trick,
         )
     raise ValueError(f"Unknown quantizer: {quantizer!r}")

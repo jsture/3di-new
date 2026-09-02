@@ -10,6 +10,7 @@ model:
   decay: 0.99
   min_count: 1.0
   l2_normalize: true
+  rotation_trick: false
 train:
   lr: 0.001
   weight_decay: 0.0001
@@ -17,6 +18,7 @@ train:
   max_epochs: 20
   patience: 5
   scheduler: none
+  optimizer: adamw
   clip_grad_norm: 1.0
   seed: 1
   kmeans_init: true
