@@ -2,11 +2,28 @@
 """CLI: Generate group-aware train and validation split manifests."""
 
 import argparse
-import random
 from collections import defaultdict
 from pathlib import Path
 
+from sklearn.model_selection import GroupShuffleSplit
+
 from tdi.data.scop import classify, load_scop_lookup
+
+
+def select_validation_groups(group_ids: list[str], val_split: float, seed: int) -> set[str]:
+    """Select validation groups with sklearn while preserving floor-count semantics."""
+    if not 0.0 <= val_split <= 1.0:
+        raise ValueError(f"val_split must be in [0, 1], got {val_split}")
+
+    val_size = int(len(group_ids) * val_split)
+    if val_size == 0:
+        return set()
+    if val_size == len(group_ids):
+        return set(group_ids)
+
+    splitter = GroupShuffleSplit(n_splits=1, test_size=val_size, random_state=seed)
+    _, val_indices = next(splitter.split(group_ids, groups=group_ids))
+    return {group_ids[int(index)] for index in val_indices}
 
 
 def main() -> None:
@@ -32,10 +49,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    random.seed(args.seed)
-
     with open(args.input) as f:
-        sids = f.read().splitlines()
+        sids = [line.strip() for line in f.read().splitlines() if line.strip()]
 
     scop_lookup = {}
     if args.group_by in ("fold", "superfamily"):
@@ -67,13 +82,11 @@ def main() -> None:
                 group_id = sid
         groups[group_id].append(sid)
 
-    # Shuffle groups
     group_ids = list(groups.keys())
-    random.shuffle(group_ids)
-
-    # Split
-    val_size = int(len(group_ids) * args.val_split)
-    val_groups = set(group_ids[:val_size])
+    try:
+        val_groups = select_validation_groups(group_ids, args.val_split, args.seed)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

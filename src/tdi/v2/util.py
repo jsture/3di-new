@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+from scipy.stats import entropy
 
 
 def parse_cigar(cigar_string: str) -> np.ndarray:
@@ -68,12 +69,19 @@ def mutual_information(p_ab: np.ndarray) -> float:
     Returns:
         Mutual information in bits.
     """
+    if p_ab.ndim != 2:
+        raise ValueError(f"p_ab must be a 2D joint distribution, got shape {p_ab.shape}")
+    if not np.all(np.isfinite(p_ab)):
+        raise ValueError("p_ab must contain only finite probabilities")
+    if np.any(p_ab < 0):
+        raise ValueError("p_ab cannot contain negative probabilities")
+    if p_ab.size == 0 or p_ab.sum() == 0:
+        return 0.0
+
     p_a = p_ab.sum(axis=1)
     p_b = p_ab.sum(axis=0)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        # Log2 scores calculation for MI
-        log_scores = np.log2(p_ab / (p_a[:, np.newaxis] * p_b))
-        return float(np.sum(p_ab * log_scores, where=np.isfinite(log_scores)))
+    independent = np.outer(p_a, p_b)
+    return float(entropy(p_ab.ravel(), independent.ravel(), base=2))
 
 
 def parse_pairfile_line(line: str) -> tuple[str, str, str] | None:

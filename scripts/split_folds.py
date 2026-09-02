@@ -2,10 +2,24 @@
 """CLI: split SCOP domain identifiers into cross-validation fold partitions."""
 
 import argparse
-import random
 from pathlib import Path
 
+from sklearn.model_selection import KFold
+
 from tdi.data.scop import classify, load_scop_lookup
+
+
+def partition_folds(folds: list[str], k: int, seed: int) -> list[list[str]]:
+    """Partition unique SCOP folds into ``k`` seeded validation sets."""
+    if k < 2:
+        raise ValueError(f"k must be >= 2, got {k}")
+    if len(folds) < k:
+        raise ValueError(f"k={k} exceeds the number of classified folds ({len(folds)})")
+
+    splitter = KFold(n_splits=k, shuffle=True, random_state=seed)
+    return [
+        [folds[int(index)] for index in test_indices] for _, test_indices in splitter.split(folds)
+    ]
 
 
 def main() -> None:
@@ -47,18 +61,10 @@ def main() -> None:
 
     folds = sorted({fold for c in cls if (fold := classify(c)["fold"]) is not None})
 
-    random.seed(args.seed)
-    random.shuffle(folds)
-
-    n = len(folds)
-    chunk_sizes = [n // args.k] * args.k
-    for i in range(n - sum(chunk_sizes)):
-        chunk_sizes[i] += 1
-
-    splits: list[list[str]] = []
-    for i, size in enumerate(chunk_sizes):
-        start_idx = sum(chunk_sizes[:i])
-        splits.append(folds[start_idx : start_idx + size])
+    try:
+        splits = partition_folds(folds, args.k, args.seed)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     for i, split in enumerate(splits):
         split_set = set(split)
