@@ -198,7 +198,7 @@ class AlphabetModel(nn.Module):
 
     def init_codebook_from_loader(
         self,
-        loader: torch.utils.data.DataLoader[tuple[torch.Tensor, torch.Tensor]],
+        loader: torch.utils.data.DataLoader[tuple[torch.Tensor, ...]],
         n_batches: int = 8,
         seed: int = 0,
     ) -> None:

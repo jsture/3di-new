@@ -5,19 +5,7 @@ import argparse
 import random
 from pathlib import Path
 
-
-def get_fold(classification: str) -> str:
-    """Extract class and fold identifier from a full SCOP classification string.
-
-    For example, maps "d.58.1.5" to "d.58".
-
-    Args:
-        classification: SCOP classification string.
-
-    Returns:
-        The class + fold portion of the identifier.
-    """
-    return ".".join(classification.split(".")[:2])
+from tdi.data.scop import classify, load_scop_lookup
 
 
 def main() -> None:
@@ -27,7 +15,7 @@ def main() -> None:
     parser.add_argument(
         "--lookup-file",
         type=str,
-        default=str(Path(__file__).parent.parent / "data" / "scop_lookup.tsv"),
+        default=str(Path(__file__).parent.parent / "data" / "raw" / "scop_lookup.tsv"),
         help="Path to the SCOP classification lookup mapping TSV file.",
     )
     parser.add_argument(
@@ -53,18 +41,11 @@ def main() -> None:
     out_path = Path(args.out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    with open(args.lookup_file) as file:
-        lines = file.readlines()
+    scop_lookup = load_scop_lookup(args.lookup_file)
+    sids: list[str] = list(scop_lookup.keys())
+    cls: list[str] = list(scop_lookup.values())
 
-    sids: list[str] = []
-    cls: list[str] = []
-    for line in lines:
-        parts = line.strip().split()
-        if len(parts) >= 2:
-            sids.append(parts[0])
-            cls.append(parts[1])
-
-    folds = sorted({get_fold(c) for c in cls})
+    folds = sorted({fold for c in cls if (fold := classify(c)["fold"]) is not None})
 
     random.seed(args.seed)
     random.shuffle(folds)
@@ -81,7 +62,9 @@ def main() -> None:
 
     for i, split in enumerate(splits):
         split_set = set(split)
-        fold_lines = [f"{sid} {cl}" for sid, cl in zip(sids, cls) if get_fold(cl) in split_set]
+        fold_lines = [
+            f"{sid} {cl}" for sid, cl in zip(sids, cls) if classify(cl)["fold"] in split_set
+        ]
         split_file = out_path / f"fold_split{i}.txt"
         with open(split_file, "w") as file:
             file.write("\n".join(fold_lines))

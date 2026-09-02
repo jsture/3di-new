@@ -232,7 +232,7 @@ def align_features(
     feat1, mask1, coords1 = extract_features(str(path1), virtual_center)
     feat2, mask2, coords2 = extract_features(str(path2), virtual_center)
 
-    idx_pairs = parse_alignment(cigar_string)
+    idx_pairs = util.parse_cigar(cigar_string)
     n_pairs_before_filters = idx_pairs.shape[0]
     if n_pairs_before_filters == 0:
         return (

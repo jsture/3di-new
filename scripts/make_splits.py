@@ -6,6 +6,8 @@ import random
 from collections import defaultdict
 from pathlib import Path
 
+from tdi.data.scop import classify, load_scop_lookup
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -37,16 +39,10 @@ def main() -> None:
 
     scop_lookup = {}
     if args.group_by in ("fold", "superfamily"):
-        lookup_path = Path(args.scop_lookup)
-        if lookup_path.exists():
-            with open(lookup_path) as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 2:
-                        scop_lookup[parts[0]] = parts[1]
-        else:
+        scop_lookup = load_scop_lookup(args.scop_lookup)
+        if not scop_lookup:
             print(
-                f"Warning: SCOP lookup file {args.scop_lookup} not found. "
+                f"Warning: SCOP lookup file {args.scop_lookup} not found or empty. "
                 "Falling back to PDB grouping."
             )
 
@@ -58,12 +54,8 @@ def main() -> None:
     for sid in sids:
         group_id = None
         if args.group_by in ("fold", "superfamily") and sid in scop_lookup:
-            classification = scop_lookup[sid]
-            parts = classification.split(".")
-            if args.group_by == "fold":
-                group_id = ".".join(parts[:2])
-            else:
-                group_id = ".".join(parts[:3])
+            classified = classify(scop_lookup[sid])
+            group_id = classified.get(args.group_by)
 
         # Fallback to PDB grouping if SCOP class lookup fails
         if group_id is None:

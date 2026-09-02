@@ -8,8 +8,8 @@ inside ``[0, n_states)``, and ``evaluate`` writes ``sequences.txt`` / ``submat.t
 simplification stays distinguishable from silent drift.
 """
 
+import argparse
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -253,7 +253,7 @@ def test_evaluate_writes_three_artifacts(tmp_path: Path) -> None:
     pairfile.write_text("alpha beta 10P\n")
 
     out_dir = tmp_path / "eval"
-    args = SimpleNamespace(
+    args = argparse.Namespace(
         model_dir=str(model_dir),
         pdb_dir=str(pdb_dir),
         pairfile=str(pairfile),

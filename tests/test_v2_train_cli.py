@@ -7,7 +7,7 @@ from unittest.mock import patch
 import yaml
 
 from tdi.v2.train import main
-from tdi.v2.train_config import load_train_config
+from tdi.v2.train_config import TrainConfig, load_train_config
 
 
 def _write_config(tmp_path: Path) -> Path:
@@ -38,11 +38,10 @@ def test_main_resolves_cli_overrides_and_conveniences(tmp_path: Path) -> None:
     """main() merges --config, dotted overrides, and --quantizer/--out conveniences."""
     config_file = _write_config(tmp_path)
 
-    captured: dict[str, object] = {}
+    captured: dict[str, TrainConfig] = {}
 
-    def _capture(cfg: object) -> object:
+    def _capture(cfg: TrainConfig) -> None:
         captured["cfg"] = cfg
-        return cfg
 
     test_argv = [
         "train",
