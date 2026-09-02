@@ -7,6 +7,8 @@ name = "tdi"
 version = "0.1.0"
 description = "3Di structural alphabet encoding: VQ-VAE training and PDB feature extraction"
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.13"
 dependencies = [
     "biopython>=1.87",

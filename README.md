@@ -1,58 +1,43 @@
-# 3Di VAE v2: a single, auditable structural-alphabet learner
+# 3Di VAE v2 — a discrete structural alphabet learner
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 [![Python: 3.13](https://img.shields.io/badge/Python-3.13-blue.svg)](https://www.python.org/downloads/release/python-3130/)
 [![Orcid: Jakob](https://img.shields.io/badge/Jakob-bar?style=flat&logo=orcid&labelColor=white&color=grey)](https://orcid.org/0000-0002-2841-7284)
 
-One reliable path from aligned residue descriptors to a trained discrete 3Di-style structural
-alphabet: a config-driven preprocessing stage, a plain-PyTorch training stage, and an evaluation
-stage that emits a substitution matrix and alphabet diagnostics.
+Learns a **3Di-style structural alphabet**: a small set of discrete states (default 20) that each
+residue of a protein structure is mapped to, so that structures can be compared as *sequences*
+instead of as coordinates.
+
+The training signal comes from structural alignments. Two residues that a structural aligner put
+in the same alignment column should look alike, so the model encodes residue *i* of one structure
+into a discrete state and is asked to reconstruct the local geometry of its aligned partner *j* in
+the other structure. States that survive this are states that generalize across homologs.
+
+Everything runs as three explicit commands — build features, train, evaluate — with YAML configs,
+content-hashed dataset manifests, and self-describing run directories.
 
 ---
 
-## The v2 pipeline
+## Quickstart
 
-Three stages, each a separate command:
-
-1. **Build features** (`python -m tdi.data build-features`) — parse PDBs, expand CIGAR
-   alignments, filter residue pairs by superposed Cα distance, and write standardized feature
-   arrays + a train-only scaler + auditable per-pair metadata.
-2. **Train** (`python -m tdi.v2 train`) — train exactly one quantizer into a self-describing
-   run directory.
-3. **Evaluate** (`python -m tdi.v2 evaluate`) — encode validation structures to sequences and
-   compute the substitution matrix + alphabet diagnostics.
-
-### The model
-
-An MLP encoder maps each 10-D residue descriptor to a latent; a quantizer forms the discrete
-state; an MLP decoder predicts the **aligned partner's** descriptors. Training minimizes a single
-`smooth_l1` partner-prediction loss plus the quantizer loss, with a **straight-through** gradient,
-**fp32** throughout, plain PyTorch (no Lightning), and a **fixed learning rate** by default.
-
-Two quantizers sit behind one interface, selected by `--quantizer {vq,fsq}` — a run trains exactly
-one:
-
-- **EMA-VQ** (reference): EMA codebook updates, commitment loss, L2-normalized (cosine) lookup,
-  mandatory dead-code replacement, one-shot k-means init.
-- **FSQ `[5,4]`** (comparator): a fixed finite-scalar grid, no learned codebook, no collapse to
-  guard against.
-
-`n_states` is configurable and **capped at 50** (the alphabet has 50 letters; more needs a longer
-alphabet). Default is 20 — for FSQ that is levels `[5, 4]`. The alphabet is recorded in the export
-`config.json`, so encode/eval never hardcode it.
-
-The optional, standalone `scripts/compare_quantizers.py` driver runs the normal train + evaluate
-path twice (once `vq`, once `fsq`) and writes a side-by-side `comparison_report.json`. It is not
-part of the core path — the core never imports it; reach for it only when you want the comparison.
-
----
-
-## Getting started
+Requires Python 3.13 and [uv](https://github.com/astral-sh/uv).
 
 ```bash
 uv sync
 ```
+
+### 0. Get structures (once)
+
+Downloads the Foldseek SCOPe40 benchmark archive and lays it out as one file per SCOP domain ID
+under `data/external/foldseek_scop40/pdb_by_sid/` (~11k structures).
+
+```bash
+uv run python scripts/fetch_scop40_structures.py --out-dir data/external/foldseek_scop40
+```
+
+The alignment pairfiles (`data/derived/pairfiles/tmaln-06.{train,val}.out`) and the SCOP lookup
+(`data/raw/scop_lookup.tsv`) are already in the repo.
 
 ### 1. Build features
 
@@ -60,99 +45,232 @@ uv sync
 uv run python -m tdi.data build-features --config configs/data/scop.yaml --force
 ```
 
-Writes a processed dataset (`train_x_raw.npy`/`train_y_raw.npy`, `val_*`, `scaler.npz`, lean
-`*_metadata.parquet`, `structures.parquet`, `report.json` + `report.md`, `manifest.json`,
-`DATACARD.md`). Add `--full-report` to also emit the sequence-separation and Cα-distance histograms.
+Parses PDBs, expands the alignment CIGARs, drops residue pairs whose superposed Cα distance
+exceeds `max_ca_dist`, fits a **train-only** standardizer, and writes a processed dataset to
+`data/processed/scop_ca5_v1/`. Add `--full-report` for the sequence-separation and Cα-distance
+histograms.
 
 ### 2. Train one quantizer
 
-```bash
-# EMA-VQ (reference)
-uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer vq --out runs/ema_vq
-# FSQ [5,4] (comparator)
-uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer fsq --out runs/fsq_5x4
-```
+A run trains exactly one quantizer — pick it with `--quantizer`.
 
-Override any config field with dotted flags, e.g. `--model.n_states 24`, `--model.levels "[5,5]"`,
-`--train.max_epochs 10`, `--train.scheduler cosine`. The run directory gets `encoder_state_dict.pt`,
-`decoder_state_dict.pt`, `config.json`, `scaler.json`, `centroids.npy` (vq) or `fsq_levels.json`
-(fsq), plus `run_config.resolved.json` and `train_log.csv`.
+```bash
+# EMA-VQ, the reference learner
+uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer vq --out runs/ema_vq
+
+# FSQ [5,4], the fixed-grid comparator
+uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer fsq --out runs/fsq_5x4
+
+# Random-init VQ, the "no k-means" floor
+uv run python -m tdi.v2 train --config configs/train/scop_vq_baseline.yaml --out runs/vq_baseline_random
+```
 
 ### 3. Evaluate
 
+Encodes the validation structures to sequences, then scores the alphabet against the alignments.
+
 ```bash
 uv run python -m tdi.v2 evaluate \
-  --model_dir runs/ema_vq \
-  --pdb_dir data/pdb \
+  --model-dir runs/ema_vq \
+  --pdb-dir data/external/foldseek_scop40/pdb_by_sid \
   --pairfile data/derived/pairfiles/tmaln-06.val.out \
-  --out_dir runs/ema_vq/eval
+  --out-dir runs/ema_vq/eval
 ```
 
-Outputs:
-- `sequences.txt` — one encoded 3Di sequence per structure (invalid residues render as the
-  configured `invalid_state`, default `X`).
-- `submat.txt` — the log-odds substitution matrix over the alphabet.
-- `evaluation_report.json` — mutual information (`mi`, `mi_tot`), state usage, `dead_state_fraction`,
-  and `normalized_entropy`.
+The virtual-center geometry is read from the run's `config.json`. If that run was trained from a
+dataset whose manifest carried no provenance, `virtual_center` is `null` there and you must pass it
+explicitly: `--virt 270 0 2` (matching `features.virtual_center` in the data config).
 
 ---
 
-## Testing
+## How it works
+
+### Descriptors (10-D per residue)
+
+| Columns | Meaning |
+| --- | --- |
+| 0–6 | Cosines of 7 angles between backbone tangents and chord vectors to the nearest spatial neighbour |
+| 7 | Cα–Cα distance (Å) to that nearest neighbour |
+| 8 | Sequence separation, clamped to [−4, +4] |
+| 9 | Signed log separation, `sign(Δ)·ln(|Δ|+1)`, with `Δ = j − i` |
+
+"Nearest neighbour" is found from a **virtual center** placed relative to the backbone by
+`features.virtual_center: [alpha, beta, d]` — the same convention Foldseek's 3Di uses.
+
+### Model
+
+`descriptor(i) → encoder → z → quantizer → z_q → decoder → descriptor(j)`
+
+- Encoder: residual MLP, `input_dim=10 → hidden_dim=64 → z_dim=4`, depth 3.
+- Decoder: residual MLP, `z_dim → hidden_dim → input_dim`, depth 2. It predicts the **aligned
+  partner's** descriptors, never its own input.
+- Loss: one `smooth_l1` partner-prediction term plus the quantizer loss. Straight-through
+  gradient, fp32 throughout, plain PyTorch (no Lightning), fixed LR by default.
+- Early stopping on `val_loss` with `patience`; the best weights are restored before export.
+
+### The two quantizers
+
+| | `--quantizer vq` (EMA-VQ) | `--quantizer fsq` (FSQ) |
+| --- | --- | --- |
+| Codebook | Learned, EMA-updated | None — a fixed scalar grid |
+| Lookup | Cosine (L2-normalized) | Rounding per dimension |
+| Collapse risk | Real; guarded by mandatory dead-code replacement (after `replacement_warmup_steps`) | None by construction |
+| Init | One-shot k-means (`kmeans_init`) | n/a |
+| States | `n_states` | `prod(levels)`, and `z_dim = len(levels)` |
+
+FSQ **overrides** `n_states` and `z_dim` from `levels` (default `[5, 4]` → 20 states, `z_dim=2`).
+
+`n_states` is capped at **50**, the length of the alphabet
+`ABCDEFGHIJKLMNOPQRSTUVWYZabcdefghijklmnopqrstuvwyz`; more states needs a longer alphabet. The
+alphabet and the invalid-residue character (`X`) are recorded in the export `config.json`, so
+encoding and evaluation never hardcode them.
+
+---
+
+## What each stage writes
+
+**`build-features` → `data/processed/<name>/`**
+
+| File | Contents |
+| --- | --- |
+| `{train,val}_{x,y}_raw.npy` | Paired input/target descriptors (bidirectional: each aligned pair contributes both directions) |
+| `scaler.npz` | Feature mean/std, fit on train pairs only — no validation leakage |
+| `{train,val}_metadata.parquet` | Per-pair audit trail: source alignment row, SCOP classification |
+| `structures.parquet` | Per-structure QC: residue counts, valid fraction, missing-backbone flags |
+| `report.json` / `report.md` | Filter attrition, stage counts, optional histograms |
+| `manifest.json` | Resolved config + SHA-256 of every input and output |
+| `DATACARD.md` | Human-readable provenance card |
+
+**`train` → the run directory**
+
+| File | Contents |
+| --- | --- |
+| `encoder_state_dict.pt`, `decoder_state_dict.pt` | Weights |
+| `config.json` | Self-describing export: dims, quantizer, alphabet, `invalid_state`, geometric provenance |
+| `scaler.json` | Standardization params, so inference is standalone |
+| `centroids.npy` (vq) *or* `fsq_levels.json` (fsq) | The discrete codebook |
+| `run_config.resolved.json` | Fully resolved training config |
+| `train_log.csv` | `epoch, train_loss, val_loss, perplexity, dead_states, margin` |
+
+**`evaluate` → `--out-dir`**
+
+| File | Contents |
+| --- | --- |
+| `sequences.txt` | `<sid> <sequence>` per structure; invalid residues become `invalid_state` (`X`) |
+| `submat.txt` | Log-odds substitution matrix over the alphabet |
+| `evaluation_report.json` | `mi`, `mi_tot`, `state_usage`, `dead_state_fraction`, `normalized_entropy`, and encoding failure counts |
+
+Read `mi` / `mi_tot` as *how much a state in one structure tells you about the aligned state in
+the other* — higher is a more discriminative alphabet. `dead_state_fraction` near 0 and
+`normalized_entropy` near 1 mean the alphabet is actually using all its letters.
+
+---
+
+## Configuration
+
+Configs live in `configs/`. Every field can be overridden on the command line with a dotted flag,
+and the resolved result is what gets recorded:
+
+```bash
+uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml \
+  --model.n_states 24 --train.max_epochs 10 --train.scheduler cosine
+uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml \
+  --quantizer fsq --model.levels "[5,5]"
+```
+
+Knobs worth knowing:
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `model.quantizer` | `vq` | `vq` or `fsq` |
+| `model.n_states` | `20` | ≤ 50; ignored by FSQ (derived from `levels`) |
+| `model.levels` | `null` | FSQ grid; defaults to `[5, 4]` |
+| `model.z_dim` | `4` | Latent width; FSQ pins it to `len(levels)` |
+| `model.loss` | `smooth_l1` | or `mse` |
+| `model.commitment_cost` | `0.25` | VQ commitment penalty |
+| `model.decay` | `0.99` | VQ EMA decay |
+| `model.min_count` | `1.0` | VQ dead-code threshold |
+| `train.scheduler` | `none` | `none` (fixed LR) or `cosine` |
+| `train.patience` | `5` | Early stopping on `val_loss` |
+| `train.kmeans_init` | `true` | VQ codebook seeding; `false` gives the random-init baseline |
+| `features.max_ca_dist` | `5.0` | Å; pair filter in the data config |
+| `sampling.max_pairs_per_alignment` | `768` | Stops long alignments dominating the set |
+
+Unknown sections or keys are rejected at load time rather than silently ignored.
+
+The data CLI has two more subcommands: `python -m tdi.data validate` (structure QC and
+CIGAR-semantics checks) and `python -m tdi.data report` (re-render `report.md` from `report.json`).
+
+---
+
+## Comparing VQ against FSQ
+
+`scripts/compare_quantizers.py` runs the normal train + evaluate path twice and tabulates the two
+`evaluation_report.json` side by side:
+
+```bash
+uv run python scripts/compare_quantizers.py \
+  --config configs/train/scop_v2_default.yaml \
+  --pdb-dir data/external/foldseek_scop40/pdb_by_sid \
+  --pairfile data/derived/pairfiles/tmaln-06.val.out \
+  --out-root runs/compare --virt 270 0 2
+```
+
+Writes `comparison_report.json` and `comparison.md` under `--out-root`. This is deliberately
+opt-in and standalone — the core `tdi.v2` code never imports it. Exactly two runs, no sweeps.
+
+---
+
+## Development
 
 ```bash
 uv run pytest
+uv run ruff check src/tdi
+uv run ruff format --check src/tdi
+uv run pyright src/tdi
 ```
+
+`pre-commit` hooks are configured in `.pre-commit-config.yaml`; CI (`.github/workflows/ci.yml`)
+runs lint, type-check, and the test suite on every push to `main` and every PR.
 
 ---
 
-## Directory structure
+## Repository layout
 
 ```
-├── configs/            # YAML configs for data generation and model training
-├── data/
-│   ├── raw/            # Baseline SCOPe SIDs and alignment pairfiles
-│   ├── derived/        # Train/val split files
-│   └── processed/      # Preprocessed float32 feature arrays
-├── scripts/            # Splits, structure fetch, and the optional compare_quantizers driver
-├── src/tdi/
-│   ├── data/           # Preprocessing pipeline orchestration
-│   └── v2/             # Encoder/decoder, quantizers, training & evaluation
-└── tests/              # Unit and integration tests
+configs/
+  data/       # preprocessing config (SCOPe baseline)
+  train/      # training configs (default + random-init VQ baseline)
+data/
+  raw/        # SCOPe SIDs, lookup table, source alignments
+  derived/    # train/val pairfile splits
+  external/   # fetched SCOPe40 structures (pdb_by_sid/)
+  processed/  # built feature arrays + scaler + manifests
+docs/         # architecture overview and the pipeline technical reference
+experiments/  # quarantined runnable snapshots of removed mechanisms
+scripts/      # structure fetch, splits, optional quantizer comparison
+src/tdi/
+  data/       # preprocessing: PDB parsing, CIGAR expansion, QC, datacards
+  v2/         # model, quantizers, training loop, encoding, evaluation
+tests/        # unit, integration, and golden tests
+runs/         # training run directories (gitignored outputs)
 ```
 
-Removed objectives from earlier iterations — GaussianNLL, contrastive learning, self-reconstruction,
-the warmup curriculum, the transition head, the rotation-trick gradient, and coordinate/descriptor
-augmentation — live in git history (see `experiments/README.md`).
+More detail: [`docs/pipeline.md`](docs/pipeline.md) is the stage-by-stage technical reference.
 
----
+## History
 
-## Command Reference
+Objectives removed during the v2 simplification — GaussianNLL, contrastive learning,
+self-reconstruction, the warmup curriculum, the transition head, the rotation-trick gradient, and
+coordinate/descriptor augmentation — are recoverable from git history. The self-contained ones are
+kept runnable under `experiments/`; see [`experiments/README.md`](experiments/README.md) for how to
+retrieve the rest.
 
-### Training Commands
+## License
 
-1. **EMA-VQ Reference Model** (with k-means initialization):
-   ```bash
-   uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer vq --out runs/ema_vq
-   ```
+GPL-3.0-or-later — see [`LICENSE`](LICENSE). Copyright (C) 2026 Jakob.
 
-2. **FSQ Comparator Model** (fixed grid quantization):
-   ```bash
-   uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer fsq --out runs/fsq_5x4
-   ```
-
-3. **Random-Init VQ Baseline Model** (random codebook initialization):
-   ```bash
-   uv run python -m tdi.v2 train --config configs/train/scop_vq_baseline.yaml --out runs/vq_baseline_random
-   ```
-
-### Evaluation Command
-
-To evaluate any of the trained model runs on sequence alignments (requires the virtual center parameters):
-```bash
-uv run python -m tdi.v2 evaluate \
-  --model_dir runs/ema_vq \
-  --pdb_dir data/pdb \
-  --pairfile data/derived/pairfiles/tmaln-06.val.out \
-  --out_dir runs/ema_vq/eval \
-  --virt 270 0 2
-```
+This repository descends from [foldseek-analysis](https://github.com/steineggerlab/foldseek-analysis)
+(Steinegger lab); its early history contains that project's code, and the original 3Di training
+scripts under `training/` were GPL-licensed. `src/tdi/` is a rewrite, but the project stays under
+GPLv3 to remain compatible with that lineage.
