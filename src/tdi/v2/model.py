@@ -3,9 +3,9 @@
 A plain ``nn.Module`` (no PyTorch Lightning): an MLP encoder maps residue descriptors to a
 latent, one of two quantizers (EMA-VQ or FSQ, selected by a flag) forms the discrete state,
 and an MLP decoder predicts the aligned partner's descriptors. Training is a partner-
-prediction smooth-L1 loss plus the quantizer loss, straight-through gradient, fp32 throughout.
-The export is self-describing (the alphabet lives in ``config.json``) so encode/eval never
-hardcode it.
+prediction smooth-L1 loss plus the quantizer loss, fp32 throughout. EMA-VQ uses a
+straight-through gradient by default or an opt-in rotation trick. The export is self-describing
+(the alphabet lives in ``config.json``) so encode/eval never hardcode it.
 """
 
 import json
@@ -94,6 +94,7 @@ class AlphabetModel(nn.Module):
         replacement_warmup_steps: int = 500,
         letters: str = LETTERS,
         invalid_state: str = "X",
+        rotation_trick: bool = False,
     ) -> None:
         """Initialize the AlphabetModel.
 
@@ -113,11 +114,14 @@ class AlphabetModel(nn.Module):
             replacement_warmup_steps: Steps before dead-code replacement begins (VQ).
             letters: The structural alphabet; recorded in the export config.
             invalid_state: Character emitted for residues with invalid coordinates.
+            rotation_trick: Use rotation-trick gradients for VQ instead of straight-through.
         """
         super().__init__()
 
         # FSQ pins z_dim and n_states to the level grid.
         if quantizer == "fsq":
+            if rotation_trick:
+                raise ValueError("rotation_trick is only supported by the VQ quantizer")
             levels = levels if levels is not None else [5, 4]
             z_dim = len(levels)
             n_states = int(np.prod(levels))
@@ -132,6 +136,7 @@ class AlphabetModel(nn.Module):
         self.quantizer_name = quantizer
         self.levels = levels
         self.loss = loss
+        self.rotation_trick = rotation_trick
         self.letters = letters
         self.invalid_state = invalid_state
         # Provenance recorded at export time; unknown until a training run sets it.
@@ -151,6 +156,7 @@ class AlphabetModel(nn.Module):
             l2_normalize=l2_normalize,
             min_count=min_count,
             replacement_warmup_steps=replacement_warmup_steps,
+            rotation_trick=rotation_trick,
         )
 
         # Standardization buffers for standalone scaled inference.
@@ -268,6 +274,7 @@ class AlphabetModel(nn.Module):
             "quantizer": self.quantizer_name,
             "levels": self.levels,
             "loss": self.loss,
+            "rotation_trick": self.rotation_trick,
             "l2_normalize": getattr(self.quantizer, "l2_normalize", False),
             "feature_convention": "seq_delta_j_minus_i",
             "letters": self.letters,
@@ -325,6 +332,7 @@ class AlphabetModel(nn.Module):
             quantizer=quantizer,
             levels=levels,
             loss=config.get("loss", "smooth_l1"),
+            rotation_trick=config.get("rotation_trick", False),
             l2_normalize=config.get("l2_normalize", True),
             letters=config.get("letters", LETTERS),
             invalid_state=config.get("invalid_state", "X"),

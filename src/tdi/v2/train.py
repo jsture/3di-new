@@ -186,6 +186,7 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
         min_count=cfg.model.min_count,
         l2_normalize=cfg.model.l2_normalize,
         replacement_warmup_steps=cfg.model.replacement_warmup_steps,
+        rotation_trick=cfg.model.rotation_trick,
     )
 
     # One-shot k-means codebook init on the VQ path (no-op for FSQ).
@@ -366,6 +367,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--quantizer", type=str, choices=["vq", "fsq"], help="Convenience for model.quantizer."
     )
+    parser.add_argument(
+        "--rotation-trick", action="store_true", help="Use rotation-trick gradients for VQ."
+    )
     parser.add_argument("--out", type=str, help="Convenience for outputs.out_dir.")
     args, unknown = parser.parse_known_args(argv)
 
@@ -375,6 +379,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(str(exc))
     if args.quantizer is not None:
         overrides["model.quantizer"] = args.quantizer
+    if args.rotation_trick:
+        overrides["model.rotation_trick"] = True
     if args.out is not None:
         overrides["outputs.out_dir"] = args.out
 

@@ -58,6 +58,9 @@ A run trains exactly one quantizer — pick it with `--quantizer`.
 # EMA-VQ, the reference learner
 uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer vq --out runs/ema_vq
 
+# EMA-VQ with the optional rotation-trick gradient
+uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer vq --rotation-trick --out runs/ema_vq_rotation
+
 # FSQ [5,4], the fixed-grid comparator
 uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer fsq --out runs/fsq_5x4
 
@@ -104,8 +107,9 @@ explicitly: `--virt 270 0 2` (matching `features.virtual_center` in the data con
 - Encoder: residual MLP, `input_dim=10 → hidden_dim=64 → z_dim=4`, depth 3.
 - Decoder: residual MLP, `z_dim → hidden_dim → input_dim`, depth 2. It predicts the **aligned
   partner's** descriptors, never its own input.
-- Loss: one `smooth_l1` partner-prediction term plus the quantizer loss. Straight-through
-  gradient, fp32 throughout, plain PyTorch (no Lightning), fixed LR by default.
+- Loss: one `smooth_l1` partner-prediction term plus the quantizer loss. EMA-VQ uses a
+  straight-through gradient by default, with `--rotation-trick` as an opt-in alternative.
+  Training is fp32 throughout, plain PyTorch (no Lightning), with a fixed LR by default.
 - Early stopping on `val_loss` with `patience`; the best weights are restored before export.
 
 ### The two quantizers
@@ -114,6 +118,7 @@ explicitly: `--virt 270 0 2` (matching `features.virtual_center` in the data con
 | --- | --- | --- |
 | Codebook | Learned, EMA-updated | None — a fixed scalar grid |
 | Lookup | Cosine (L2-normalized) | Rounding per dimension |
+| Gradient | Straight-through, or `--rotation-trick` | Bounding derivative + rounding STE |
 | Collapse risk | Real; guarded by mandatory dead-code replacement (after `replacement_warmup_steps`) | None by construction |
 | Init | One-shot k-means (`kmeans_init`) | n/a |
 | States | `n_states` | `prod(levels)`, and `z_dim = len(levels)` |
@@ -261,10 +266,9 @@ More detail: [`docs/pipeline.md`](docs/pipeline.md) is the stage-by-stage techni
 ## History
 
 Objectives removed during the v2 simplification — GaussianNLL, contrastive learning,
-self-reconstruction, the warmup curriculum, the transition head, the rotation-trick gradient, and
-coordinate/descriptor augmentation — are recoverable from git history. The self-contained ones are
-kept runnable under `experiments/`; see [`experiments/README.md`](experiments/README.md) for how to
-retrieve the rest.
+self-reconstruction, the warmup curriculum, the transition head, and coordinate/descriptor
+augmentation — are recoverable from git history. The self-contained ones are kept runnable under
+`experiments/`; see [`experiments/README.md`](experiments/README.md) for how to retrieve the rest.
 
 ## License
 

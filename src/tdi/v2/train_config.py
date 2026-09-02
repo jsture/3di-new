@@ -27,6 +27,7 @@ class ModelConfig:
     min_count: float = 1.0
     l2_normalize: bool = True
     replacement_warmup_steps: int = 500  # VQ: steps before dead-code replacement begins
+    rotation_trick: bool = False  # VQ only; standard STE remains the default
 
 
 @dataclass
@@ -107,6 +108,10 @@ def _validate_train_config(cfg: TrainConfig) -> None:
         raise ValueError("model.commitment_cost and model.min_count must be >= 0")
     if model.replacement_warmup_steps < 0:
         raise ValueError("model.replacement_warmup_steps must be >= 0")
+    if not isinstance(model.rotation_trick, bool):
+        raise ValueError("model.rotation_trick must be true or false")
+    if model.rotation_trick and model.quantizer == "fsq":
+        raise ValueError("model.rotation_trick is only supported by the VQ quantizer")
 
     if loop.scheduler not in {"none", "cosine"}:
         raise ValueError(f"train.scheduler must be 'none' or 'cosine', got {loop.scheduler!r}")

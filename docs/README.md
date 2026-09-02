@@ -14,7 +14,7 @@ The system is organized into two primary layers:
 
 2. **Model & Alphabet Learning Layer (`src/tdi/v2/`)**
    - Core MLP encoder-decoder architecture with two first-class discrete quantizers: **EMA-VQ** (reference learner with dead-code replacement and k-means initialization) and **FSQ** (finite scalar comparator).
-   - Trains using plain PyTorch (fp32 throughout, straight-through estimator) and produces self-describing export artifacts.
+   - Trains using plain PyTorch (fp32 throughout, straight-through or opt-in rotation-trick gradients) and produces self-describing export artifacts.
    - Evaluates trained models on held-out structural alignments to emit substitution matrices and alphabet mutual information metrics.
    - Commands: `python -m tdi.v2 train --config ...` and `python -m tdi.v2 evaluate --model-dir ...`
 

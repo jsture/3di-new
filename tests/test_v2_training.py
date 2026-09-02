@@ -60,6 +60,29 @@ def test_ema_quantizer_interface() -> None:
     assert set(metrics) == {"perplexity", "n_replaced", "margin"}
 
 
+def test_rotation_trick_changes_only_the_vq_gradient() -> None:
+    """The opt-in path preserves quantized values while changing finite gradients."""
+    standard = EMAVectorQuantizer(n_states=2, z_dim=2)
+    rotated = EMAVectorQuantizer(n_states=2, z_dim=2, rotation_trick=True)
+    standard.embedding.copy_(torch.tensor([[1.0, 0.0], [0.0, 1.0]]))
+    rotated.load_state_dict(standard.state_dict())
+    standard.eval()
+    rotated.eval()
+
+    z_standard = torch.tensor([[0.8, 0.2], [0.2, 0.8]], requires_grad=True)
+    z_rotated = z_standard.detach().clone().requires_grad_()
+    weights = torch.tensor([[1.0, 2.0], [3.0, -1.0]])
+    out_standard = standard(z_standard)[0]
+    out_rotated = rotated(z_rotated)[0]
+
+    assert torch.equal(out_standard, out_rotated)
+    (out_standard * weights).sum().backward()
+    (out_rotated * weights).sum().backward()
+    assert z_standard.grad is not None and z_rotated.grad is not None
+    assert torch.isfinite(z_rotated.grad).all()
+    assert not torch.allclose(z_standard.grad, z_rotated.grad)
+
+
 def test_fsq_quantizer_interface() -> None:
     """FSQ returns q_loss == 0 and only the perplexity metric (no VQ margin)."""
     quantizer = FSQQuantizer(levels=[5, 4])
@@ -225,7 +248,7 @@ def test_forward_is_differentiable() -> None:
 
 def test_export_roundtrip_states_identical(tmp_path: Path) -> None:
     """A round-tripped VQ export assigns identical states."""
-    model = AlphabetModel()
+    model = AlphabetModel(rotation_trick=True)
     model.eval()
     x = torch.randn(16, 10)
     states_before = model.encode_states(x)
@@ -233,6 +256,7 @@ def test_export_roundtrip_states_identical(tmp_path: Path) -> None:
     model.save(tmp_path, mean=np.zeros(10), std=np.ones(10))
     loaded, _, _ = AlphabetModel.load(tmp_path)
     loaded.eval()
+    assert loaded.rotation_trick is True
     assert torch.equal(states_before, loaded.encode_states(x))
 
 

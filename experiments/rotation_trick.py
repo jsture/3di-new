@@ -1,9 +1,8 @@
-"""Quarantined experiment: surrogate-gradient estimators for the VQ bottleneck.
+"""Standalone reference implementation of surrogate gradients for the VQ bottleneck.
 
-Removed from the core (which now uses the straight-through estimator inline), this keeps the
-rotation trick (Fifty et al., 2024) as a self-contained, runnable snapshot. It is pure-torch
-and depends on nothing in ``tdi.v2``; drop ``apply_quantizer_gradient(z, z_q, mode=...)`` into a
-quantizer's forward to reproduce the pre-refactor gradient routing.
+This keeps the rotation trick (Fifty et al., 2024) as a self-contained, runnable snapshot. The
+core VQ quantizer now offers the same strategy through a toggle, while this pure-torch version
+remains independent of ``tdi.v2`` for experimentation.
 """
 
 import torch

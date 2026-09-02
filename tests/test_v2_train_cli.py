@@ -84,3 +84,13 @@ def test_main_resolves_cli_overrides_and_conveniences(tmp_path: Path) -> None:
     assert cfg.model.n_states == 24
     assert cfg.train.lr == 0.01
     assert cfg.outputs.out_dir == str(tmp_path / "run_x")
+
+
+def test_main_enables_rotation_trick_flag(tmp_path: Path) -> None:
+    """The convenience flag enables rotation-trick gradients in the resolved config."""
+    captured: dict[str, TrainConfig] = {}
+
+    with patch("tdi.v2.train.train_model", side_effect=lambda cfg: captured.setdefault("cfg", cfg)):
+        main(["--config", str(_write_config(tmp_path)), "--rotation-trick"])
+
+    assert captured["cfg"].model.rotation_trick is True

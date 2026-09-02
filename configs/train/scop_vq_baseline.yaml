@@ -11,6 +11,7 @@ model:
   decay: 0.99
   min_count: 1.0
   l2_normalize: true
+  rotation_trick: false
 train:
   lr: 0.001
   weight_decay: 0.0001

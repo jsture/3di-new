@@ -8,8 +8,8 @@ as runnable snapshots; the rest are coupled to the old model/training loop and s
 
 Self-contained, depend only on numpy/torch, and covered by `tests/test_experiments.py`:
 
-- `rotation_trick.py` — the rotation-trick (Householder) and straight-through gradient estimators
-  via `apply_quantizer_gradient(z, z_q, mode=...)`.
+- `rotation_trick.py` — the original standalone rotation-trick snapshot; the VQ core now exposes
+  the same gradient strategy through `--rotation-trick`.
 - `augmentation.py` — `jitter_coords`, coordinate-level Gaussian augmentation.
 - `alignment_batch_sampler.py` — `AlignmentBatchSampler`, several distinct alignments per batch.
 
