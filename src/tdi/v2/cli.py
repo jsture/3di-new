@@ -168,22 +168,44 @@ def run_evaluate(args: argparse.Namespace) -> None:
     print(f"Saved evaluation report to {report_path}")
 
 
-def main() -> None:
-    """Main CLI driver."""
-    if len(sys.argv) > 1 and sys.argv[1] == "train":
-        from .train import main as train_main
-
-        sys.argv = [sys.argv[0], *sys.argv[2:]]
-        train_main()
-        return
-
-    parser = argparse.ArgumentParser(description="Tdi-v2 CLI tools.")
+def main(argv: list[str] | None = None) -> None:
+    """Main CLI driver for tdi.v2 (train and evaluate)."""
+    parser = argparse.ArgumentParser(
+        prog="tdi.v2",
+        description="Tdi-v2 CLI tools: train and evaluate structural alphabet models.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # Subcommand train
+    train_parser = subparsers.add_parser(
+        "train",
+        help="Train the single-path v2 alphabet model.",
+        description=(
+            "Train the single-path v2 alphabet model into a self-describing run directory."
+        ),
+    )
+    train_parser.add_argument(
+        "--config", type=str, required=True, help="Path to a YAML config file."
+    )
+    train_parser.add_argument(
+        "--quantizer", type=str, choices=["vq", "fsq"], help="Convenience for model.quantizer."
+    )
+    train_parser.add_argument("--out", type=str, help="Convenience for outputs.out_dir.")
+
     # Subcommand evaluate
-    eval_parser = subparsers.add_parser("evaluate", help="Evaluate trained model on alignments.")
+    eval_parser = subparsers.add_parser(
+        "evaluate",
+        help="Evaluate trained model on alignments.",
+        description=(
+            "Evaluate trained model on alignments to emit substitution matrix and diagnostics."
+        ),
+    )
     eval_parser.add_argument(
-        "--model-dir", "--model_dir", type=str, required=True, help="Path to exported model folder."
+        "--model-dir",
+        "--model_dir",
+        type=str,
+        required=True,
+        help="Path to exported model folder.",
     )
     eval_parser.add_argument(
         "--pdb-dir", "--pdb_dir", type=str, required=True, help="Directory containing PDB files."
@@ -213,8 +235,16 @@ def main() -> None:
         help="State for invalid coordinates (defaults to the model config's invalid_state).",
     )
 
-    args = parser.parse_args()
-    if args.command == "evaluate":
+    args, unknown = parser.parse_known_args(argv)
+    if args.command == "train":
+        from .train import main as train_main
+
+        # Forward train args and any dotted overrides to train_main
+        effective_argv = sys.argv[2:] if argv is None else argv[1:]
+        train_main(effective_argv)
+    elif args.command == "evaluate":
+        if unknown:
+            parser.error(f"Unrecognized arguments: {' '.join(unknown)}")
         run_evaluate(args)
 
 

@@ -103,4 +103,3 @@ def resolve_pdb_path(pdb_dir: str | Path, sid: str) -> Path:
         return path2
     # Fallback to the first path if neither exists (propagating standard error)
     return path1
-

@@ -123,3 +123,36 @@ uv run pytest
 Removed objectives from earlier iterations — GaussianNLL, contrastive learning, self-reconstruction,
 the warmup curriculum, the transition head, the rotation-trick gradient, and coordinate/descriptor
 augmentation — live in git history (see `experiments/README.md`).
+
+---
+
+## Command Reference
+
+### Training Commands
+
+1. **EMA-VQ Reference Model** (with k-means initialization):
+   ```bash
+   uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer vq --out runs/ema_vq
+   ```
+
+2. **FSQ Comparator Model** (fixed grid quantization):
+   ```bash
+   uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer fsq --out runs/fsq_5x4
+   ```
+
+3. **Random-Init VQ Baseline Model** (random codebook initialization):
+   ```bash
+   uv run python -m tdi.v2 train --config configs/train/scop_vq_baseline.yaml --out runs/vq_baseline_random
+   ```
+
+### Evaluation Command
+
+To evaluate any of the trained model runs on sequence alignments (requires the virtual center parameters):
+```bash
+uv run python -m tdi.v2 evaluate \
+  --model_dir runs/ema_vq \
+  --pdb_dir data/pdb \
+  --pairfile data/derived/pairfiles/tmaln-06.val.out \
+  --out_dir runs/ema_vq/eval \
+  --virt 270 0 2
+```

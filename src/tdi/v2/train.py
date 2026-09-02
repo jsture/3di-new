@@ -9,6 +9,7 @@ import argparse
 import copy
 import csv
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -185,6 +186,15 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
     out_dir = Path(cfg.outputs.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Print training headers
+    print("\nTraining 3Di VAE v2 model:")
+    print(f"  * Quantizer: {cfg.model.quantizer} (n_states={model.n_states})")
+    print(f"  * Dataset: {processed_dir.name} (batch_size={cfg.train.batch_size})")
+    print(f"  * Output: {out_dir}\n")
+
+    print("Epoch   Train Loss   Val Loss    Perplexity   Dead States   Patience   Status")
+    print("---------------------------------------------------------------------------------")
+
     best_val = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
     patience_left = cfg.train.patience
@@ -194,7 +204,8 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
         model.train()
         epoch_loss = 0.0
         n_batches = 0
-        for x, y in train_loader:
+        total_batches = len(train_loader)
+        for batch_idx, (x, y) in enumerate(train_loader):
             optimizer.zero_grad()
             out = model(x)
             loss = _reconstruction_loss(cfg.model.loss, out["y_hat"], y) + out["q_loss"]
@@ -203,26 +214,52 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
             optimizer.step()
             epoch_loss += float(loss.detach())
             n_batches += 1
+
+            # Live batch progress bar update (no colors)
+            progress = int(100 * (batch_idx + 1) / total_batches)
+            bar_len = 20
+            filled = int(bar_len * (batch_idx + 1) // total_batches)
+            arrow = ">" if filled < bar_len else ""
+            dots = "." * (bar_len - filled - (1 if filled < bar_len else 0))
+            bar = "=" * filled + arrow + dots
+            msg = (
+                f"\rEpoch {epoch + 1:2d}/{cfg.train.max_epochs:2d} "
+                f"[{bar}] {progress:3d}% | Loss: {loss.item():.4f}"
+            )
+            sys.stdout.write(msg)
+            sys.stdout.flush()
+
         if scheduler is not None:
             scheduler.step()
 
         train_loss = epoch_loss / max(1, n_batches)
         diag = _run_validation(model, val_loader, cfg.model.loss, model.n_states)
         log_rows.append({"epoch": epoch, "train_loss": train_loss, **diag})
-        print(
-            f"epoch {epoch}: train_loss={train_loss:.4f} val_loss={diag['val_loss']:.4f} "
-            f"perplexity={diag['perplexity']:.2f} dead_states={diag['dead_states']}"
-        )
 
+        # Clear progress line
+        sys.stdout.write("\r" + " " * 80 + "\r")
+        sys.stdout.flush()
+
+        status = ""
         if diag["val_loss"] < best_val:
             best_val = diag["val_loss"]
             best_state = copy.deepcopy(model.state_dict())
             patience_left = cfg.train.patience
+            status = "New Best"
         else:
             patience_left -= 1
-            if patience_left <= 0:
-                print(f"Early stopping at epoch {epoch} (no val_loss improvement).")
-                break
+            if diag["dead_states"] > 0:
+                status = "Dead states"
+
+        patience_str = f"{patience_left}/{cfg.train.patience}"
+        print(
+            f" {epoch + 1:<6d} {train_loss:<12.4f} {diag['val_loss']:<11.4f} "
+            f"{diag['perplexity']:<12.2f} {diag['dead_states']:<13d} {patience_str:<10s} {status}"
+        )
+
+        if patience_left <= 0:
+            print(f"\nEarly stopping at epoch {epoch + 1} (no val_loss improvement).")
+            break
 
     # Restore the best weights before exporting.
     if best_state is not None:
@@ -269,7 +306,7 @@ def _parse_overrides(unknown: list[str]) -> dict[str, object]:
     return overrides
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """CLI entrypoint: ``python -m tdi.v2 train --config ... [--section.key value ...]``."""
     parser = argparse.ArgumentParser(description="Train the single-path v2 alphabet model.")
     parser.add_argument("--config", type=str, required=True, help="Path to a YAML config file.")
@@ -277,7 +314,7 @@ def main() -> None:
         "--quantizer", type=str, choices=["vq", "fsq"], help="Convenience for model.quantizer."
     )
     parser.add_argument("--out", type=str, help="Convenience for outputs.out_dir.")
-    args, unknown = parser.parse_known_args()
+    args, unknown = parser.parse_known_args(argv)
 
     overrides = _parse_overrides(unknown)
     if args.quantizer is not None:
