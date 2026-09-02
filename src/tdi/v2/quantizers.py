@@ -5,12 +5,13 @@ Two first-class quantizers form the discrete alphabet:
 - :class:`EMAVectorQuantizer` -- the reference learner: EMA codebook updates, commitment
   loss, L2-normalized (cosine) lookup, mandatory dead-code replacement, k-means init.
 - :class:`FSQQuantizer` -- a fixed finite-scalar-quantization comparator with no learned
-  codebook (and so no collapse to guard against).
+  codebook.
 
 Both return ``(z_q, indices, q_loss, metrics)`` where ``metrics`` is a dict of optional
-diagnostics, so adding or dropping a metric never churns call sites. The gradient path is the
-straight-through estimator only (``z_q = z + (z_q - z).detach()``); the rotation trick has
-been removed from the core and lives in git history.
+diagnostics, so adding or dropping a metric never churns call sites. EMA-VQ uses the standard
+straight-through estimator; FSQ preserves the derivative of its bounding function and applies
+the straight-through estimator only to rounding, following the reference formulation. The
+rotation trick has been removed from the core and lives in git history.
 """
 
 import numpy as np
@@ -18,6 +19,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.cluster import KMeans
+
+
+def _round_ste(z: torch.Tensor) -> torch.Tensor:
+    """Round in the forward pass while preserving the input gradient."""
+    return z + (torch.round(z) - z).detach()
 
 
 def _kmeans(x: torch.Tensor, n_clusters: int, seed: int = 0) -> torch.Tensor:
@@ -239,65 +245,78 @@ class FSQQuantizer(nn.Module):
     """
 
     basis: torch.Tensor
+    level_values: torch.Tensor
     implicit_codebook: torch.Tensor
 
-    def __init__(self, levels: list[int]) -> None:
+    def __init__(self, levels: list[int], eps: float = 1e-3) -> None:
         """Initialize the FSQQuantizer.
 
         Args:
             levels: Integer quantization steps per dimension (e.g. [5, 4] for 20 states).
+            eps: Margin keeping bounded values inside the outer rounding thresholds.
         """
         super().__init__()
         if not levels or any((not isinstance(level, int)) or level < 2 for level in levels):
             raise ValueError(f"FSQ levels must be integers >= 2, got {levels!r}")
+        if not 0.0 < eps < 1.0:
+            raise ValueError(f"FSQ eps must be in (0, 1), got {eps}")
         self.levels = levels
+        self.eps = eps
         self.n_states = int(np.prod(levels))
         self.z_dim = len(levels)
 
-        # Coordinate basis coefficients
-        basis: list[int] = []
-        current = 1
-        for level in reversed(levels):
-            basis.append(current)
-            current *= level
-        self.register_buffer("basis", torch.tensor(list(reversed(basis)), dtype=torch.long))
+        # Reference FSQ uses the first latent dimension as the least-significant digit.
+        basis = [1]
+        for level in levels[:-1]:
+            basis.append(basis[-1] * level)
+        self.register_buffer("basis", torch.tensor(basis, dtype=torch.long))
+        self.register_buffer("level_values", torch.tensor(levels, dtype=torch.long))
         self.register_buffer("implicit_codebook", self._make_implicit_codebook())
 
     def _make_implicit_codebook(self) -> torch.Tensor:
-        grids: list[torch.Tensor] = []
-        for level in self.levels:
-            if level % 2 == 1:
-                grid = torch.linspace(-1.0, 1.0, level)
-            else:
-                grid = torch.linspace(-1.0 + 1.0 / level, 1.0 - 1.0 / level, level)
-            grids.append(grid)
-        mesh = torch.meshgrid(*grids, indexing="ij")
-        codebook = torch.stack([m.flatten() for m in mesh], dim=1)
-        return codebook
+        return self.indices_to_codes(torch.arange(self.n_states))
+
+    def bound(self, z: torch.Tensor) -> torch.Tensor:
+        """Map unbounded latents just inside each dimension's rounding range."""
+        if z.shape[-1] != self.z_dim:
+            raise ValueError(f"Expected FSQ latent width {self.z_dim}, got shape {tuple(z.shape)}")
+
+        levels = self.level_values.to(device=z.device, dtype=z.dtype)
+        half_l = (levels - 1) * (1.0 - self.eps) / 2.0
+        offset = torch.where(self.level_values.to(z.device) % 2 == 1, 0.0, 0.5).to(z.dtype)
+        shift = torch.tan(offset / half_l)
+        return torch.tanh(z + shift) * half_l - offset
+
+    def codes_to_indices(self, codes: torch.Tensor) -> torch.Tensor:
+        """Map normalized FSQ code vectors to their integer state indices."""
+        if codes.shape[-1] != self.z_dim:
+            raise ValueError(
+                f"Expected FSQ code width {self.z_dim}, got shape {tuple(codes.shape)}"
+            )
+        half_width = torch.div(self.level_values, 2, rounding_mode="floor").to(codes.device)
+        digits = torch.round(codes * half_width + half_width).long()
+        return (digits * self.basis.to(codes.device)).sum(dim=-1)
+
+    def indices_to_codes(self, indices: torch.Tensor) -> torch.Tensor:
+        """Map integer state indices back to normalized FSQ code vectors."""
+        indices = torch.as_tensor(indices, dtype=torch.long, device=self.basis.device)
+        if torch.any(indices < 0) or torch.any(indices >= self.n_states):
+            raise ValueError(f"FSQ indices must be in [0, {self.n_states})")
+
+        digits = (
+            torch.div(indices.unsqueeze(-1), self.basis, rounding_mode="floor") % self.level_values
+        )
+        half_width = torch.div(self.level_values, 2, rounding_mode="floor")
+        return (digits - half_width).float() / half_width
 
     def quantize(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Scale to range [-1, 1]
-        z_bounded = torch.tanh(z)
-
-        z_q_list: list[torch.Tensor] = []
-        indices = torch.zeros(z.shape[0], dtype=torch.long, device=z.device)
-
-        for i, level in enumerate(self.levels):
-            if level % 2 == 1:
-                val = (z_bounded[:, i] + 1.0) / 2.0 * (level - 1)
-                val_q = torch.round(val).clamp(0, level - 1)
-                mapped = val_q / (level - 1) * 2.0 - 1.0
-                idx = val_q.long()
-            else:
-                val = (z_bounded[:, i] + 1.0 - 1.0 / level) / 2.0 * (level - 1)
-                val_q = torch.round(val).clamp(0, level - 1)
-                mapped = val_q / (level - 1) * (2.0 - 2.0 / level) - 1.0 + 1.0 / level
-                idx = val_q.long()
-
-            z_q_list.append(mapped)
-            indices += idx * self.basis[i]
-
-        z_q = torch.stack(z_q_list, dim=1)
+        bounded = self.bound(z)
+        half_width = torch.div(self.level_values, 2, rounding_mode="floor").to(
+            device=z.device, dtype=z.dtype
+        )
+        # Preserve the bounding-function derivative; only rounding uses the STE.
+        z_q = _round_ste(bounded) / half_width
+        indices = self.codes_to_indices(z_q)
         return z_q, indices
 
     def forward(
@@ -310,8 +329,6 @@ class FSQQuantizer(nn.Module):
             commitment) and ``metrics`` holding only ``perplexity`` (no VQ margin).
         """
         z_q, indices = self.quantize(z)
-        # Straight-through estimator: forward value z_q, gradient path z.
-        z_q = z + (z_q - z).detach()
 
         encodings = F.one_hot(indices, self.n_states).float()
         usage = encodings.mean(dim=0)

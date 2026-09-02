@@ -73,7 +73,7 @@ def test_fsq_quantizer_interface() -> None:
 
 
 def test_fsq_quantizer_grids() -> None:
-    """FSQ grid creation for odd vs even levels."""
+    """FSQ uses the reference normalized grids for odd and even levels."""
     q_odd = FSQQuantizer(levels=[3])
     assert torch.allclose(
         q_odd.implicit_codebook, torch.tensor([[-1.0], [0.0], [1.0]], dtype=torch.float32)
@@ -81,8 +81,38 @@ def test_fsq_quantizer_grids() -> None:
     q_even = FSQQuantizer(levels=[4])
     assert torch.allclose(
         q_even.implicit_codebook,
-        torch.tensor([[-0.75], [-0.25], [0.25], [0.75]], dtype=torch.float32),
+        torch.tensor([[-1.0], [-0.5], [0.0], [0.5]], dtype=torch.float32),
     )
+
+
+def test_fsq_indices_and_codes_round_trip() -> None:
+    """Every implicit code has a stable bijection with one integer state."""
+    quantizer = FSQQuantizer(levels=[5, 4])
+    indices = torch.arange(quantizer.n_states)
+
+    codes = quantizer.indices_to_codes(indices)
+
+    assert torch.equal(quantizer.codes_to_indices(codes), indices)
+    assert torch.equal(codes, quantizer.implicit_codebook)
+
+
+def test_fsq_ste_preserves_bounding_gradient() -> None:
+    """The rounding STE retains tanh's derivative rather than bypassing the bound."""
+    quantizer = FSQQuantizer(levels=[5, 4])
+    z = torch.tensor([[0.2, -0.3]], requires_grad=True)
+
+    z_q, _ = quantizer.quantize(z)
+    z_q.sum().backward()
+
+    levels = torch.tensor([5.0, 4.0])
+    half_l = (levels - 1) * (1.0 - quantizer.eps) / 2.0
+    offset = torch.tensor([0.0, 0.5])
+    shift = torch.tan(offset / half_l)
+    half_width = torch.tensor([2.0, 2.0])
+    expected = (1.0 - torch.tanh(z.detach() + shift).square()) * half_l / half_width
+    assert z.grad is not None
+    assert torch.allclose(z.grad, expected)
+    assert not torch.allclose(z.grad, torch.ones_like(z.grad))
 
 
 def test_vq_dead_code_replacement() -> None:
