@@ -364,7 +364,10 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train the single-path v2 alphabet model.")
     parser.add_argument("--config", type=str, required=True, help="Path to a YAML config file.")
     parser.add_argument(
-        "--quantizer", type=str, choices=["vq", "fsq"], help="Convenience for model.quantizer."
+        "--quantizer",
+        type=str,
+        choices=["vq", "fsq", "continuous"],
+        help="Convenience for model.quantizer ('continuous' is the no-quantizer ablation).",
     )
     parser.add_argument("--out", type=str, help="Convenience for outputs.out_dir.")
     args, unknown = parser.parse_known_args(argv)

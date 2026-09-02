@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from tdi.v2 import (
     AlphabetModel,
+    ContinuousBypass,
     EMAVectorQuantizer,
     FSQQuantizer,
     PairDataset,
@@ -599,3 +600,43 @@ def test_training_reads_preprocessing_provenance_from_manifest(tmp_path: Path) -
     manifest = {"preprocessing": {"virtual_center": [270.0, 0.0, 2.0], "max_ca_dist": 5.0}}
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
     assert _read_provenance(tmp_path) == ([270.0, 0.0, 2.0], 5.0)
+
+
+# ---------------------------------------------------------------------------
+# Continuous-bypass ablation
+# ---------------------------------------------------------------------------
+
+
+def test_continuous_bypass_passes_latents_through_untouched() -> None:
+    """The ablation returns z unchanged, costs nothing, and keeps an exact gradient path."""
+    bypass = ContinuousBypass(z_dim=4)
+    z = torch.randn(8, 4, requires_grad=True)
+    z_q, indices, q_loss, metrics = bypass(z)
+
+    assert torch.equal(z_q, z)
+    assert float(q_loss) == 0.0
+    assert indices.shape == (8,) and int(indices.abs().sum()) == 0
+    assert metrics == {}
+
+    # No straight-through estimator in the way: the gradient is the decoder's, exactly.
+    weights = torch.randn(8, 4)
+    (z_q * weights).sum().backward()
+    assert z.grad is not None and torch.allclose(z.grad, weights)
+
+
+def test_continuous_export_writes_no_codebook(tmp_path: Path) -> None:
+    """A bypass export is never mistaken for a quantized one on disk."""
+    model = AlphabetModel(input_dim=10, n_states=20, z_dim=4, quantizer="continuous")
+    model.save(tmp_path, mean=np.zeros(10), std=np.ones(10))
+
+    assert not (tmp_path / "centroids.npy").exists()
+    assert not (tmp_path / "fsq_levels.json").exists()
+    loaded, _, _ = AlphabetModel.load(tmp_path)
+    assert loaded.quantizer_name == "continuous"
+
+
+def test_continuous_model_refuses_to_encode_states() -> None:
+    """Encoding is undefined without a codebook, so it raises instead of emitting one letter."""
+    model = AlphabetModel(input_dim=10, n_states=20, z_dim=4, quantizer="continuous")
+    with pytest.raises(TypeError, match="forms no alphabet"):
+        model.encode_states(torch.randn(4, 10))
