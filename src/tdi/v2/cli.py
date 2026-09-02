@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from scipy.stats import entropy as scipy_entropy
 
 from .encode import process_pdb
 from .model import AlphabetModel
@@ -152,8 +153,7 @@ def run_evaluate(args: argparse.Namespace) -> None:
     total_states = int(usage_counts.sum())
     if total_states > 0:
         p = usage_counts / total_states
-        with np.errstate(divide="ignore", invalid="ignore"):
-            entropy = float(-(p * np.log(p + 1e-10)).sum())
+        entropy = float(scipy_entropy(p))
         normalized_entropy = entropy / np.log(n_states) if n_states > 1 else 0.0
         dead_state_fraction = float(np.sum(p < 1e-5) / n_states)
     else:

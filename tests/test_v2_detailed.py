@@ -28,6 +28,7 @@ from tdi.v2.submat import (
     merge_columns,
 )
 from tdi.v2.training_data import fit_standardizer, transform
+from tdi.v2.util import mutual_information
 
 # =====================================================================
 # 1. Biopython and Geometry Tests
@@ -173,6 +174,47 @@ def test_move_cb_spherical_coordinates() -> None:
     assert np.allclose(ca_cb_dist, 1.5)
 
 
+def test_move_cb_rotation_matches_rodrigues_formula() -> None:
+    """SciPy rotations preserve the former formula on valid geometry."""
+    coords = np.zeros((1, 12), dtype=np.float64)
+    ca = np.array([0.2, -0.4, 0.7])
+    cb = np.array([1.3, 0.1, 0.9])
+    n_atm = np.array([-0.1, 0.8, 1.2])
+    coords[0, 0:3] = ca
+    coords[0, 3:6] = cb
+    coords[0, 6:9] = n_atm
+    alpha, beta = np.radians([31.0, -17.0])
+    distance = 1.8
+
+    def rodrigues(vector: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
+        axis = axis / np.linalg.norm(axis)
+        return (
+            vector * np.cos(angle)
+            + np.cross(axis, vector) * np.sin(angle)
+            + axis * np.dot(axis, vector) * (1 - np.cos(angle))
+        )
+
+    vector = cb - ca
+    vector = rodrigues(vector, np.cross(cb - ca, n_atm - ca), alpha)
+    vector = rodrigues(vector, n_atm - ca, beta)
+    expected = ca + vector * distance
+
+    moved = move_CB(coords.copy(), virt_cb=(31.0, -17.0, distance))
+    assert np.allclose(moved[0, 3:6], expected)
+
+
+def test_move_cb_collinear_axis_does_not_shrink_vector() -> None:
+    """An undefined first axis is an identity rotation, not a cosine scaling."""
+    coords = np.zeros((1, 12), dtype=np.float64)
+    coords[0, 3:6] = [1.0, 0.0, 0.0]
+    coords[0, 6:9] = [2.0, 0.0, 0.0]
+
+    moved = move_CB(coords, virt_cb=(60.0, 0.0, 2.0))
+
+    assert np.all(np.isfinite(moved[0, 3:6]))
+    assert np.allclose(moved[0, 3:6], [2.0, 0.0, 0.0])
+
+
 # =====================================================================
 # 2. Standardizer Tests
 # =====================================================================
@@ -226,6 +268,20 @@ def test_submat_accumulation_and_mi() -> None:
         assert mi_tot is not None
     finally:
         Path(pairfile_path).unlink()
+
+
+def test_mutual_information_known_distributions_and_validation() -> None:
+    """Mutual information handles sparse, empty, and invalid distributions."""
+    assert mutual_information(np.array([[0.5, 0.0], [0.0, 0.5]])) == pytest.approx(1.0)
+    assert mutual_information(np.full((2, 2), 0.25)) == pytest.approx(0.0)
+    assert mutual_information(np.zeros((2, 2))) == 0.0
+
+    with pytest.raises(ValueError, match="negative"):
+        mutual_information(np.array([[1.0, -0.5]]))
+    with pytest.raises(ValueError, match="finite"):
+        mutual_information(np.array([[np.nan]]))
+    with pytest.raises(ValueError, match="2D"):
+        mutual_information(np.array([0.5, 0.5]))
 
 
 def test_merge_columns_counts_preservation() -> None:

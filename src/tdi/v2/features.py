@@ -11,6 +11,7 @@ from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.Residue import Residue
 from numpy.linalg import norm
 from scipy.spatial.distance import cdist
+from scipy.spatial.transform import Rotation
 
 # Standard distance between C_alpha and C_beta in Angstroms
 DISTANCE_ALPHA_BETA: float = 1.5336
@@ -389,6 +390,34 @@ def get_coords_from_pdb(path: str, full_backbone: bool = False) -> tuple[np.ndar
     return coords, valid_mask
 
 
+def _rotate_about_axes(
+    vectors: np.ndarray,
+    axes: np.ndarray,
+    angle: float,
+    *,
+    zero_axis_identity: bool,
+) -> np.ndarray:
+    """Rotate row vectors around row axes while handling invalid axes explicitly."""
+    vectors = np.asarray(vectors, dtype=np.float64)
+    axes = np.asarray(axes, dtype=np.float64)
+    rotated = np.full(vectors.shape, np.nan, dtype=np.float64)
+
+    axis_norms = np.linalg.norm(axes, axis=1)
+    finite = np.isfinite(vectors).all(axis=1) & np.isfinite(axes).all(axis=1)
+    usable = finite & (axis_norms > 1e-8)
+
+    if np.any(usable):
+        unit_axes = axes[usable] / axis_norms[usable, np.newaxis]
+        rotations = Rotation.from_rotvec(unit_axes * angle)
+        rotated[usable] = rotations.apply(vectors[usable])
+
+    if zero_axis_identity:
+        zero_axes = finite & ~usable
+        rotated[zero_axes] = vectors[zero_axes]
+
+    return rotated
+
+
 def move_CB(
     coords: np.ndarray,
     c_alpha_beta_distance_scale: float = 1.0,
@@ -423,21 +452,22 @@ def move_CB(
         a = cb - ca
         b = n_atm - ca
         cross_prod = np.cross(a, b)
-        # Floor the norm to avoid divide-by-zero on degenerate (collinear) geometry.
-        cross_norm = np.maximum(np.linalg.norm(cross_prod, axis=1, keepdims=True), 1e-8)
-        k = cross_prod / cross_norm
-
-        v = (
-            v * np.cos(alpha)
-            + np.cross(k, v) * np.sin(alpha)
-            + k * (k * v).sum(axis=1, keepdims=True) * (1 - np.cos(alpha))
+        # A collinear CA-CB-N triplet has no uniquely defined first rotation axis.
+        # Treat it as a zero rotation instead of shrinking the vector by cos(alpha).
+        v = _rotate_about_axes(
+            v,
+            cross_prod,
+            alpha,
+            zero_axis_identity=True,
         )
 
-        k = (n_atm - ca) / np.linalg.norm(n_atm - ca, axis=1, keepdims=True)
-        v = (
-            v * np.cos(beta)
-            + np.cross(k, v) * np.sin(beta)
-            + k * (k * v).sum(axis=1, keepdims=True) * (1 - np.cos(beta))
+        # A zero-length N-CA bond is invalid structural input. Keep its result NaN so
+        # downstream validity filtering can reject it rather than inventing geometry.
+        v = _rotate_about_axes(
+            v,
+            n_atm - ca,
+            beta,
+            zero_axis_identity=False,
         )
 
         coords[:, 3:6] = ca + v * d
