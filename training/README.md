@@ -1,8 +1,12 @@
-# Training
+# Training (Legacy Benchmarks)
+
+> [!NOTE]
+> This directory contains legacy bash scripts and benchmarks from earlier 3Di / Foldseek iterations.
+> The modern single-path pipeline is driven by `python -m tdi.data` (preprocessing) and `python -m tdi.v2` (training & evaluation). See the root [README.md](../README.md) for current workflows.
 
 Scripts and data for learning the 3Di structural alphabet via VQ-VAE.
 
-## Quick start
+## Quick start (Legacy)
 
 ```bash
 cd training
