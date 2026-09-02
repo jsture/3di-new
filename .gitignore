@@ -293,6 +293,8 @@ data/**/*.arrow
 data/**/*.h5
 data/**/*.hdf5
 
+!data/v1/*.pt
+
 # Model/checkpoint outputs
 outputs/
 runs/

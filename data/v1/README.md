@@ -1,0 +1,1 @@
+[Source](https://github.com/steineggerlab/foldseek-analysis/tree/main/training/data/foldseek_v1)
