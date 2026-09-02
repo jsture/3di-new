@@ -150,7 +150,7 @@ encoding and evaluation never hardcode them.
 | `scaler.json` | Standardization params, so inference is standalone |
 | `centroids.npy` (vq) *or* `fsq_levels.json` (fsq) | The discrete codebook |
 | `run_config.resolved.json` | Fully resolved training config |
-| `train_log.csv` | `epoch, train_loss, val_loss, perplexity, dead_states, margin` |
+| `train_log.csv` | Total, reconstruction, and quantizer losses plus state diagnostics per epoch |
 
 **`evaluate` → `--out-dir`**
 

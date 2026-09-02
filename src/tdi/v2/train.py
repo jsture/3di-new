@@ -84,9 +84,10 @@ def _reconstruction_loss(loss_name: str, y_hat: torch.Tensor, y: torch.Tensor) -
 def _run_validation(
     model: AlphabetModel, loader: DataLoader, loss_name: str, n_states: int
 ) -> dict[str, float]:
-    """Compute val_loss plus state diagnostics over the whole validation set."""
+    """Compute validation loss components and state diagnostics."""
     model.eval()
-    total_loss = 0.0
+    total_recon_loss = 0.0
+    total_q_loss = 0.0
     n_examples = 0
     total_margin = 0.0
     margin_examples = 0
@@ -95,7 +96,8 @@ def _run_validation(
         for x, y in loader:
             out = model(x)
             batch_size = len(x)
-            total_loss += float(_reconstruction_loss(loss_name, out["y_hat"], y)) * batch_size
+            total_recon_loss += float(_reconstruction_loss(loss_name, out["y_hat"], y)) * batch_size
+            total_q_loss += float(out["q_loss"]) * batch_size
             n_examples += batch_size
             metrics = out["metrics"]
             if "margin" in metrics:
@@ -105,12 +107,16 @@ def _run_validation(
 
     if n_examples == 0:
         raise ValueError("Validation loader produced zero examples.")
-    val_loss = total_loss / n_examples
+    val_loss = total_recon_loss / n_examples
+    val_q_loss = total_q_loss / n_examples
     dead_state_count = int((counts == 0).sum())
     usage = counts.float() / n_examples
     perplexity = float(torch.exp(-(usage * (usage + 1e-10).log()).sum()))
     diag = {
+        # Keep val_loss as reconstruction loss for backward compatibility and early stopping.
         "val_loss": val_loss,
+        "val_q_loss": val_q_loss,
+        "val_total_loss": val_loss + val_q_loss,
         "perplexity": perplexity,
         "dead_states": dead_state_count,
     }
@@ -215,8 +221,13 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
     print(f"  * Dataset: {processed_dir.name} (batch_size={cfg.train.batch_size})")
     print(f"  * Output: {out_dir}\n")
 
-    print("Epoch   Train Loss   Val Loss    Perplexity   Dead States   Patience   Status")
-    print("---------------------------------------------------------------------------------")
+    print(
+        "Epoch   Train Recon   Train Q   Val Recon   Val Q     "
+        "Perplexity   Dead States   Patience   Status"
+    )
+    print(
+        "------------------------------------------------------------------------------------------------"
+    )
 
     best_val = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
@@ -226,16 +237,22 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
     for epoch in range(cfg.train.max_epochs):
         model.train()
         epoch_loss = 0.0
+        epoch_recon_loss = 0.0
+        epoch_q_loss = 0.0
         n_batches = 0
         total_batches = len(train_loader)
         for batch_idx, (x, y) in enumerate(train_loader):
             optimizer.zero_grad()
             out = model(x)
-            loss = _reconstruction_loss(cfg.model.loss, out["y_hat"], y) + out["q_loss"]
+            recon_loss = _reconstruction_loss(cfg.model.loss, out["y_hat"], y)
+            q_loss = out["q_loss"]
+            loss = recon_loss + q_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.clip_grad_norm)
             optimizer.step()
             epoch_loss += float(loss.detach())
+            epoch_recon_loss += float(recon_loss.detach())
+            epoch_q_loss += float(q_loss.detach())
             n_batches += 1
 
             # Live batch progress bar update (no colors)
@@ -247,7 +264,8 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
             bar = "=" * filled + arrow + dots
             msg = (
                 f"\rEpoch {epoch + 1:2d}/{cfg.train.max_epochs:2d} "
-                f"[{bar}] {progress:3d}% | Loss: {loss.item():.4f}"
+                f"[{bar}] {progress:3d}% | Recon: {recon_loss.item():.4f} "
+                f"| Q: {q_loss.item():.4f}"
             )
             sys.stdout.write(msg)
             sys.stdout.flush()
@@ -256,8 +274,18 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
             scheduler.step()
 
         train_loss = epoch_loss / max(1, n_batches)
+        train_recon_loss = epoch_recon_loss / max(1, n_batches)
+        train_q_loss = epoch_q_loss / max(1, n_batches)
         diag = _run_validation(model, val_loader, cfg.model.loss, model.n_states)
-        log_rows.append({"epoch": epoch, "train_loss": train_loss, **diag})
+        log_rows.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_recon_loss": train_recon_loss,
+                "train_q_loss": train_q_loss,
+                **diag,
+            }
+        )
 
         # Clear progress line
         sys.stdout.write("\r" + " " * 80 + "\r")
@@ -276,8 +304,10 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
 
         patience_str = f"{patience_left}/{cfg.train.patience}"
         print(
-            f" {epoch + 1:<6d} {train_loss:<12.4f} {diag['val_loss']:<11.4f} "
-            f"{diag['perplexity']:<12.2f} {diag['dead_states']:<13d} {patience_str:<10s} {status}"
+            f" {epoch + 1:<6d} {train_recon_loss:<13.4f} {train_q_loss:<9.4f} "
+            f"{diag['val_loss']:<11.4f} {diag['val_q_loss']:<9.4f} "
+            f"{diag['perplexity']:<12.2f} {diag['dead_states']:<13d} "
+            f"{patience_str:<10s} {status}"
         )
 
         if patience_left <= 0:

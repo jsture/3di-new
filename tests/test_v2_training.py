@@ -307,9 +307,9 @@ def test_pair_dataset_uses_runtime_validation_not_asserts() -> None:
 
 
 def test_validation_loss_is_weighted_by_examples() -> None:
-    """A short final batch has proportional rather than equal influence on val_loss."""
+    """A short final batch has proportional influence on validation loss components."""
     torch.manual_seed(7)
-    model = AlphabetModel(quantizer="fsq", levels=[5, 4])
+    model = AlphabetModel(quantizer="vq")
     x = torch.randn(3, 10)
     y = torch.randn(3, 10)
     loader = DataLoader(TensorDataset(x, y), batch_size=2, shuffle=False)
@@ -317,8 +317,12 @@ def test_validation_loss_is_weighted_by_examples() -> None:
     diag = _run_validation(model, loader, "smooth_l1", model.n_states)
     model.eval()
     with torch.no_grad():
-        expected = float(F.smooth_l1_loss(model(x)["y_hat"], y))
-    assert diag["val_loss"] == pytest.approx(expected)
+        out = model(x)
+        expected_recon = float(F.smooth_l1_loss(out["y_hat"], y))
+        expected_q = float(out["q_loss"])
+    assert diag["val_loss"] == pytest.approx(expected_recon)
+    assert diag["val_q_loss"] == pytest.approx(expected_q)
+    assert diag["val_total_loss"] == pytest.approx(expected_recon + expected_q)
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +532,16 @@ def test_train_model_end_to_end_writes_export(
         "run_config.resolved.json",
     ):
         assert (out_dir / name).exists(), name
+
+    log_fields = (out_dir / "train_log.csv").read_text().splitlines()[0].split(",")
+    assert {
+        "train_loss",
+        "train_recon_loss",
+        "train_q_loss",
+        "val_loss",
+        "val_q_loss",
+        "val_total_loss",
+    } <= set(log_fields)
 
     loaded, _, _ = AlphabetModel.load(out_dir)
     assert loaded.n_states == 16
