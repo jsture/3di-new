@@ -16,10 +16,7 @@ It does not:
   - split train/validation sets
 """
 
-from __future__ import annotations
-
 import argparse
-import hashlib
 import json
 import os
 import shutil
@@ -31,6 +28,8 @@ import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+
+from tdi.data.hashing import sha256_file
 
 DEFAULT_URLS = [
     # Name used by the Foldseek benchmark-data README.
@@ -47,14 +46,6 @@ class ManifestRow:
     original_path: str
     size_bytes: int
     sha256: str
-
-
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(chunk_size), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def format_bytes(n_bytes: int) -> str:
