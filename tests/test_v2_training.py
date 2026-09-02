@@ -1,10 +1,15 @@
 """Tests for the single-path v2 model, quantizers, data utilities, and training loop."""
 
+import json
+import runpy
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 
 from tdi.v2 import (
     AlphabetModel,
@@ -14,7 +19,7 @@ from tdi.v2 import (
     ResidualMLP,
     make_quantizer,
 )
-from tdi.v2.train import train_model
+from tdi.v2.train import _read_provenance, _run_validation, train_model
 from tdi.v2.train_config import (
     DataConfig,
     LoopConfig,
@@ -311,6 +316,34 @@ def test_pair_dataset_scaling() -> None:
     assert y_scaled.shape == (10,)
 
 
+def test_pair_dataset_uses_runtime_validation_not_asserts() -> None:
+    """Mismatched data and scaler shapes raise explicit errors under every Python mode."""
+    with pytest.raises(ValueError, match="matching length"):
+        PairDataset(np.zeros((2, 10)), np.zeros((1, 10)))
+    with pytest.raises(ValueError, match="Scaler mean must have shape"):
+        PairDataset(
+            np.zeros((2, 10)),
+            np.zeros((2, 10)),
+            mean=np.zeros(9),
+            std=np.ones(9),
+        )
+
+
+def test_validation_loss_is_weighted_by_examples() -> None:
+    """A short final batch has proportional rather than equal influence on val_loss."""
+    torch.manual_seed(7)
+    model = AlphabetModel(quantizer="fsq", levels=[5, 4])
+    x = torch.randn(3, 10)
+    y = torch.randn(3, 10)
+    loader = DataLoader(TensorDataset(x, y), batch_size=2, shuffle=False)
+
+    diag = _run_validation(model, loader, "smooth_l1", model.n_states)
+    model.eval()
+    with torch.no_grad():
+        expected = float(F.smooth_l1_loss(model(x)["y_hat"], y))
+    assert diag["val_loss"] == pytest.approx(expected)
+
+
 # ---------------------------------------------------------------------------
 # Data-path utilities (unchanged through the refactor)
 # ---------------------------------------------------------------------------
@@ -427,22 +460,22 @@ def test_deterministic_rng_capping() -> None:
     assert np.array_equal(rng1.choice(100, 10, replace=False), rng2.choice(100, 10, replace=False))
 
 
-def test_scop_grouping_logic(tmp_path: Path) -> None:
+def test_scop_grouping_logic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """make_splits.py groups by SCOP superfamily."""
     lookup_file = tmp_path / "scop_lookup.tsv"
     lookup_file.write_text("d1qksa1\ta.3.1.2\nd1gwua_\ta.3.1.5\nd1i17a_\tb.1.1.1\n")
     pdbs_file = tmp_path / "pdbs.txt"
     pdbs_file.write_text("d1qksa1\nd1gwua_\nd1i17a_\nd_fallback\n")
 
-    import subprocess
-
     import pandas as pd
 
     out_dir = tmp_path / "splits"
-    res = subprocess.run(
+    script = Path(__file__).parent.parent / "scripts" / "make_splits.py"
+    monkeypatch.setattr(
+        sys,
+        "argv",
         [
-            "python3",
-            "scripts/make_splits.py",
+            str(script),
             str(pdbs_file),
             str(out_dir),
             "--scop_lookup",
@@ -452,10 +485,8 @@ def test_scop_grouping_logic(tmp_path: Path) -> None:
             "--seed",
             "42",
         ],
-        capture_output=True,
-        text=True,
     )
-    assert res.returncode == 0, res.stderr
+    runpy.run_path(str(script), run_name="__main__")
     df = pd.read_csv(out_dir / "train_manifest.csv")
     assert df[df["structure_id"] == "d1qksa1"].iloc[0]["group_id"] == "a.3.1"
     assert df[df["structure_id"] == "d1gwua_"].iloc[0]["group_id"] == "a.3.1"
@@ -507,3 +538,27 @@ def test_train_model_end_to_end_writes_export(tmp_path: Path) -> None:
 
     loaded, _, _ = AlphabetModel.load(out_dir)
     assert loaded.n_states == 16
+
+
+def test_train_model_rejects_empty_validation_split(tmp_path: Path) -> None:
+    """An empty validation set cannot be treated as a zero-loss best checkpoint."""
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    _write_processed_dir(processed, n=16)
+    np.save(processed / "val_x_raw.npy", np.zeros((0, 10), dtype=np.float32))
+    np.save(processed / "val_y_raw.npy", np.zeros((0, 10), dtype=np.float32))
+    cfg = TrainConfig(
+        train=LoopConfig(batch_size=8, max_epochs=1),
+        data=DataConfig(processed_dir=str(processed)),
+        outputs=OutputsConfig(out_dir=str(tmp_path / "run")),
+    )
+
+    with pytest.raises(ValueError, match="Validation set is empty"):
+        train_model(cfg)
+
+
+def test_training_reads_preprocessing_provenance_from_manifest(tmp_path: Path) -> None:
+    """Model exports inherit geometry settings from the processed dataset manifest."""
+    manifest = {"preprocessing": {"virtual_center": [270.0, 0.0, 2.0], "max_ca_dist": 5.0}}
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    assert _read_provenance(tmp_path) == ([270.0, 0.0, 2.0], 5.0)
