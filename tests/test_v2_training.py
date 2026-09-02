@@ -351,9 +351,7 @@ def test_superposed_distances_match_manual_svd_reference() -> None:
     """SciPy rotation matches the previous handwritten SVD implementation."""
     rng = np.random.default_rng(123)
     coords1 = rng.normal(size=(8, 3))
-    rot_z = np.array(
-        [[0.5, -np.sqrt(3) / 2, 0.0], [np.sqrt(3) / 2, 0.5, 0.0], [0.0, 0.0, 1.0]]
-    )
+    rot_z = np.array([[0.5, -np.sqrt(3) / 2, 0.0], [np.sqrt(3) / 2, 0.5, 0.0], [0.0, 0.0, 1.0]])
     coords2 = coords1 @ rot_z.T + np.array([3.0, -7.0, 2.0])
     assert np.allclose(
         _superposed_ca_distances(coords1, coords2),

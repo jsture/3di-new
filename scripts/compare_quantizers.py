@@ -109,9 +109,7 @@ def main() -> None:
     fsq_dir = out_root / "fsq_5x4"
 
     for quantizer, out_dir in (("vq", vq_dir), ("fsq", fsq_dir)):
-        _train_and_evaluate(
-            args.config, quantizer, out_dir, args.pdb_dir, args.pairfile, args.virt
-        )
+        _train_and_evaluate(args.config, quantizer, out_dir, args.pdb_dir, args.pairfile, args.virt)
 
     comparison = build_comparison(vq_dir, fsq_dir)
     with open(out_root / "comparison_report.json", "w") as f:

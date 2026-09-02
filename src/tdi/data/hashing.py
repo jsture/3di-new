@@ -73,4 +73,3 @@ def git_dirty() -> bool:
         return bool(out.stdout.strip())
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
-
