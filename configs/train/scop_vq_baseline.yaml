@@ -19,6 +19,7 @@ train:
   max_epochs: 20
   patience: 5
   scheduler: none
+  optimizer: adamw
   clip_grad_norm: 1.0
   seed: 42
   kmeans_init: false

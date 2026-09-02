@@ -58,15 +58,32 @@ A run trains exactly one quantizer — pick it with `--quantizer`.
 # EMA-VQ, the reference learner
 uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer vq --out runs/ema_vq
 
-# EMA-VQ with the optional rotation-trick gradient
-uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer vq --rotation-trick --out runs/ema_vq_rotation
-
 # FSQ [5,4], the fixed-grid comparator
 uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml --quantizer fsq --out runs/fsq_5x4
 
 # Random-init VQ, the "no k-means" floor
 uv run python -m tdi.v2 train --config configs/train/scop_vq_baseline.yaml --out runs/vq_baseline_random
 ```
+
+#### Schedule-Free AdamW (optional)
+
+`--optimizer schedulefree` swaps AdamW for Schedule-Free AdamW ([Defazio et al., NeurIPS
+2024](https://arxiv.org/abs/2405.15682)), which drops the need to pick a stopping horizon:
+
+```bash
+uv run python -m tdi.v2 train --config configs/train/scop_v2_default.yaml \
+  --optimizer schedulefree --train.lr 0.0025 --out runs/sf_vq
+```
+
+It replaces the LR schedule rather than composing with one, so pairing it with
+`train.scheduler: cosine` is rejected at config load. The paper reports its best learning rates
+are **larger** than the base optimizer's, so sweep `--train.lr` rather than reusing the AdamW
+value. Warmup is still required and stays exposed as `train.sf_warmup_steps`.
+
+Internally the optimizer keeps two views of the weights — the point gradients are taken at, and
+the averaged point it is defined to return. The trainer switches to the averaged view before
+validation, before every best-checkpoint snapshot, and before the export, so run directories
+always hold the returned iterate.
 
 ### 3. Evaluate
 
@@ -108,7 +125,7 @@ explicitly: `--virt 270 0 2` (matching `features.virtual_center` in the data con
 - Decoder: residual MLP, `z_dim → hidden_dim → input_dim`, depth 2. It predicts the **aligned
   partner's** descriptors, never its own input.
 - Loss: one `smooth_l1` partner-prediction term plus the quantizer loss. EMA-VQ uses a
-  straight-through gradient by default, with `--rotation-trick` as an opt-in alternative.
+  straight-through gradient.
   Training is fp32 throughout, plain PyTorch (no Lightning), with a fixed LR by default.
 - Early stopping on `val_loss` with `patience`; the best weights are restored before export.
 
@@ -118,7 +135,7 @@ explicitly: `--virt 270 0 2` (matching `features.virtual_center` in the data con
 | --- | --- | --- |
 | Codebook | Learned, EMA-updated | None — a fixed scalar grid |
 | Lookup | Cosine (L2-normalized) | Rounding per dimension |
-| Gradient | Straight-through, or `--rotation-trick` | Bounding derivative + rounding STE |
+| Gradient | Straight-through | Bounding derivative + rounding STE |
 | Collapse risk | Real; guarded by mandatory dead-code replacement (after `replacement_warmup_steps`) | None by construction |
 | Init | One-shot k-means (`kmeans_init`) | n/a |
 | States | `n_states` | `prod(levels)`, and `z_dim = len(levels)` |
@@ -195,7 +212,10 @@ Knobs worth knowing:
 | `model.commitment_cost` | `0.25` | VQ commitment penalty |
 | `model.decay` | `0.99` | VQ EMA decay |
 | `model.min_count` | `1.0` | VQ dead-code threshold |
-| `train.scheduler` | `none` | `none` (fixed LR) or `cosine` |
+| `train.scheduler` | `none` | `none` (fixed LR) or `cosine`; must stay `none` under Schedule-Free |
+| `train.optimizer` | `adamw` | or `schedulefree` (Schedule-Free AdamW) |
+| `train.sf_warmup_steps` | `500` | Schedule-Free linear LR warmup; ignored by `adamw` |
+| `train.sf_beta` | `0.9` | Schedule-Free momentum interpolation; ignored by `adamw` |
 | `train.patience` | `5` | Early stopping on `val_loss` |
 | `train.kmeans_init` | `true` | VQ codebook seeding; `false` gives the random-init baseline |
 | `features.max_ca_dist` | `5.0` | Å; pair filter in the data config |
