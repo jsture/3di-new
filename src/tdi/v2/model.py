@@ -67,6 +67,22 @@ class ResidualMLP(nn.Module):
         return self.output(h)
 
 
+class SimpleMLP(nn.Module):
+    """Plain stacked-Linear MLP: no residual connections, no LayerNorm."""
+
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, depth: int = 3) -> None:
+        super().__init__()
+        layers: list[nn.Module] = [nn.Linear(input_dim, hidden_dim), nn.SiLU()]
+        for _ in range(depth - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.SiLU()]
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass: (N, input_dim) -> (N, output_dim)."""
+        return self.net(x)
+
+
 class AlphabetModel(nn.Module):
     """Encoder + quantizer + decoder learning a discrete structural alphabet.
 
@@ -139,8 +155,15 @@ class AlphabetModel(nn.Module):
         self.virtual_center: list[float] | None = None
         self.max_ca_dist: float | None = None
 
-        self.encoder = ResidualMLP(input_dim, hidden_dim, z_dim, depth=3)
-        self.decoder = ResidualMLP(z_dim, hidden_dim, input_dim, depth=2)
+        USE_SIMPLE_MLP = False  # ablation: no residuals, no LayerNorm, just stacked Linear+SiLU
+
+        if USE_SIMPLE_MLP:
+            self.encoder = SimpleMLP(input_dim, hidden_dim, z_dim, depth=3)
+            self.decoder = SimpleMLP(z_dim, hidden_dim, input_dim, depth=2)
+        else:
+            self.encoder = ResidualMLP(input_dim, hidden_dim, z_dim, depth=3)
+            self.decoder = ResidualMLP(z_dim, hidden_dim, input_dim, depth=2)
+
         self.quantizer = make_quantizer(
             quantizer,
             n_states,
