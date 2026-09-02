@@ -27,6 +27,16 @@ def run_evaluate(args: argparse.Namespace) -> None:
     print(f"Loading exported model from {args.model_dir}...")
     model, mean, std = AlphabetModel.load(args.model_dir)
 
+    # The continuous bypass is a reconstruction-only ablation: its "states" are placeholder
+    # zeros, so encoding structures with it would emit a single-letter sequence and a
+    # meaningless substitution matrix rather than failing.
+    if model.quantizer_name == "continuous":
+        raise ValueError(
+            f"Model in {args.model_dir} was trained with the continuous bypass ablation and "
+            "forms no alphabet, so it cannot be evaluated. Compare its train_log.csv val_loss "
+            "against a quantized run instead."
+        )
+
     if model.n_states > len(model.letters):
         raise ValueError(
             f"Model has {model.n_states} states, but only {len(model.letters)} letters are "
@@ -202,7 +212,10 @@ def main(argv: list[str] | None = None) -> None:
         "--config", type=str, required=True, help="Path to a YAML config file."
     )
     train_parser.add_argument(
-        "--quantizer", type=str, choices=["vq", "fsq"], help="Convenience for model.quantizer."
+        "--quantizer",
+        type=str,
+        choices=["vq", "fsq", "continuous"],
+        help="Convenience for model.quantizer ('continuous' is the no-quantizer ablation).",
     )
     train_parser.add_argument("--out", type=str, help="Convenience for outputs.out_dir.")
 

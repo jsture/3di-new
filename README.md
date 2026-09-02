@@ -118,6 +118,12 @@ explicitly: `--virt 270 0 2` (matching `features.virtual_center` in the data con
 | Init | One-shot k-means (`kmeans_init`) | n/a |
 | States | `n_states` | `prod(levels)`, and `z_dim = len(levels)` |
 
+A third setting, `--quantizer continuous`, is an **ablation, not an alphabet**: it feeds the
+latent straight to the decoder with no quantization and no quantizer loss. Holding the encoder,
+decoder, data, seed, and optimizer fixed, the val_loss gap against a quantized run measures what
+discretization itself costs. It writes no codebook and refuses to encode sequences or be
+evaluated.
+
 FSQ **overrides** `n_states` and `z_dim` from `levels` (default `[5, 4]` → 20 states, `z_dim=2`).
 
 `n_states` is capped at **50**, the length of the alphabet
@@ -182,7 +188,7 @@ Knobs worth knowing:
 
 | Key | Default | Notes |
 | --- | --- | --- |
-| `model.quantizer` | `vq` | `vq` or `fsq` |
+| `model.quantizer` | `vq` | `vq`, `fsq`, or `continuous` (bypass ablation) |
 | `model.n_states` | `20` | ≤ 50; ignored by FSQ (derived from `levels`) |
 | `model.levels` | `null` | FSQ grid; defaults to `[5, 4]` |
 | `model.z_dim` | `4` | Latent width; FSQ pins it to `len(levels)` |

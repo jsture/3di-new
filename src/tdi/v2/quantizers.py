@@ -7,7 +7,10 @@ Two first-class quantizers form the discrete alphabet:
 - :class:`FSQQuantizer` -- a fixed finite-scalar-quantization comparator with no learned
   codebook.
 
-Both return ``(z_q, indices, q_loss, metrics)`` where ``metrics`` is a dict of optional
+A third, ablation-only path is :class:`ContinuousBypass`, which forms no alphabet at all --
+it passes the latent through untouched so a run can measure what discretization itself costs.
+
+All three return ``(z_q, indices, q_loss, metrics)`` where ``metrics`` is a dict of optional
 diagnostics, so adding or dropping a metric never churns call sites. EMA-VQ uses the standard
 straight-through estimator; FSQ preserves the derivative of its bounding function and applies
 the straight-through estimator only to rounding, following the reference formulation. The
@@ -339,6 +342,48 @@ class FSQQuantizer(nn.Module):
         return z_q, indices, q_loss, metrics
 
 
+class ContinuousBypass(nn.Module):
+    """Ablation-only pass-through: the latent reaches the decoder unquantized.
+
+    This is the control for "is discretization the reconstruction bottleneck?". Holding the
+    encoder, decoder, data, seed, and optimizer fixed and swapping only this in isolates the
+    cost of the discrete bottleneck: the val_loss gap against a quantized run is attributable
+    to quantization alone.
+
+    It forms no alphabet. ``indices`` are all zero and ``q_loss`` is exactly zero, so the
+    state diagnostics derived from them (perplexity, dead states) are meaningless for this
+    path -- read val_loss and nothing else. A model built on it cannot be encoded to
+    sequences or evaluated as a structural alphabet.
+    """
+
+    def __init__(self, z_dim: int) -> None:
+        """Initialize the bypass.
+
+        Args:
+            z_dim: Latent dimension, recorded for parity with the real quantizers.
+        """
+        super().__init__()
+        self.z_dim = z_dim
+        # Mirrors the attribute the export config reads off every quantizer.
+        self.l2_normalize = False
+
+    def forward(
+        self, z: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Return the latent unchanged, with placeholder indices and a zero loss.
+
+        Args:
+            z: Latent tensor of shape (N, z_dim).
+
+        Returns:
+            ``(z, zeros, 0.0, {})`` -- the gradient path to the encoder stays exact, with no
+            straight-through estimator in the way.
+        """
+        indices = torch.zeros(z.shape[0], dtype=torch.long, device=z.device)
+        q_loss = torch.zeros((), device=z.device, dtype=z.dtype)
+        return z, indices, q_loss, {}
+
+
 def make_quantizer(
     quantizer: str,
     n_states: int,
@@ -350,11 +395,12 @@ def make_quantizer(
     l2_normalize: bool = True,
     min_count: float = 1.0,
     replacement_warmup_steps: int = 500,
-) -> EMAVectorQuantizer | FSQQuantizer:
+) -> EMAVectorQuantizer | FSQQuantizer | ContinuousBypass:
     """Build the selected quantizer behind the shared interface.
 
     Args:
-        quantizer: ``"vq"`` (EMA vector quantization) or ``"fsq"`` (finite scalar).
+        quantizer: ``"vq"`` (EMA vector quantization), ``"fsq"`` (finite scalar), or
+            ``"continuous"`` (ablation-only bypass that forms no alphabet).
         n_states: Number of discrete states (VQ codebook size).
         z_dim: Latent dimension (VQ).
         levels: Per-dimension FSQ levels (defaults to ``[5, 4]`` for FSQ).
@@ -366,10 +412,12 @@ def make_quantizer(
         replacement_warmup_steps: Steps before dead-code replacement begins (VQ).
 
     Returns:
-        An ``EMAVectorQuantizer`` or ``FSQQuantizer``.
+        An ``EMAVectorQuantizer``, ``FSQQuantizer``, or ``ContinuousBypass``.
     """
     if quantizer == "fsq":
         return FSQQuantizer(levels if levels is not None else [5, 4])
+    if quantizer == "continuous":
+        return ContinuousBypass(z_dim)
     if quantizer in ("vq", "ema_vq"):
         return EMAVectorQuantizer(
             n_states,

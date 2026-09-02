@@ -15,7 +15,8 @@ from typing import Any
 class ModelConfig:
     """Architecture + quantizer selection."""
 
-    quantizer: str = "vq"  # "vq" (EMA vector quantization) or "fsq" (finite scalar)
+    quantizer: str = "vq"  # "vq" (EMA vector quantization), "fsq" (finite scalar),
+    # or "continuous" (ablation-only: no quantization, forms no alphabet)
     input_dim: int = 10
     hidden_dim: int = 64
     z_dim: int = 4
@@ -92,9 +93,10 @@ def _validate_train_config(cfg: TrainConfig) -> None:
     model = cfg.model
     loop = cfg.train
 
-    if model.quantizer not in {"vq", "ema_vq", "fsq"}:
+    if model.quantizer not in {"vq", "ema_vq", "fsq", "continuous"}:
         raise ValueError(
-            f"model.quantizer must be 'vq', 'ema_vq', or 'fsq', got {model.quantizer!r}"
+            f"model.quantizer must be 'vq', 'ema_vq', 'fsq', or 'continuous', "
+            f"got {model.quantizer!r}"
         )
     if model.loss not in {"smooth_l1", "mse"}:
         raise ValueError(f"model.loss must be 'smooth_l1' or 'mse', got {model.loss!r}")

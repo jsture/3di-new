@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 
 from .quantizers import (
+    ContinuousBypass,
     EMAVectorQuantizer,
     FSQQuantizer,
     make_quantizer,
@@ -73,7 +74,7 @@ class AlphabetModel(nn.Module):
     as more than one per model.
     """
 
-    quantizer: EMAVectorQuantizer | FSQQuantizer
+    quantizer: EMAVectorQuantizer | FSQQuantizer | ContinuousBypass
     feature_mean: torch.Tensor
     feature_std: torch.Tensor
 
@@ -193,6 +194,11 @@ class AlphabetModel(nn.Module):
                 z, self.quantizer.embedding, self.quantizer.l2_normalize
             )
             return distances.argmin(dim=-1)
+        if isinstance(self.quantizer, ContinuousBypass):
+            raise TypeError(
+                "encode_states is undefined for the continuous bypass: the ablation has no "
+                "codebook and forms no alphabet."
+            )
         _, indices = self.quantizer.quantize(z)
         return indices
 
@@ -284,9 +290,11 @@ class AlphabetModel(nn.Module):
         if isinstance(self.quantizer, EMAVectorQuantizer):
             centroids = self.quantizer.embedding.detach().cpu().numpy()
             np.save(out_path / "centroids.npy", centroids)
-        else:
+        elif isinstance(self.quantizer, FSQQuantizer):
             with open(out_path / "fsq_levels.json", "w") as f:
                 json.dump({"levels": self.levels}, f, indent=2)
+        # The continuous bypass has no codebook and no level grid: it writes neither, so an
+        # ablation export is never mistaken for a quantized one on disk.
 
     @classmethod
     def load(cls, export_dir: Path | str) -> tuple["AlphabetModel", np.ndarray, np.ndarray]:
@@ -303,7 +311,7 @@ class AlphabetModel(nn.Module):
             config = json.load(f)
 
         quantizer = config["quantizer"]
-        if quantizer not in ("vq", "ema_vq", "fsq"):
+        if quantizer not in ("vq", "ema_vq", "fsq", "continuous"):
             raise ValueError(f"Unknown quantizer in config: {quantizer}")
 
         n_states = config["n_states"]

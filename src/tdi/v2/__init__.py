@@ -17,6 +17,7 @@ from .model import (
     ResidualMLP,
 )
 from .quantizers import (
+    ContinuousBypass,
     EMAVectorQuantizer,
     FSQQuantizer,
     make_quantizer,
@@ -32,6 +33,7 @@ from .training_data import (
 __all__ = [
     "LETTERS",
     "AlphabetModel",
+    "ContinuousBypass",
     "EMAVectorQuantizer",
     "FSQQuantizer",
     "PairDataset",
