@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
@@ -11,6 +12,7 @@ import yaml
 from tdi.data import build_features, validate_cigar, validate_dataset
 from tdi.data.cigar import CigarValidationError
 from tdi.data.config import load_config
+from tdi.data.report import _ca_distance_bins
 from tdi.v2 import features
 from tdi.v2.training_data import FEATURE_CACHE, extract_features
 
@@ -73,6 +75,22 @@ def test_cache_key_disambiguates_virt_cb(tmp_path: Path) -> None:
     feat_a_again, _, _ = extract_features(str(pdb), _VIRT_A)
     assert np.array_equal(np.nan_to_num(feat_a), np.nan_to_num(feat_a_again))
     assert not np.array_equal(np.nan_to_num(feat_a), np.nan_to_num(feat_b))
+
+
+def test_cache_invalidates_when_pdb_at_same_path_changes(tmp_path: Path) -> None:
+    """Replacing a PDB cannot reuse descriptors cached for its previous contents."""
+    pdb = tmp_path / "domain.pdb"
+    _write_pdb(pdb, seed=1)
+    FEATURE_CACHE.clear()
+    feat_before, _, _ = extract_features(str(pdb), _VIRT_A)
+
+    old_stat = pdb.stat()
+    _write_pdb(pdb, seed=2)
+    os.utime(pdb, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns + 1_000_000))
+    feat_after, _, _ = extract_features(str(pdb), _VIRT_A)
+
+    assert len(FEATURE_CACHE) == 2
+    assert not np.array_equal(np.nan_to_num(feat_before), np.nan_to_num(feat_after))
 
 
 def test_extract_features_caches_raw_coords(tmp_path: Path) -> None:
@@ -226,6 +244,17 @@ def test_validate_dataset_summary_is_strict_json_serializable(tmp_path: Path) ->
     json.dumps(summary, indent=2, allow_nan=False)
 
 
+def test_validate_dataset_rejects_missing_pairfile(tmp_path: Path) -> None:
+    """The validation command does not report success when a required pairfile is absent."""
+    config_path = _make_dataset(tmp_path, "out_missing_pairfile")
+    config = yaml.safe_load(config_path.read_text())
+    config["dataset"]["val_pairfile"] = str(tmp_path / "missing.out")
+    config_path.write_text(yaml.safe_dump(config))
+
+    with pytest.raises(FileNotFoundError, match="Required pairfile"):
+        validate_dataset(config_path)
+
+
 def test_build_refuses_overwrite(tmp_path: Path) -> None:
     """A populated out_dir is immutable unless force=True."""
     config_path = _make_dataset(tmp_path, "out_immut")
@@ -294,6 +323,13 @@ def test_full_report_flag_gates_histograms(tmp_path: Path) -> None:
     assert ca_hist["bins"][-1]["label"] == ">=5.0"
     assert all("count" in bin_record for bin_record in ca_hist["bins"])
     assert "sequence_separation_histogram" in full_report["train"]
+
+
+def test_ca_histogram_boundary_is_counted_once() -> None:
+    """The final bounded bin and overflow bin are disjoint at exactly 5 Angstrom."""
+    bins = _ca_distance_bins(np.array([4.999, 5.0], dtype=np.float32))
+    assert sum(cast(int, record["count"]) for record in bins) == 2
+    assert bins[-1] == {"label": ">=5.0", "count": 1}
 
 
 def test_alignment_id_is_enriched_and_split_group_is_superfamily(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from tdi.v2.train import main
@@ -32,6 +33,22 @@ def test_load_config_applies_dotted_overrides(tmp_path: Path) -> None:
     assert cfg.train.max_epochs == 5
     assert cfg.model.levels == [5, 5]
     assert cfg.model.z_dim == 4  # untouched
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"model.loss": "smoothl1"}, "model.loss"),
+        ({"train.scheduler": "cosin"}, "train.scheduler"),
+        ({"trian.lr": 0.1}, "Unknown training config section"),
+    ],
+)
+def test_load_config_rejects_fail_open_values(
+    tmp_path: Path, override: dict[str, object], message: str
+) -> None:
+    """Typos cannot silently select fallback training behavior."""
+    with pytest.raises(ValueError, match=message):
+        load_train_config(_write_config(tmp_path), override)
 
 
 def test_main_resolves_cli_overrides_and_conveniences(tmp_path: Path) -> None:

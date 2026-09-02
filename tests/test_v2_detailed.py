@@ -236,6 +236,14 @@ def test_merge_columns_counts_preservation() -> None:
     assert new_counts.sum() == counts.sum()
 
 
+def test_merge_columns_adjusts_retained_index_after_deletion() -> None:
+    """Merging a lower state into a higher one uses the shifted retained index."""
+    counts = np.arange(1, 17).reshape(4, 4)
+    new_counts = merge_columns(counts, i=0, j=3)
+    assert new_counts.shape == (3, 3)
+    assert new_counts.sum() == counts.sum()
+
+
 # =====================================================================
 # 4. Inference and Predict Fallback Tests
 # =====================================================================

@@ -79,6 +79,13 @@ def test_parse_cigar_rejects_unsupported_ops() -> None:
         parse_cigar("3P2X")
 
 
+@pytest.mark.parametrize("cigar", ["2P!2P", "2P123", "", "0P"])
+def test_parse_cigar_rejects_partially_malformed_input(cigar: str) -> None:
+    """Malformed fragments and zero-length operations are never silently ignored."""
+    with pytest.raises(ValueError):
+        parse_cigar(cigar)
+
+
 def test_parse_cigar_parses_perfect_match_pairs() -> None:
     """``P`` records aligned pairs as an (N, 2) ref/query index map; M/D/I only advance."""
     pairs = parse_cigar("2M3P")
@@ -266,3 +273,27 @@ def test_evaluate_writes_three_artifacts(tmp_path: Path) -> None:
     assert (out_dir / "sequences.txt").exists()
     assert (out_dir / "submat.txt").exists()
     assert (out_dir / "evaluation_report.json").exists()
+
+
+def test_evaluate_fails_when_no_structure_encodes(tmp_path: Path) -> None:
+    """A 100% encoding failure cannot produce a plausible empty evaluation."""
+    model = AlphabetModel(quantizer="fsq", levels=[5, 4])
+    model_dir = tmp_path / "model"
+    model.save(model_dir, mean=np.zeros(10), std=np.ones(10))
+
+    pdb_dir = tmp_path / "empty_pdbs"
+    pdb_dir.mkdir()
+    pairfile = tmp_path / "pairs.txt"
+    pairfile.write_text("missing_a missing_b 10P\n")
+
+    args = argparse.Namespace(
+        model_dir=str(model_dir),
+        pdb_dir=str(pdb_dir),
+        pairfile=str(pairfile),
+        out_dir=str(tmp_path / "eval"),
+        virt=[0.0, 0.0, 1.0],
+        invalid_state="X",
+        max_failure_rate=1.0,
+    )
+    with pytest.raises(RuntimeError, match="every requested structure"):
+        run_evaluate(args)
