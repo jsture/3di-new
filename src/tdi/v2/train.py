@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from tdi.v2.model import AlphabetModel
-from tdi.v2.train_config import TrainConfig, load_train_config
+from tdi.v2.train_config import TrainConfig, _validate_train_config, load_train_config
 from tdi.v2.training_data import PairDataset
 
 
@@ -53,7 +53,16 @@ def _load_arrays(processed_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarra
 
 
 def _read_provenance(processed_dir: Path) -> tuple[list[float] | None, float | None]:
-    """Read (virtual_center, max_ca_dist) from a data report if present."""
+    """Read (virtual_center, max_ca_dist) from the processed-dataset metadata."""
+    manifest_path = processed_dir / "manifest.json"
+    if manifest_path.exists():
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        preprocessing = manifest.get("preprocessing", {})
+        if isinstance(preprocessing, dict):
+            return preprocessing.get("virtual_center"), preprocessing.get("max_ca_dist")
+
+    # Backward compatibility with older single-split reports that kept provenance at root.
     for name in ("report.json", "training_data_report.json"):
         path = processed_dir / name
         if path.exists():
@@ -67,7 +76,9 @@ def _reconstruction_loss(loss_name: str, y_hat: torch.Tensor, y: torch.Tensor) -
     """Partner-prediction reconstruction loss."""
     if loss_name == "mse":
         return F.mse_loss(y_hat, y)
-    return F.smooth_l1_loss(y_hat, y)
+    if loss_name == "smooth_l1":
+        return F.smooth_l1_loss(y_hat, y)
+    raise ValueError(f"Unknown reconstruction loss: {loss_name!r}")
 
 
 def _run_validation(
@@ -76,30 +87,35 @@ def _run_validation(
     """Compute val_loss plus state diagnostics over the whole validation set."""
     model.eval()
     total_loss = 0.0
-    n_batches = 0
-    perplexities: list[float] = []
-    margins: list[float] = []
+    n_examples = 0
+    total_margin = 0.0
+    margin_examples = 0
     counts = torch.zeros(n_states, dtype=torch.long)
     with torch.no_grad():
         for x, y in loader:
             out = model(x)
-            total_loss += float(_reconstruction_loss(loss_name, out["y_hat"], y))
-            n_batches += 1
+            batch_size = len(x)
+            total_loss += float(_reconstruction_loss(loss_name, out["y_hat"], y)) * batch_size
+            n_examples += batch_size
             metrics = out["metrics"]
-            perplexities.append(float(metrics["perplexity"]))
             if "margin" in metrics:
-                margins.append(float(metrics["margin"]))
+                total_margin += float(metrics["margin"]) * batch_size
+                margin_examples += batch_size
             counts += torch.bincount(out["indices"].cpu(), minlength=n_states)
 
-    val_loss = total_loss / max(1, n_batches)
+    if n_examples == 0:
+        raise ValueError("Validation loader produced zero examples.")
+    val_loss = total_loss / n_examples
     dead_state_count = int((counts == 0).sum())
+    usage = counts.float() / n_examples
+    perplexity = float(torch.exp(-(usage * (usage + 1e-10).log()).sum()))
     diag = {
         "val_loss": val_loss,
-        "perplexity": float(np.mean(perplexities)) if perplexities else 0.0,
+        "perplexity": perplexity,
         "dead_states": dead_state_count,
     }
-    if margins:
-        diag["margin"] = float(np.mean(margins))
+    if margin_examples:
+        diag["margin"] = total_margin / margin_examples
     return diag
 
 
@@ -112,6 +128,7 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
     Returns:
         The best (lowest val_loss) model, reloaded and exported.
     """
+    _validate_train_config(cfg)
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
 
@@ -142,8 +159,14 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
             f"{cfg.train.batch_size} with drop_last=True, producing zero batches. "
             "Lower batch_size or provide more training data."
         )
+    if len(val_dataset) == 0:
+        raise ValueError("Validation set is empty; provide a non-empty validation split.")
 
     input_dim = x_train_raw.shape[1]
+    if cfg.model.input_dim != input_dim:
+        raise ValueError(
+            f"model.input_dim={cfg.model.input_dim} does not match training data width {input_dim}."
+        )
     model = AlphabetModel(
         input_dim=input_dim,
         hidden_dim=cfg.model.hidden_dim,
@@ -291,18 +314,18 @@ def _parse_overrides(unknown: list[str]) -> dict[str, object]:
     i = 0
     while i < len(unknown):
         arg = unknown[i]
-        if arg.startswith("--") and i + 1 < len(unknown):
-            try:
-                value: object = yaml.safe_load(unknown[i + 1])
-            except yaml.YAMLError:
-                value = unknown[i + 1]
-            overrides[arg[2:]] = value
-            i += 2
-        elif arg.startswith("--"):
-            overrides[arg[2:]] = True
-            i += 1
-        else:
-            i += 1
+        if not arg.startswith("--"):
+            raise ValueError(f"Unexpected positional argument: {arg!r}")
+        if "." not in arg[2:]:
+            raise ValueError(f"Unknown argument: {arg!r}")
+        if i + 1 >= len(unknown) or unknown[i + 1].startswith("--"):
+            raise ValueError(f"Override {arg!r} requires a value")
+        try:
+            value: object = yaml.safe_load(unknown[i + 1])
+        except yaml.YAMLError:
+            value = unknown[i + 1]
+        overrides[arg[2:]] = value
+        i += 2
     return overrides
 
 
@@ -316,7 +339,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out", type=str, help="Convenience for outputs.out_dir.")
     args, unknown = parser.parse_known_args(argv)
 
-    overrides = _parse_overrides(unknown)
+    try:
+        overrides = _parse_overrides(unknown)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.quantizer is not None:
         overrides["model.quantizer"] = args.quantizer
     if args.out is not None:

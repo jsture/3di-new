@@ -22,7 +22,9 @@ def _histogram_from_edges(values: np.ndarray, edges: list[float]) -> list[int]:
     """Count values into half-open bins [edges[i], edges[i+1])."""
     if values.size == 0:
         return [0] * (len(edges) - 1)
-    counts, _ = np.histogram(values, bins=edges)
+    # np.histogram includes the final right edge in its last bin. Filter that edge out so
+    # the stated half-open contract remains true and the caller's overflow bin is disjoint.
+    counts, _ = np.histogram(values[values < edges[-1]], bins=edges)
     return [int(c) for c in counts]
 
 

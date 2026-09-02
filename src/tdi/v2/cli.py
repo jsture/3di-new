@@ -15,6 +15,10 @@ from .util import parse_pairfile_line, resolve_pdb_path
 
 def run_evaluate(args: argparse.Namespace) -> None:
     """Run model evaluation pipeline on sequence alignments."""
+    max_failure_rate = float(getattr(args, "max_failure_rate", 1.0))
+    if not 0.0 <= max_failure_rate <= 1.0:
+        raise ValueError(f"max_failure_rate must be in [0, 1], got {max_failure_rate}.")
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -50,6 +54,8 @@ def run_evaluate(args: argparse.Namespace) -> None:
             if res is not None:
                 unique_sids.add(res[0])
                 unique_sids.add(res[1])
+    if not unique_sids:
+        raise ValueError(f"Pairfile {args.pairfile} contains no parseable structure pairs.")
 
     # 3. Encode PDB files into 3Di sequences
     print(f"Encoding {len(unique_sids)} PDB files using trained encoder...")
@@ -87,7 +93,11 @@ def run_evaluate(args: argparse.Namespace) -> None:
     if n_failed > 0:
         print(f"Failed sample IDs: {failed_sids_sample}", file=sys.stderr)
 
-    max_failure_rate = getattr(args, "max_failure_rate", 1.0)
+    if n_encoded == 0:
+        raise RuntimeError(
+            f"Encoding failed for every requested structure ({n_failed}/{n_requested}). "
+            f"Failed sample: {failed_sids_sample}"
+        )
     if failure_rate > max_failure_rate:
         raise RuntimeError(
             f"Encoding failure rate {failure_rate:.1%} exceeds maximum allowed "
@@ -152,7 +162,11 @@ def run_evaluate(args: argparse.Namespace) -> None:
 
     # 10. Compile evaluation summary report
     report = {
+        "n_requested": n_requested,
         "n_sequences": len(sid2seq),
+        "n_failed": n_failed,
+        "failure_rate": failure_rate,
+        "failed_sids_sample": failed_sids_sample,
         "total_counts": int(counts.sum()),
         "mi": float(mi),
         "mi_tot": float(mi_tot),
@@ -233,6 +247,16 @@ def main(argv: list[str] | None = None) -> None:
         type=str,
         default=None,
         help="State for invalid coordinates (defaults to the model config's invalid_state).",
+    )
+    eval_parser.add_argument(
+        "--max-failure-rate",
+        "--max_failure_rate",
+        type=float,
+        default=1.0,
+        help=(
+            "Maximum tolerated fraction of structures that fail encoding (default: 1.0; "
+            "evaluation always fails if none encode successfully)."
+        ),
     )
 
     args, unknown = parser.parse_known_args(argv)

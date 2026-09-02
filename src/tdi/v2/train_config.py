@@ -6,7 +6,7 @@ config is small and nested only enough to keep ``--section.key`` dotted override
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +79,45 @@ class TrainConfig:
         return hashlib.sha256(payload).hexdigest()
 
 
+_SECTION_TYPES = {
+    "model": ModelConfig,
+    "train": LoopConfig,
+    "data": DataConfig,
+    "outputs": OutputsConfig,
+}
+
+
+def _validate_train_config(cfg: TrainConfig) -> None:
+    """Reject invalid settings before they can silently change training semantics."""
+    model = cfg.model
+    loop = cfg.train
+
+    if model.quantizer not in {"vq", "ema_vq", "fsq"}:
+        raise ValueError(
+            f"model.quantizer must be 'vq', 'ema_vq', or 'fsq', got {model.quantizer!r}"
+        )
+    if model.loss not in {"smooth_l1", "mse"}:
+        raise ValueError(f"model.loss must be 'smooth_l1' or 'mse', got {model.loss!r}")
+    for name in ("input_dim", "hidden_dim", "z_dim", "n_states"):
+        if getattr(model, name) <= 0:
+            raise ValueError(f"model.{name} must be > 0, got {getattr(model, name)!r}")
+    if not 0.0 <= model.decay < 1.0:
+        raise ValueError(f"model.decay must be in [0, 1), got {model.decay!r}")
+    if model.commitment_cost < 0 or model.min_count < 0:
+        raise ValueError("model.commitment_cost and model.min_count must be >= 0")
+    if model.replacement_warmup_steps < 0:
+        raise ValueError("model.replacement_warmup_steps must be >= 0")
+
+    if loop.scheduler not in {"none", "cosine"}:
+        raise ValueError(f"train.scheduler must be 'none' or 'cosine', got {loop.scheduler!r}")
+    if loop.lr <= 0 or loop.batch_size <= 0 or loop.max_epochs <= 0:
+        raise ValueError("train.lr, train.batch_size, and train.max_epochs must be > 0")
+    if loop.weight_decay < 0 or loop.patience < 0:
+        raise ValueError("train.weight_decay and train.patience must be >= 0")
+    if loop.clip_grad_norm <= 0 or loop.kmeans_init_batches <= 0:
+        raise ValueError("train.clip_grad_norm and train.kmeans_init_batches must be > 0")
+
+
 def load_train_config(path: str | Path, overrides: dict[str, Any] | None = None) -> TrainConfig:
     """Load and parse a YAML training config, applying optional dotted overrides.
 
@@ -94,16 +133,33 @@ def load_train_config(path: str | Path, overrides: dict[str, Any] | None = None)
     with open(path) as f:
         raw: dict[str, Any] = yaml.safe_load(f) or {}
 
+    if not isinstance(raw, dict):
+        raise ValueError(f"Config {path} did not parse to a mapping.")
+
+    unknown_sections = set(raw) - set(_SECTION_TYPES)
+    if unknown_sections:
+        raise ValueError(f"Unknown training config section(s): {sorted(unknown_sections)}")
+
     if overrides:
         for dotted, value in overrides.items():
             if value is None:
                 continue
+            if "." not in dotted:
+                raise ValueError(f"Override {dotted!r} must have the form section.key")
             section, key = dotted.split(".", 1)
+            section_type = _SECTION_TYPES.get(section)
+            if section_type is None:
+                raise ValueError(f"Unknown training config section in override: {section!r}")
+            known_keys = {item.name for item in fields(section_type)}
+            if key not in known_keys:
+                raise ValueError(f"Unknown training config key: {dotted!r}")
             raw.setdefault(section, {})[key] = value
 
-    return TrainConfig(
+    cfg = TrainConfig(
         model=ModelConfig(**raw.get("model", {})),
         train=LoopConfig(**raw.get("train", {})),
         data=DataConfig(**raw.get("data", {})),
         outputs=OutputsConfig(**raw.get("outputs", {})),
     )
+    _validate_train_config(cfg)
+    return cfg

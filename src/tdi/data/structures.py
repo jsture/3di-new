@@ -17,6 +17,19 @@ from tdi.v2.util import resolve_pdb_path
 
 # Module-level cache dict (keyed on path, mtime, size) to avoid redundant PDB parses
 _STRUCTURE_QC_CACHE: dict[tuple[str, float, int], dict[str, object]] = {}
+_STRUCTURE_COLUMNS = [
+    "sid",
+    "path",
+    "n_residues",
+    "n_valid_residues",
+    "valid_fraction",
+    "n_chains",
+    "selected_chain",
+    "has_missing_ca",
+    "has_missing_backbone",
+    "sha256",
+    "parse_status",
+]
 
 
 def structure_qc(sid: str, pdb_path: str | Path) -> dict[str, object]:
@@ -117,4 +130,4 @@ def build_structures_table(sids: list[str], pdb_dir: str | Path) -> pd.DataFrame
         DataFrame with one row per sid.
     """
     records = [structure_qc(sid, resolve_pdb_path(pdb_dir, sid)) for sid in sids]
-    return pd.DataFrame.from_records(records)
+    return pd.DataFrame.from_records(records, columns=_STRUCTURE_COLUMNS)

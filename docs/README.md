@@ -22,5 +22,5 @@ The system is organized into two primary layers:
 
 ## Documentation Index
 
-- **[Pipeline Technical Reference](file:///Users/skn506/Documents/Claude/Projects/3di-new/docs/pipeline.md)**: Detailed reference guide covering data processing specifications, model architecture parameters, export file formats, and evaluation metrics.
-- **[Experiments Quarantine](file:///Users/skn506/Documents/Claude/Projects/3di-new/experiments/README.md)**: Quarantined, runnable snapshots of self-contained experimental components (rotation trick gradient, coordinate augmentation, alignment batch sampler).
+- **[Pipeline Technical Reference](pipeline.md)**: Detailed reference guide covering data processing specifications, model architecture parameters, export file formats, and evaluation metrics.
+- **[Experiments Quarantine](../experiments/README.md)**: Quarantined, runnable snapshots of self-contained experimental components (rotation trick gradient, coordinate augmentation, alignment batch sampler).

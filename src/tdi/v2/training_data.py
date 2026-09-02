@@ -16,8 +16,8 @@ from torch.utils.data import Dataset
 from . import features, util
 
 # Cache for computed features (vae_features, valid_mask, coords) to avoid expensive PDB re-parsing.
-# Keyed on (abs path, virt_cb, feature-version, convention) so different virt_cb cannot collide.
-CacheKey = tuple[str, tuple[float, float, float], str, str]
+# File identity is part of the key so replacing a PDB at the same path cannot return stale data.
+CacheKey = tuple[str, int, int, tuple[float, float, float], str, str]
 FEATURE_CACHE: dict[CacheKey, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
 
@@ -37,8 +37,12 @@ def extract_features(
     """
     # Cache keyed on virt_cb + version/convention tags so two runs with different virt_cb
     # do not return stale features.
+    abs_path = os.path.abspath(pdb_path)
+    stat = os.stat(abs_path)
     cache_key: CacheKey = (
-        os.path.abspath(pdb_path),
+        abs_path,
+        stat.st_mtime_ns,
+        stat.st_size,
         (float(virt_cb[0]), float(virt_cb[1]), float(virt_cb[2])),
         "features_v2",  # feature-definition version tag
         "seq_delta_j_minus_i",  # convention tag
@@ -370,7 +374,14 @@ class PairDataset(Dataset):
             std: Precomputed feature std. If None, statistics are fit on x.
             fit_scaler: If True, fits scaler parameters (mean/std) internally when omitted.
         """
-        assert len(x) == len(y), "Features and targets must have matching length."
+        if len(x) != len(y):
+            raise ValueError("Features and targets must have matching length.")
+        if x.ndim != 2 or y.ndim != 2:
+            raise ValueError(f"Features and targets must be 2-D, got {x.shape} and {y.shape}.")
+        if x.shape[1] != y.shape[1]:
+            raise ValueError(
+                f"Features and targets must have matching width, got {x.shape[1]} and {y.shape[1]}."
+            )
         self.raw_x = x.astype(np.float32)
         self.raw_y = y.astype(np.float32)
 
@@ -387,9 +398,20 @@ class PairDataset(Dataset):
             self.mean = mean.astype(np.float32)
             self.std = std.astype(np.float32)
 
-        assert np.isfinite(self.mean).all(), "Scaler mean contains non-finite values"
-        assert np.isfinite(self.std).all(), "Scaler std contains non-finite values"
-        assert (self.std > 0).all(), "Scaler std contains non-positive values"
+        if self.mean.shape != (self.raw_x.shape[1],):
+            raise ValueError(
+                f"Scaler mean must have shape ({self.raw_x.shape[1]},), got {self.mean.shape}."
+            )
+        if self.std.shape != (self.raw_x.shape[1],):
+            raise ValueError(
+                f"Scaler std must have shape ({self.raw_x.shape[1]},), got {self.std.shape}."
+            )
+        if not np.isfinite(self.mean).all():
+            raise ValueError("Scaler mean contains non-finite values")
+        if not np.isfinite(self.std).all():
+            raise ValueError("Scaler std contains non-finite values")
+        if not (self.std > 0).all():
+            raise ValueError("Scaler std contains non-positive values")
 
         self.x_scaled = transform(self.raw_x, self.mean, self.std)
         self.y_scaled = transform(self.raw_y, self.mean, self.std)

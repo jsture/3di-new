@@ -159,15 +159,20 @@ def download_file(urls: list[str], destination: Path, force: bool = False) -> st
     raise RuntimeError(f"All download URLs failed. Last error: {last_error}")
 
 
-def safe_extract_tar(archive: Path, destination: Path, force: bool = False) -> None:
+def safe_extract_tar(archive: Path, destination: Path, force: bool = False) -> bool:
+    """Extract ``archive`` when needed and return whether extraction was refreshed."""
     destination.mkdir(parents=True, exist_ok=True)
 
     marker = destination / ".extracted"
-    if marker.exists() and not force:
+    archive_sha256 = sha256_file(archive)
+    expected_marker = f"sha256:{archive_sha256}\n"
+    if marker.exists() and not force and marker.read_text() == expected_marker:
         print(f"Using existing extraction: {destination}", file=sys.stderr)
-        return
+        return False
 
-    if force and destination.exists():
+    # A missing/mismatched marker means the directory is partial or belongs to another
+    # archive. Clear it before extraction so files from two archives cannot be mixed.
+    if destination.exists():
         shutil.rmtree(destination)
         destination.mkdir(parents=True, exist_ok=True)
 
@@ -178,12 +183,13 @@ def safe_extract_tar(archive: Path, destination: Path, force: bool = False) -> N
 
         for member in members:
             target = (destination / member.name).resolve()
-            if not str(target).startswith(str(destination_resolved)):
+            if target != destination_resolved and not target.is_relative_to(destination_resolved):
                 raise RuntimeError(f"Unsafe path in tar archive: {member.name}")
 
         tar.extractall(destination, filter="data")
 
-    marker.write_text("ok\n")
+    marker.write_text(expected_marker)
+    return True
 
 
 def is_probable_pdb_domain_file(path: Path) -> bool:
@@ -225,6 +231,8 @@ def wrangle_structures(
     copy_mode: str = "copy",
     force: bool = False,
 ) -> list[ManifestRow]:
+    if copy_mode not in {"copy", "symlink", "hardlink"}:
+        raise ValueError(f"Unsupported copy_mode: {copy_mode}")
     if force and normalized_dir.exists():
         shutil.rmtree(normalized_dir)
 
@@ -246,16 +254,18 @@ def wrangle_structures(
         dest = normalized_dir / sid
 
         if dest.exists():
-            dest.unlink()
-
-        if copy_mode == "copy":
-            shutil.copy2(source, dest)
-        elif copy_mode == "symlink":
-            dest.symlink_to(source.resolve())
-        elif copy_mode == "hardlink":
-            os.link(source, dest)
+            if sha256_file(dest) != sha256_file(source):
+                raise RuntimeError(
+                    f"Existing normalized structure differs from extracted source: {dest}. "
+                    "Pass --force-wrangle to rebuild the normalized directory."
+                )
         else:
-            raise ValueError(f"Unsupported copy_mode: {copy_mode}")
+            if copy_mode == "copy":
+                shutil.copy2(source, dest)
+            elif copy_mode == "symlink":
+                dest.symlink_to(source.resolve())
+            elif copy_mode == "hardlink":
+                os.link(source, dest)
 
         rows.append(
             ManifestRow(
@@ -269,6 +279,13 @@ def wrangle_structures(
 
     if not rows:
         raise RuntimeError(f"No probable PDB/domain files found under: {extracted_dir}")
+
+    extras = sorted(path.name for path in normalized_dir.iterdir() if path.name not in seen)
+    if extras:
+        raise RuntimeError(
+            f"Normalized directory contains {len(extras)} stale file(s), e.g. {extras[:5]}. "
+            "Pass --force-wrangle to rebuild it."
+        )
 
     return rows
 
@@ -460,7 +477,7 @@ def main() -> None:
         force=args.force_download,
     )
 
-    safe_extract_tar(
+    extraction_refreshed = safe_extract_tar(
         archive=archive_path,
         destination=extracted_dir,
         force=args.force_extract,
@@ -470,7 +487,7 @@ def main() -> None:
         extracted_dir=extracted_dir,
         normalized_dir=normalized_dir,
         copy_mode=args.copy_mode,
-        force=args.force_wrangle,
+        force=args.force_wrangle or extraction_refreshed,
     )
 
     write_manifest(rows, manifest_path)

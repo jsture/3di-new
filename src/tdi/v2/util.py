@@ -29,9 +29,18 @@ def parse_cigar(cigar_string: str) -> np.ndarray:
     matches = []
 
     # Match counts followed by any letter op so unsupported ops are rejected (not
-    # silently skipped, which would desynchronize the reference/query indices).
-    for cnt_str, action in re.findall(r"([0-9]*)([A-Za-z])", cigar_string):
+    # silently skipped, which would desynchronize the reference/query indices). Require
+    # the tokens to cover the entire input: findall alone would silently ignore punctuation
+    # or trailing digits and accept a malformed alignment during evaluation.
+    tokens = re.findall(r"([0-9]*)([A-Za-z])", cigar_string)
+    if not cigar_string or "".join(f"{count}{action}" for count, action in tokens) != cigar_string:
+        raise ValueError(f"CIGAR {cigar_string!r} is malformed.")
+
+    for cnt_str, action in tokens:
         cnt = int(cnt_str) if cnt_str else 1
+
+        if cnt <= 0:
+            raise ValueError(f"CIGAR {cigar_string!r} contains a zero-length operation.")
 
         if action == "D":
             ref += cnt

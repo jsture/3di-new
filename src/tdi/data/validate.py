@@ -40,11 +40,12 @@ def validate_dataset(
     referenced: set[str] = set()
     alignments: list[tuple[int, str, str, str]] = []
     for pf in pairfiles:
-        if pf and Path(pf).exists():
-            rows = _read_pairfile(pf)
-            alignments.extend(rows)
-            for _row, sid1, sid2, _cigar in rows:
-                referenced.update([sid1, sid2])
+        if not pf or not Path(pf).is_file():
+            raise FileNotFoundError(f"Required pairfile not found: {pf!r}")
+        rows = _read_pairfile(pf)
+        alignments.extend(rows)
+        for _row, sid1, sid2, _cigar in rows:
+            referenced.update([sid1, sid2])
 
     if prebuilt_structures is not None:
         structures = prebuilt_structures

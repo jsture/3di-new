@@ -61,13 +61,21 @@ def merge_columns(counts: np.ndarray, i: int, j: int) -> np.ndarray:
     Returns:
         Reduced matrix of shape (S-1, S-1).
     """
+    if counts.ndim != 2 or counts.shape[0] != counts.shape[1]:
+        raise ValueError(f"counts must be square, got shape {counts.shape}")
+    if not (0 <= i < len(counts)) or not (0 <= j < len(counts)):
+        raise IndexError(f"merge indices {(i, j)} are out of range for size {len(counts)}")
+    if i == j:
+        raise ValueError("Cannot merge a state into itself.")
+
     mask = np.ones(len(counts), dtype=bool)
     mask[i] = False
+    retained_j = j - 1 if i < j else j
 
     new_counts = np.copy(counts[mask, :][:, mask])
-    new_counts[j, :] += counts[i, mask]
-    new_counts[:, j] += counts[mask, i]
-    new_counts[j, j] += counts[i, i]
+    new_counts[retained_j, :] += counts[i, mask]
+    new_counts[:, retained_j] += counts[mask, i]
+    new_counts[retained_j, retained_j] += counts[i, i]
 
     return new_counts
 
