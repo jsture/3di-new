@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -193,7 +194,7 @@ def run_evaluate(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Main CLI driver for tdi.v2 (train and evaluate)."""
+    """Main CLI driver for training, evaluation, and search benchmarking."""
     parser = argparse.ArgumentParser(
         prog="tdi.v2",
         description="Tdi-v2 CLI tools: train and evaluate structural alphabet models.",
@@ -234,6 +235,97 @@ def main(argv: list[str] | None = None) -> None:
         required=True,
         help="Path to exported model folder.",
     )
+
+    # Historical Foldseek SCOP search benchmark. Kept opt-in and separate from training:
+    # running train/evaluate never launches the expensive all-versus-all search.
+    benchmark_parser = subparsers.add_parser(
+        "benchmark",
+        help="Run the historical 3Di-only SCOP Smith-Waterman benchmark.",
+        description=(
+            "Encode the fixed SCOP split (or use prepared artifacts), run all-versus-all SSW, "
+            "and report recovery before the first different-fold hit."
+        ),
+    )
+    benchmark_source = benchmark_parser.add_mutually_exclusive_group(required=True)
+    benchmark_source.add_argument(
+        "--model-dir",
+        "--model_dir",
+        help="Exported model to encode; derives its matrix from training alignments.",
+    )
+    benchmark_source.add_argument(
+        "--sequences",
+        help="Prepared validation sequences; requires --submat (artifact/reference mode).",
+    )
+    benchmark_parser.add_argument(
+        "--submat", help="Prepared A-T substitution matrix, required with --sequences."
+    )
+    benchmark_parser.add_argument(
+        "--pdb-dir",
+        "--pdb_dir",
+        default="data/external/foldseek_scop40/pdb_by_sid",
+        help="Structure directory used with --model-dir.",
+    )
+    benchmark_parser.add_argument(
+        "--train-pairfile",
+        "--train_pairfile",
+        default="data/derived/pairfiles/tmaln-06.train.out",
+        help="Training-only structural alignments used to derive candidate substitution matrix.",
+    )
+    benchmark_parser.add_argument(
+        "--train-sids",
+        "--train_sids",
+        default="data/raw/pdbs_train.txt",
+        help="Historical Foldseek training SID manifest.",
+    )
+    benchmark_parser.add_argument(
+        "--val-sids",
+        "--val_sids",
+        default="data/raw/pdbs_val.txt",
+        help="Historical Foldseek validation SID manifest.",
+    )
+    benchmark_parser.add_argument(
+        "--scop-lookup",
+        "--scop_lookup",
+        default="data/raw/scop_lookup.tsv",
+        help="SCOP SID-to-family lookup.",
+    )
+    benchmark_parser.add_argument(
+        "--ssw",
+        required=True,
+        help="Path to Complete-Striped-Smith-Waterman-Library's ssw_test executable.",
+    )
+    benchmark_parser.add_argument("--out-dir", "--out_dir", required=True)
+    benchmark_parser.add_argument(
+        "--virt",
+        type=float,
+        nargs=3,
+        default=None,
+        help="Virtual center override; otherwise read from model export.",
+    )
+    benchmark_parser.add_argument("--gap-open", type=int, default=8)
+    benchmark_parser.add_argument("--gap-extend", type=int, default=2)
+    benchmark_parser.add_argument(
+        "--min-score",
+        type=int,
+        default=50,
+        help="Minimum reported SSW score (historical default: 50).",
+    )
+    benchmark_parser.add_argument(
+        "--jobs",
+        type=int,
+        default=min(8, max(1, (os.cpu_count() or 1))),
+        help="Concurrent SSW processes (default: min(8, CPU count)).",
+    )
+    roc1_parser = subparsers.add_parser(
+        "roc1",
+        help="Score pre-ranked search hits using the historical Foldseek ROC1 metric.",
+    )
+    roc1_parser.add_argument(
+        "--hits", nargs="+", required=True, help="Ranked query-target-score tables."
+    )
+    roc1_parser.add_argument("--sid-list", "--sid_list", required=True)
+    roc1_parser.add_argument("--scop-lookup", "--scop_lookup", required=True)
+    roc1_parser.add_argument("--out", required=True, help="Per-query TSV output.")
     eval_parser.add_argument(
         "--pdb-dir", "--pdb_dir", type=str, required=True, help="Directory containing PDB files."
     )
@@ -283,6 +375,20 @@ def main(argv: list[str] | None = None) -> None:
         if unknown:
             parser.error(f"Unrecognized arguments: {' '.join(unknown)}")
         run_evaluate(args)
+    elif args.command == "benchmark":
+        if unknown:
+            parser.error(f"Unrecognized arguments: {' '.join(unknown)}")
+        if args.sequences is not None and args.submat is None:
+            parser.error("--sequences requires --submat.")
+        from .benchmark import run_benchmark
+
+        run_benchmark(args)
+    elif args.command == "roc1":
+        if unknown:
+            parser.error(f"Unrecognized arguments: {' '.join(unknown)}")
+        from .benchmark import run_roc1
+
+        run_roc1(args)
 
 
 if __name__ == "__main__":
