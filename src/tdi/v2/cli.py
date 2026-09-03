@@ -10,7 +10,7 @@ from scipy.stats import entropy as scipy_entropy
 
 from .encode import process_pdb
 from .model import AlphabetModel
-from .submat import accumulate_counts, calc_alphabet_mi, write_mat
+from .submat import accumulate_counts, calc_alphabet_mi, chain_contribution, write_mat
 from .util import parse_pairfile_line, resolve_pdb_path
 
 
@@ -133,8 +133,13 @@ def run_evaluate(args: argparse.Namespace) -> None:
 
     # 6. Calculate Mutual Information metrics
     mi, mi_tot = calc_alphabet_mi(counts, counts_prev)
+    # The lagged term and its share of raw MI. Reported so an arm that raises raw MI only by
+    # emitting longer correlated state runs is visible as a rising chain fraction rather than
+    # as progress.
+    mi_prev, chain_fraction = chain_contribution(mi, mi_tot)
     print(f"Mutual Information (MI): {mi:.4f}")
     print(f"Transition-Adjusted MI (MI_tot): {mi_tot:.4f}")
+    print(f"Lagged MI (MI_prev): {mi_prev:.4f}   chain fraction: {chain_fraction:.1%}")
 
     # 7. Compute log-odds substitution scoring matrix
     p_ab = counts / counts.sum() if counts.sum() > 0 else np.zeros_like(counts, dtype=np.float32)
@@ -180,6 +185,8 @@ def run_evaluate(args: argparse.Namespace) -> None:
         "total_counts": int(counts.sum()),
         "mi": float(mi),
         "mi_tot": float(mi_tot),
+        "mi_prev": float(mi_prev),
+        "chain_fraction": float(chain_fraction),
         "n_letters": n_states,
         "letters": alphabet,
         "state_usage": usage_counts.tolist(),

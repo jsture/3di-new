@@ -51,6 +51,8 @@ class RunResult:
     # Alphabet side: what the exported model scores on held-out alignments.
     mi: float | None = None
     mi_tot: float | None = None
+    mi_prev: float | None = None
+    chain_fraction: float | None = None
     normalized_entropy: float | None = None
     dead_state_fraction: float | None = None
     n_sequences: int | None = None
@@ -277,6 +279,17 @@ def _collect(run_dir: Path, pdb_dir: str, pairfile: str, virt: list[float] | Non
         result.skipped = "no evaluation report produced"
         return result
 
+    return _read_eval_report(report_path, result)
+
+
+def _read_eval_report(report_path: Path, result: RunResult) -> RunResult:
+    """Copy an evaluation report's alphabet metrics onto a run row.
+
+    Split out from ``_collect`` so the mapping from report keys to table columns can be
+    tested without running an evaluation. ``mi_prev`` and ``chain_fraction`` are read rather
+    than recomputed whenever the evaluator emitted them; the table falls back to deriving
+    them only for runs scored before they existed.
+    """
     with open(report_path) as f:
         report = json.load(f)
     usage = report.get("state_usage", [])
@@ -284,6 +297,8 @@ def _collect(run_dir: Path, pdb_dir: str, pairfile: str, virt: list[float] | Non
 
     result.mi = report.get("mi")
     result.mi_tot = report.get("mi_tot")
+    result.mi_prev = report.get("mi_prev")
+    result.chain_fraction = report.get("chain_fraction")
     result.normalized_entropy = report.get("normalized_entropy")
     result.dead_state_fraction = report.get("dead_state_fraction")
     result.n_sequences = report.get("n_sequences")
@@ -305,14 +320,32 @@ def _effective_states(result: RunResult) -> float | None:
 
 
 def _chain_autocorrelation(result: RunResult) -> float | None:
-    """Back out the lagged-MI term that ``mi_tot`` subtracts from ``mi``.
+    """The lagged-MI term that ``mi_tot`` subtracts from ``mi``.
 
     This is how much of the raw MI is explained by a state predicting its own sequence
     neighbour -- local smoothness the alphabet gets for free rather than alignment signal.
+    Taken from the report when present, and otherwise backed out of the reported pair so
+    runs evaluated before ``mi_prev`` was emitted still tabulate.
     """
+    if result.mi_prev is not None:
+        return result.mi_prev
     if result.mi is None or result.mi_tot is None:
         return None
     return (result.mi - result.mi_tot) / _MI_PREV_WEIGHT
+
+
+def _chain_fraction(result: RunResult) -> float | None:
+    """Share of raw MI removed by the transition adjustment.
+
+    The diagnostic that separates real alignment signal from an alphabet inflating raw MI
+    with longer correlated state runs: a soft-MI arm whose ``mi`` rises while this rises
+    with it has bought nothing.
+    """
+    if result.chain_fraction is not None:
+        return result.chain_fraction
+    if result.mi is None or result.mi_tot is None or result.mi == 0.0:
+        return None
+    return (result.mi - result.mi_tot) / result.mi
 
 
 def _print_table(results: list[RunResult]) -> None:
@@ -323,7 +356,8 @@ def _print_table(results: list[RunResult]) -> None:
 
     header = (
         f"{'run':26s} {'quant':6s} {'K':>3s} {'zd':>3s} {'val_loss':>9s} {'ep':>3s} "
-        f"{'mi':>7s} {'mi_tot':>7s} {'chain':>7s} {'cap%':>6s} {'eff_K':>6s} {'top%':>6s}"
+        f"{'mi':>7s} {'mi_tot':>7s} {'chain':>7s} {'chain%':>7s} {'cap%':>6s} "
+        f"{'eff_K':>6s} {'top%':>6s}"
     )
     print("\n" + header)
     print("-" * len(header))
@@ -335,6 +369,7 @@ def _print_table(results: list[RunResult]) -> None:
         )
         effective = _effective_states(r)
         chain = _chain_autocorrelation(r)
+        chain_share = _chain_fraction(r)
         print(
             f"{r.name[:26]:26s} {r.quantizer[:6]:6s} {r.n_states:3d} {r.z_dim:3d} "
             f"{r.best_val_loss if r.best_val_loss is not None else float('nan'):9.5f} "
@@ -342,6 +377,7 @@ def _print_table(results: list[RunResult]) -> None:
             f"{r.mi if r.mi is not None else float('nan'):7.4f} "
             f"{r.mi_tot if r.mi_tot is not None else float('nan'):7.4f} "
             f"{chain if chain is not None else float('nan'):7.4f} "
+            f"{100 * chain_share if chain_share is not None else float('nan'):6.1f}% "
             f"{capacity:6.1f} "
             f"{effective if effective is not None else float('nan'):6.2f} "
             f"{100 * r.top_state_share if r.top_state_share is not None else float('nan'):6.1f}"
@@ -355,7 +391,8 @@ def _print_table(results: list[RunResult]) -> None:
         "K-state\nalphabet could carry. eff_K = 2**entropy, the usage-weighted state count "
         "(all K states\nmay still appear; this measures imbalance, not dead states). "
         "top% = share of the single\nmost-used state. chain = the lagged term mi_tot "
-        "subtracts: local smoothness, not alignment\nsignal."
+        "subtracts: local smoothness, not alignment\nsignal; chain% is its share of raw mi, "
+        "the tell for an arm that raises mi only by emitting\nlonger correlated state runs."
     )
 
 

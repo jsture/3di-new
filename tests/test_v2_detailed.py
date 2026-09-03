@@ -25,7 +25,10 @@ from tdi.v2.features import (
 from tdi.v2.submat import (
     accumulate_counts,
     calc_alphabet_mi,
+    chain_contribution,
     merge_columns,
+    miller_madow_corrected_mi,
+    mutual_information_from_counts,
 )
 from tdi.v2.training_data import fit_standardizer, transform
 from tdi.v2.util import mutual_information
@@ -338,3 +341,91 @@ def test_encode_device_move_is_noop_on_cpu() -> None:
 
     assert np.array_equal(z_before, z_after)
     assert np.array_equal(idx_before, idx_after)
+
+
+def test_mutual_information_from_counts_matches_normalized_joint() -> None:
+    """The shared helper normalizes counts itself and agrees with the raw MI function."""
+    counts = np.array([[40, 10], [10, 40]])
+    assert mutual_information_from_counts(counts) == pytest.approx(
+        mutual_information(counts / counts.sum())
+    )
+    # A perfectly coupled balanced pair carries exactly one bit.
+    assert mutual_information_from_counts(np.array([[50, 0], [0, 50]])) == pytest.approx(1.0)
+    # Independence carries none, and an empty matrix must not divide by zero.
+    assert mutual_information_from_counts(np.full((2, 2), 25)) == pytest.approx(0.0)
+    assert mutual_information_from_counts(np.zeros((2, 2), dtype=int)) == 0.0
+
+
+def test_miller_madow_matches_the_formula_exactly() -> None:
+    """The correction must equal (m_x + m_y - m_xy - 1) / (2 N ln 2) added to the plug-in."""
+    rng = np.random.default_rng(0)
+    counts = rng.integers(0, 5, size=(6, 7))
+    n = 250
+
+    occupied_joint = int(np.count_nonzero(counts))
+    occupied_x = int(np.count_nonzero(counts.sum(axis=1)))
+    occupied_y = int(np.count_nonzero(counts.sum(axis=0)))
+    expected = mutual_information_from_counts(counts) + (
+        occupied_x + occupied_y - occupied_joint - 1
+    ) / (2 * n * np.log(2))
+    assert miller_madow_corrected_mi(counts, n_observations=n) == pytest.approx(expected)
+
+
+def test_miller_madow_lowers_a_sparse_many_bin_estimate() -> None:
+    """When the joint occupies more bins than the marginals combined, the sign is negative."""
+    # 30x30 bins from 400 independent draws: occupancy is spread, so m_xy >> m_x + m_y and the
+    # correction pulls the inflated plug-in estimate back toward the truth of zero.
+    rng = np.random.default_rng(1)
+    counts = np.zeros((30, 30), dtype=int)
+    np.add.at(counts, (rng.integers(0, 30, 400), rng.integers(0, 30, 400)), 1)
+
+    plugin = mutual_information_from_counts(counts)
+    corrected = miller_madow_corrected_mi(counts, n_observations=400)
+    assert corrected < plugin
+    assert abs(corrected) < abs(plugin)
+
+
+def test_miller_madow_raises_a_concentrated_estimate() -> None:
+    """The correction is not signed: a diagonal joint pushes it upward, even past log2(K).
+
+    Pinned deliberately. A previous version of this test assumed the correction always lowers
+    MI, which is false whenever m_xy is no larger than m_x + m_y -- for a diagonal table all
+    three occupancies are K, leaving a strictly positive term.
+    """
+    counts = np.eye(20, dtype=int)
+    plugin = mutual_information_from_counts(counts)
+    corrected = miller_madow_corrected_mi(counts, n_observations=20)
+
+    assert plugin == pytest.approx(np.log2(20))
+    assert corrected > plugin
+    # Smaller N means a larger correction, in whichever direction the sign points.
+    assert corrected > miller_madow_corrected_mi(counts, n_observations=40)
+
+
+def test_miller_madow_handles_empty_counts() -> None:
+    """An empty joint must not divide by zero."""
+    assert miller_madow_corrected_mi(np.zeros((3, 3), dtype=int)) == 0.0
+
+
+def test_chain_contribution_inverts_the_transition_adjustment() -> None:
+    """mi_prev and chain_fraction must reconstruct exactly what calc_alphabet_mi subtracted."""
+    counts = np.array([[40, 10], [10, 40]])
+    counts_prev = np.array([[30, 20], [20, 30]])
+    mi, mi_tot = calc_alphabet_mi(counts, counts_prev)
+
+    mi_prev, chain_fraction = chain_contribution(mi, mi_tot)
+    # calc_alphabet_mi computes mi_tot = mi - (1 - 0.057) * mi_prev; invert it exactly.
+    assert mi_prev == pytest.approx(mutual_information_from_counts(counts_prev))
+    assert chain_fraction == pytest.approx((mi - mi_tot) / mi)
+    assert mi - (1 - 0.057) * mi_prev == pytest.approx(mi_tot)
+
+
+def test_chain_contribution_guards_only_the_division() -> None:
+    """Zero raw MI must still recover mi_prev; only the fraction is undefined there."""
+    assert chain_contribution(0.0, 0.0) == (0.0, 0.0)
+
+    # Zero aligned MI with positive lagged MI gives a negative mi_tot, and mi_prev is still
+    # exactly recoverable -- guarding the whole function would silently discard it.
+    mi_prev, chain_fraction = chain_contribution(0.0, -0.5)
+    assert mi_prev == pytest.approx(0.5 / (1 - 0.057))
+    assert chain_fraction == 0.0

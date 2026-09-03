@@ -30,6 +30,67 @@ def load_sequences(seqfile_path: str) -> dict[str, str]:
     return sid2seq
 
 
+def mutual_information_from_counts(counts: np.ndarray) -> float:
+    """Plug-in mutual information, in bits, of a joint count matrix.
+
+    The single place counts become an MI number, shared by final evaluation, the training-time
+    ``val_pair_mi`` diagnostic, and the descriptor-information probe, so all three report the
+    same quantity computed the same way.
+
+    Args:
+        counts: Joint count matrix of shape (A, B). Need not be square or symmetric.
+
+    Returns:
+        Mutual information in bits; 0.0 for an empty matrix.
+    """
+    total = counts.sum()
+    if total <= 0:
+        return 0.0
+    return util.mutual_information(counts / total)
+
+
+def miller_madow_corrected_mi(counts: np.ndarray, n_observations: int | None = None) -> float:
+    """Apply the Miller-Madow bias correction to a plug-in MI estimate.
+
+    The plug-in estimator is biased at finite sample size by roughly
+    ``(m_xy - m_x - m_y + 1) / (2 N)`` nats, where each ``m`` is the number of *occupied*
+    bins in the corresponding support. Subtracting that term is what this function does.
+
+    The sign is not fixed. It is negative -- lowering an inflated estimate -- only when the
+    joint occupies more bins than the two marginals combined, which is the usual sparse
+    many-bin case. For a table whose occupancy is concentrated (a near-diagonal joint, where
+    ``m_xy`` approaches ``m_x`` and ``m_y``) the correction is positive and can push the
+    result above ``log2(K)``. Callers must not assume it always reduces the estimate.
+
+    **Validity.** This is the ordinary multinomial correction: it assumes ``counts`` came
+    from ``N`` independent draws from the joint distribution. It is therefore *not* valid on
+    a symmetrized table, where every observation was written into two dependent cells --
+    passing the one-orientation ``N`` does not repair the independence assumption or the
+    degrees of freedom. Apply it to the unsymmetrized joint, and use a pair-level resampling
+    estimate for the bias of a symmetrized target.
+
+    Args:
+        counts: Joint count matrix of shape (A, B), from independent draws.
+        n_observations: Independent observations behind ``counts``. Defaults to the matrix
+            total, which is correct whenever each observation contributed exactly one count.
+
+    Returns:
+        Bias-corrected mutual information in bits.
+    """
+    total = counts.sum()
+    if total <= 0:
+        return 0.0
+    n = int(n_observations) if n_observations is not None else int(total)
+    if n <= 0:
+        return 0.0
+
+    occupied_joint = int(np.count_nonzero(counts))
+    occupied_x = int(np.count_nonzero(counts.sum(axis=1)))
+    occupied_y = int(np.count_nonzero(counts.sum(axis=0)))
+    correction = (occupied_x + occupied_y - occupied_joint - 1) / (2 * n * np.log(2))
+    return mutual_information_from_counts(counts) + float(correction)
+
+
 def calc_alphabet_mi(counts: np.ndarray, counts_prev: np.ndarray) -> tuple[float, float]:
     """Calculate the Mutual Information (MI) and adjusted transition MI.
 
@@ -40,14 +101,38 @@ def calc_alphabet_mi(counts: np.ndarray, counts_prev: np.ndarray) -> tuple[float
     Returns:
         A tuple of (MI, adjusted transition MI).
     """
-    mi = util.mutual_information(counts / counts.sum()) if counts.sum() > 0 else 0.0
+    mi = mutual_information_from_counts(counts)
     # Guard the lagged matrix: no adjacent pairs -> zero baseline (avoid 0/0).
-    mi_prev = (
-        util.mutual_information(counts_prev / counts_prev.sum()) if counts_prev.sum() > 0 else 0.0
-    )
+    mi_prev = mutual_information_from_counts(counts_prev)
     # Adjust for sequential dependency baseline
     mi_tot = mi - (1 - 0.057) * mi_prev
     return mi, mi_tot
+
+
+def chain_contribution(mi: float, mi_tot: float) -> tuple[float, float]:
+    """Recover the lagged MI term and its share of raw MI from the reported pair.
+
+    ``mi_tot = mi - (1 - 0.057) * mi_prev``, so ``mi_prev`` is recoverable from the two
+    reported numbers. ``chain_fraction`` is the share of raw MI that the transition
+    adjustment removes -- the diagnostic that separates an alphabet carrying genuine
+    alignment signal from one inflating raw MI with longer correlated state runs.
+
+    ``mi_prev`` is recoverable whenever both numbers are known, including when ``mi`` is 0:
+    a zero raw MI with positive lagged MI gives a negative ``mi_tot``, and the lagged term is
+    still exactly ``-mi_tot / (1 - 0.057)``. Only the *fraction* is undefined there, since it
+    divides by ``mi``, so the guard covers the division alone.
+
+    Args:
+        mi: Raw pair mutual information in bits.
+        mi_tot: Transition-adjusted mutual information in bits.
+
+    Returns:
+        A tuple of (mi_prev, chain_fraction). ``chain_fraction`` is 0.0 when ``mi`` is 0.
+    """
+    mi_prev = (mi - mi_tot) / (1 - 0.057)
+    if mi == 0.0:
+        return mi_prev, 0.0
+    return mi_prev, (mi - mi_tot) / mi
 
 
 def merge_columns(counts: np.ndarray, i: int, j: int) -> np.ndarray:

@@ -260,6 +260,7 @@ scratch/
 .prompt.md
 GEMINI.md
 CLAUDE.md
+AGENTS.md
 .github/prompts/
 .github/copilot-instructions.md
 
