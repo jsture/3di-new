@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from tdi.v2.model import AlphabetModel
+from tdi.v2.submat import mutual_information_from_counts
 from tdi.v2.train_config import TrainConfig, _validate_train_config, load_train_config
 from tdi.v2.training_data import PairDataset
 
@@ -92,6 +93,12 @@ def _run_validation(
     total_margin = 0.0
     margin_examples = 0
     counts = torch.zeros(n_states, dtype=torch.long)
+    # Joint state counts over aligned (x, y) pairs, accumulated globally rather than
+    # per batch: MI is not an average of per-batch MIs, so it is computed once at the end
+    # and is therefore invariant to validation batch size.
+    pair_counts = torch.zeros(n_states * n_states, dtype=torch.long)
+    # The continuous bypass has no codebook, so partner states are undefined for it.
+    pair_mi_available = model.quantizer_name != "continuous"
     with torch.no_grad():
         for x, y in loader:
             out = model(x)
@@ -103,7 +110,15 @@ def _run_validation(
             if "margin" in metrics:
                 total_margin += float(metrics["margin"]) * batch_size
                 margin_examples += batch_size
-            counts += torch.bincount(out["indices"].cpu(), minlength=n_states)
+            indices = out["indices"]
+            counts += torch.bincount(indices.cpu(), minlength=n_states)
+
+            if pair_mi_available:
+                # x's states are already computed by the forward pass; only the partner
+                # descriptors need a second encode.
+                partner_indices = model.encode_states(y)
+                flat = indices.cpu() * n_states + partner_indices.cpu()
+                pair_counts += torch.bincount(flat, minlength=n_states * n_states)
 
     if n_examples == 0:
         raise ValueError("Validation loader produced zero examples.")
@@ -120,6 +135,12 @@ def _run_validation(
         "perplexity": perplexity,
         "dead_states": dead_state_count,
     }
+    if pair_mi_available:
+        # Raw pair MI only. This is the training-time view of the evaluated deliverable; the
+        # transition adjustment needs chain adjacency, which the flattened pair dataset does
+        # not carry, so chain_fraction stays a full-evaluation metric (see run_evaluate).
+        joint = pair_counts.reshape(n_states, n_states).numpy()
+        diag["val_pair_mi"] = mutual_information_from_counts(joint)
     if margin_examples:
         diag["margin"] = total_margin / margin_examples
     return diag
@@ -223,10 +244,11 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
 
     print(
         "Epoch   Train Recon   Train Q   Val Recon   Val Q     "
-        "Perplexity   Dead States   Patience   Status"
+        "Pair MI   Perplexity   Dead States   Patience   Status"
     )
     print(
-        "------------------------------------------------------------------------------------------------"
+        "-------------------------------------------------------------------------------------"
+        "----------------------"
     )
 
     best_val = float("inf")
@@ -303,10 +325,12 @@ def train_model(cfg: TrainConfig) -> AlphabetModel:
                 status = "Dead states"
 
         patience_str = f"{patience_left}/{cfg.train.patience}"
+        # The bypass ablation reports no pair MI (it forms no alphabet).
+        pair_mi_str = f"{diag['val_pair_mi']:.4f}" if "val_pair_mi" in diag else "-"
         print(
             f" {epoch + 1:<6d} {train_recon_loss:<13.4f} {train_q_loss:<9.4f} "
             f"{diag['val_loss']:<11.4f} {diag['val_q_loss']:<9.4f} "
-            f"{diag['perplexity']:<12.2f} {diag['dead_states']:<13d} "
+            f"{pair_mi_str:<9s} {diag['perplexity']:<12.2f} {diag['dead_states']:<13d} "
             f"{patience_str:<10s} {status}"
         )
 

@@ -9,6 +9,7 @@ simplification stays distinguishable from silent drift.
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -297,3 +298,50 @@ def test_evaluate_fails_when_no_structure_encodes(tmp_path: Path) -> None:
     )
     with pytest.raises(RuntimeError, match="every requested structure"):
         run_evaluate(args)
+
+
+def test_evaluate_report_includes_chain_contribution(tmp_path: Path) -> None:
+    """``evaluate`` reports the lagged MI term and its share of raw MI.
+
+    These exist to expose an arm that raises raw ``mi`` only by emitting longer correlated
+    state runs: such an arm shows a rising ``chain_fraction`` rather than real alignment
+    signal. Pinned as a full-evaluation contract, since the lagged term needs chain adjacency
+    that the flattened training pair set does not carry.
+    """
+    model = AlphabetModel(quantizer="fsq", levels=[5, 4])
+    model_dir = tmp_path / "model"
+    model.save(model_dir, mean=np.zeros(10), std=np.ones(10))
+
+    pdb_dir = tmp_path / "pdbs"
+    pdb_dir.mkdir()
+    _write_pdb(pdb_dir / "alpha.pdb", n_res=10)
+    _write_pdb(pdb_dir / "beta.pdb", n_res=10)
+
+    pairfile = tmp_path / "pairs.txt"
+    pairfile.write_text("alpha beta 10P\n")
+
+    out_dir = tmp_path / "eval"
+    run_evaluate(
+        argparse.Namespace(
+            model_dir=str(model_dir),
+            pdb_dir=str(pdb_dir),
+            pairfile=str(pairfile),
+            out_dir=str(out_dir),
+            virt=[0.0, 0.0, 1.0],
+            invalid_state="X",
+        )
+    )
+
+    with open(out_dir / "evaluation_report.json") as f:
+        report = json.load(f)
+
+    assert "mi_prev" in report
+    assert "chain_fraction" in report
+    # The pair must invert the transition adjustment calc_alphabet_mi applied.
+    assert report["mi"] - (1 - 0.057) * report["mi_prev"] == pytest.approx(report["mi_tot"])
+    if report["mi"] != 0.0:
+        assert report["chain_fraction"] == pytest.approx(
+            (report["mi"] - report["mi_tot"]) / report["mi"]
+        )
+    else:
+        assert report["chain_fraction"] == 0.0

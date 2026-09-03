@@ -640,3 +640,117 @@ def test_continuous_model_refuses_to_encode_states() -> None:
     model = AlphabetModel(input_dim=10, n_states=20, z_dim=4, quantizer="continuous")
     with pytest.raises(TypeError, match="forms no alphabet"):
         model.encode_states(torch.randn(4, 10))
+
+
+# ---------------------------------------------------------------------------
+# Training-time pair MI (val_pair_mi)
+# ---------------------------------------------------------------------------
+
+
+def _validation_loader(x: torch.Tensor, y: torch.Tensor, batch_size: int) -> DataLoader:
+    """Wrap aligned descriptor pairs in a non-shuffling validation loader."""
+    return DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=False)
+
+
+class _IdentityEncoder(torch.nn.Module):
+    """Passes descriptors through unchanged, so a pinned codebook alone decides the state."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Identity: (N, 1) -> (N, 1)."""
+        return x
+
+
+def _pinned_two_state_model() -> AlphabetModel:
+    """A 2-state VQ model whose encoder and codebook are pinned to a known partition.
+
+    Swapping in an identity encoder rather than zeroing the trained one matters: the encoder's
+    output block starts with a LayerNorm, so zeroing every parameter would zero its gain and
+    force z to 0 for every input, collapsing the partition this helper exists to create.
+
+    With the codebook pinned at -1 and +1 (and l2_normalize reducing a 1-D latent to its
+    sign), a descriptor's state is exactly the sign of its single feature, which makes the
+    expected pair MI computable by hand.
+    """
+    model = AlphabetModel(input_dim=1, hidden_dim=4, z_dim=1, n_states=2, quantizer="vq")
+    # add_module rather than attribute assignment: the attribute is annotated as the trained
+    # encoder union, and this swaps in a stand-in that is deliberately neither member.
+    model.add_module("encoder", _IdentityEncoder())
+    quantizer = model.quantizer
+    assert isinstance(quantizer, EMAVectorQuantizer)
+    with torch.no_grad():
+        quantizer.embedding.copy_(torch.tensor([[-1.0], [1.0]]))
+    # eval() also freezes the EMA codebook update, so the pinned centroids cannot drift.
+    model.eval()
+    return model
+
+
+def test_val_pair_mi_perfect_correlation_is_one_bit() -> None:
+    """Aligned pairs that always share a state carry log2(2) = 1 bit."""
+    model = _pinned_two_state_model()
+    # Balanced halves, with x and y always agreeing in sign.
+    values = torch.tensor([[-3.0]] * 50 + [[3.0]] * 50)
+    diag = _run_validation(model, _validation_loader(values, values, 16), "mse", n_states=2)
+    assert diag["val_pair_mi"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_val_pair_mi_independent_states_is_zero_bits() -> None:
+    """Aligned pairs whose states are independent carry no shared information."""
+    model = _pinned_two_state_model()
+    # All four sign combinations in equal number: perfectly independent.
+    x = torch.tensor([[-3.0], [-3.0], [3.0], [3.0]] * 25)
+    y = torch.tensor([[-3.0], [3.0], [-3.0], [3.0]] * 25)
+    diag = _run_validation(model, _validation_loader(x, y, 16), "mse", n_states=2)
+    assert diag["val_pair_mi"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_val_pair_mi_collapsed_alphabet_is_zero_bits() -> None:
+    """A single occupied state carries no information however well aligned."""
+    model = _pinned_two_state_model()
+    values = torch.tensor([[3.0]] * 100)
+    diag = _run_validation(model, _validation_loader(values, values, 16), "mse", n_states=2)
+    assert diag["val_pair_mi"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_val_pair_mi_is_invariant_to_validation_batch_size() -> None:
+    """MI is accumulated globally, so batching must not change the reported value."""
+    model = _pinned_two_state_model()
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(240, 1, generator=generator)
+    # Correlated but not identical, so the MI is strictly between 0 and 1 bit.
+    y = x + 0.5 * torch.randn(240, 1, generator=generator)
+
+    values = [
+        _run_validation(model, _validation_loader(x, y, size), "mse", n_states=2)["val_pair_mi"]
+        for size in (7, 32, 240)
+    ]
+    assert values[0] == pytest.approx(values[1], abs=1e-12)
+    assert values[1] == pytest.approx(values[2], abs=1e-12)
+    assert 0.0 < values[0] < 1.0
+
+
+def test_val_pair_mi_absent_for_continuous_bypass() -> None:
+    """The bypass forms no alphabet, so it reports no pair MI instead of raising."""
+    model = AlphabetModel(input_dim=3, hidden_dim=8, z_dim=2, n_states=20, quantizer="continuous")
+    x = torch.randn(32, 3)
+    diag = _run_validation(model, _validation_loader(x, x, 8), "mse", n_states=20)
+    assert "val_pair_mi" not in diag
+    assert "val_loss" in diag
+
+
+def test_train_log_csv_contains_val_pair_mi(tmp_path: Path) -> None:
+    """The metric must reach train_log.csv, where run comparison reads it."""
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    _write_processed_dir(processed, n=64, dim=4)
+
+    out_dir = tmp_path / "run"
+    cfg = TrainConfig(
+        data=DataConfig(processed_dir=str(processed)),
+        model=ModelConfig(input_dim=4, hidden_dim=8, z_dim=2, n_states=4, quantizer="vq"),
+        train=LoopConfig(batch_size=16, max_epochs=2, patience=5, kmeans_init_batches=1),
+        outputs=OutputsConfig(out_dir=str(out_dir)),
+    )
+    train_model(cfg)
+
+    header = (out_dir / "train_log.csv").read_text().splitlines()[0]
+    assert "val_pair_mi" in header.split(",")
