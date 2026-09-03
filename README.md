@@ -81,6 +81,58 @@ The virtual-center geometry is read from the run's `config.json`. If that run wa
 dataset whose manifest carried no provenance, `virtual_center` is `null` there and you must pass it
 explicitly: `--virt 270 0 2` (matching `features.virtual_center` in the data config).
 
+### 4. Run the historical SCOP search benchmark (opt-in)
+
+This reproduces Foldseek's 3Di-only model-selection benchmark: encode the original fixed validation
+split, perform all-versus-all Smith-Waterman search, then measure family, superfamily, and fold
+recovery before the first different-fold hit. It is separate from training and normal evaluation.
+
+Build `ssw_test` from
+[Complete Striped Smith-Waterman](https://github.com/mengyao/Complete-Striped-Smith-Waterman-Library),
+then run:
+
+```bash
+uv run python -m tdi.v2 benchmark \
+  --model-dir runs/ema_vq \
+  --ssw /path/to/ssw_test \
+  --out-dir runs/ema_vq/scop_search
+```
+
+Defaults use the checked-in original Foldseek manifests (`data/raw/pdbs_{train,val}.txt`), SCOP
+lookup, training pairfile, gap-open 8, and gap-extension 2. Candidate substitution matrices are
+derived only from training alignments; SSW's historical minimum reported score is 50.
+Invalid-coordinate `X` states are assigned to the valid state maximizing training `mi_tot`, then
+that choice is frozen for validation.
+
+Prepared reference artifacts can use the same search and scoring path:
+
+```bash
+uv run python -m tdi.v2 benchmark \
+  --sequences path/to/full_validation_sequences.txt \
+  --submat data/v1/sub_score.mat \
+  --ssw /path/to/ssw_test \
+  --out-dir runs/foldseek_v1/scop_search
+```
+
+The sequence file must contain all domains in `data/raw/pdbs_val.txt`. The command rejects partial
+splits by default. Results are `roc1.tsv` plus `benchmark_report.json`; the metric deliberately
+preserves the historical self-hit and denominator conventions. It is ROC1-like recovery, not
+conventional ROC AUC.
+
+Original shell averaging accidentally included `roc1.awk`'s header in its divisor. Reports keep
+correct header-free means as primary values and also emit `legacy_header_biased_*` values for exact
+comparison with historical logs.
+
+To rescore existing ranked hit tables without rerunning search:
+
+```bash
+uv run python -m tdi.v2 roc1 \
+  --hits runs/ema_vq/scop_search/search/hits/*.m8 \
+  --sid-list data/raw/pdbs_val.txt \
+  --scop-lookup data/raw/scop_lookup.tsv \
+  --out runs/ema_vq/scop_search/roc1-rescored.tsv
+```
+
 ---
 
 ## How it works
@@ -165,6 +217,16 @@ encoding and evaluation never hardcode them.
 | `sequences.txt` | `<sid> <sequence>` per structure; invalid residues become `invalid_state` (`X`) |
 | `submat.txt` | Log-odds substitution matrix over the alphabet |
 | `evaluation_report.json` | `mi`, `mi_tot`, `state_usage`, `dead_state_fraction`, `normalized_entropy`, and encoding failure counts |
+
+**`benchmark` → `--out-dir`**
+
+| File | Contents |
+| --- | --- |
+| `sequences.txt` | Full historical validation split in manifest order |
+| `submat.txt` | Frozen A–T matrix used by SSW |
+| `search/hits/*.m8` | Query-grouped hits sorted by descending local-alignment score |
+| `roc1.tsv` | Historical per-query family/superfamily/fold recovery |
+| `benchmark_report.json` | Mean ROC1 values, normalized historical selection score, and benchmark provenance |
 
 Read `mi` / `mi_tot` as *how much a state in one structure tells you about the aligned state in
 the other* — higher is a more discriminative alphabet. `dead_state_fraction` near 0 and

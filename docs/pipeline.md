@@ -79,3 +79,20 @@ uv run python -m tdi.v2 evaluate \
 - `sequences.txt`: Encoded 3Di character sequences for all requested structures.
 - `submat.txt`: Log-odds substitution scoring matrix over the alphabet states.
 - `evaluation_report.json`: Metrics including raw mutual information (`mi`), transition-adjusted mutual information (`mi_tot`), state usage frequencies, normalized entropy, and dead state fraction.
+
+---
+
+## 4. Historical SCOP Search Benchmark (`tdi.v2 benchmark`)
+
+This opt-in post-training benchmark uses the original Foldseek train/validation SID manifests and
+SCOP classifications already stored under `data/raw/`. It derives a candidate substitution matrix
+from training alignments only and encodes the complete validation manifest. External `ssw_test`
+performs all-versus-all local alignment with the historical gap-open 8 and gap-extension 2 settings.
+
+The Python ROC1 implementation preserves `training/roc1.awk` semantics: self-hits count as family
+hits, query classes without both cross-family and cross-superfamily candidates are excluded, and
+recovery stops at the first different-fold hit. Inputs receive stricter validation than the AWK
+script, and output order is deterministic. This metric is not conventional ROC AUC.
+
+The original shell average counted the AWK header as an extra zero-valued row. Reports expose both
+correct means and explicitly named `legacy_header_biased_*` values for published-log parity.
